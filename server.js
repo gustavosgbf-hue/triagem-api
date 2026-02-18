@@ -55,3 +55,34 @@ app.post("/api/doctor", async (req, res) => {
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log("Servidor rodando na porta", PORT));
+import admin from "firebase-admin";
+
+// (se você ainda não colocou no server.js)
+if (!admin.apps.length) {
+  const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT || "{}");
+  admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
+}
+const db = admin.firestore();
+
+app.post("/api/consultas", async (req, res) => {
+  try {
+    const { patientName, summary, triageMessages, doctorMessages, status } = req.body;
+
+    if (!summary) return res.status(400).json({ ok: false, error: "summary obrigatório" });
+
+    const doc = await db.collection("consultas").add({
+      patientName: patientName || "Sem nome",
+      summary,
+      triageMessages: triageMessages || [],
+      doctorMessages: doctorMessages || [],
+      status: status || "triagem_concluida",
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    res.json({ ok: true, id: doc.id });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
