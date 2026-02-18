@@ -1,83 +1,57 @@
 import express from "express";
 import cors from "cors";
+import OpenAI from "openai";
 
 const app = express();
 
 app.use(cors());
 app.use(express.json({ limit: "1mb" }));
 
-if (!process.env.ANTHROPIC_API_KEY) {
-  console.error("ANTHROPIC_API_KEY não definida");
+if (!process.env.OPENAI_API_KEY) {
+  console.error("OPENAI_API_KEY não definida");
   process.exit(1);
 }
 
-app.get("/health", (req, res) => {
-  res.json({ ok: true });
-});
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-async function chamarClaude(system, messages) {
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "x-api-key": process.env.ANTHROPIC_API_KEY,
-      "anthropic-version": "2023-06-01"
-    },
-    body: JSON.stringify({
-      model: "claude-3-haiku-20240307",
-      max_tokens: 800,
-      system: system,
-      messages: messages
-    })
+app.get("/health", (req, res) => res.json({ ok: true }));
+
+async function runChat(system, messages) {
+  const completion = await openai.chat.completions.create({
+    model: "gpt-4o-mini",
+    messages: [{ role: "system", content: system }, ...messages],
+    temperature: 0.4
   });
-
-  const data = await response.json();
-
-  if (!response.ok) {
-    throw new Error(JSON.stringify(data));
-  }
-
-  return data.content?.[0]?.text || "";
+  return completion.choices[0]?.message?.content || "";
 }
 
 app.post("/api/triage", async (req, res) => {
   try {
     const { system, messages } = req.body;
-
     if (!system || !Array.isArray(messages)) {
-      return res.status(400).json({ error: "Payload inválido" });
+      return res.status(400).json({ ok: false, error: "Payload inválido" });
     }
-
-    const reply = await chamarClaude(system, messages);
-
+    const reply = await runChat(system, messages);
     res.json({ text: reply });
-
-  } catch (error) {
-    console.error("Erro triage:", error);
-    res.status(500).json({ ok: false, error: error.message });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ ok: false, error: e.message || "Erro interno" });
   }
 });
 
 app.post("/api/doctor", async (req, res) => {
   try {
     const { system, messages } = req.body;
-
     if (!system || !Array.isArray(messages)) {
-      return res.status(400).json({ error: "Payload inválido" });
+      return res.status(400).json({ ok: false, error: "Payload inválido" });
     }
-
-    const reply = await chamarClaude(system, messages);
-
+    const reply = await runChat(system, messages);
     res.json({ text: reply });
-
-  } catch (error) {
-    console.error("Erro doctor:", error);
-    res.status(500).json({ ok: false, error: error.message });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ ok: false, error: e.message || "Erro interno" });
   }
 });
 
 const PORT = process.env.PORT || 10000;
-
-app.listen(PORT, () => {
-  console.log("Servidor rodando na porta", PORT);
-});
+app.listen(PORT, () => console.log("Servidor rodando na porta", PORT));
