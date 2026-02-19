@@ -142,7 +142,20 @@ app.post("/api/notify", async (req, res) => {
           </table>
           <div style="background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:10px;padding:18px">
             <p style="margin:0 0 10px;font-size:12px;text-transform:uppercase;letter-spacing:.1em;color:rgba(255,255,255,.4)">Triagem completa</p>
-            <p style="margin:0;font-size:14px;line-height:1.7;color:rgba(255,255,255,.8);white-space:pre-wrap">${triagem || '—'}</p>
+            <p style="margin:0;font-size:14px;line-height:1.9;color:rgba(255,255,255,.8)">${
+  (triagem || '—')
+    .split(/,\s*(?=[A-ZÀÁÂÃÉÊÍÓÔÕÚÇ])/)
+    .map(item => {
+      const [key, ...val] = item.split(':');
+      return val.length
+        ? `<div style="display:flex;gap:8px;padding:6px 0;border-bottom:1px solid rgba(255,255,255,.06)">
+            <span style="color:rgba(255,255,255,.4);font-size:12px;min-width:180px;flex-shrink:0">${key.trim()}</span>
+            <span style="color:#fff;font-weight:500">${val.join(':').trim()}</span>
+           </div>`
+        : `<div style="padding:6px 0;border-bottom:1px solid rgba(255,255,255,.06);color:#fff">${item.trim()}</div>`;
+    })
+    .join('')
+}</p>
           </div>
           <p style="margin:20px 0 0;font-size:12px;color:rgba(255,255,255,.3)">Enviado automaticamente pelo sistema ConsultaJá24h</p>
         </div>
