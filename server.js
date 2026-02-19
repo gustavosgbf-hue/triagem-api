@@ -126,7 +126,7 @@ app.post("/api/notify", async (req, res) => {
 
     // Destinatários — adicione os emails dos médicos aqui
     const destinatarios = [
-      'drgustavofons@gmail.com',
+      'gustavosgbf@gmail.com',
       process.env.EMAIL_MEDICO_2 || ''
     ].filter(Boolean);
 
