@@ -120,9 +120,14 @@ app.post("/api/notify", async (req, res) => {
     const { nome, tel, triagem } = req.body || {};
     const RESEND_KEY = process.env.RESEND_API_KEY;
 
-    // Formata número como link do WhatsApp
+    // Formata número como link rastreado por médico
     const telLimpo = (tel || '').replace(/\D/g, '');
-    const waLink = telLimpo ? `https://wa.me/55${telLimpo}` : '—';
+    const BASE_URL = process.env.RENDER_EXTERNAL_URL || 'https://triagem-api.onrender.com';
+    
+    // Gera link rastreado para cada médico
+    function linkMedico(nomeMedico){
+      return `${BASE_URL}/atender?medico=${encodeURIComponent(nomeMedico)}&paciente=${encodeURIComponent(nome||'')}&tel=${encodeURIComponent(telLimpo)}`;
+    }
 
     // Destinatários — adicione os emails dos médicos aqui
     const destinatarios = [
@@ -187,6 +192,106 @@ app.post("/api/notify", async (req, res) => {
     console.error("Notify error:", e);
     return res.status(500).json({ ok: false });
   }
+});
+
+
+// ── RASTREAMENTO DE ATENDIMENTOS ────────────────────────
+const fs = require('fs');
+const ARQUIVO = './atendimentos.json';
+
+function carregarAtendimentos(){
+  try {
+    if(fs.existsSync(ARQUIVO)) return JSON.parse(fs.readFileSync(ARQUIVO,'utf8'));
+  } catch(e){}
+  return [];
+}
+
+function salvarAtendimento(medico, paciente, tel){
+  const lista = carregarAtendimentos();
+  lista.push({
+    medico,
+    paciente,
+    tel,
+    data: new Date().toLocaleString('pt-BR', {timeZone:'America/Fortaleza'})
+  });
+  fs.writeFileSync(ARQUIVO, JSON.stringify(lista, null, 2));
+}
+
+// Rota de clique rastreado — médico clica no email e vai pro WhatsApp do paciente
+app.get('/atender', (req, res) => {
+  const { medico, paciente, tel } = req.query;
+  if(!tel) return res.status(400).send('Parâmetros inválidos');
+  
+  salvarAtendimento(medico || 'desconhecido', paciente || '—', tel);
+  console.log(`[ATENDIMENTO] Médico: ${medico} | Paciente: ${paciente} | Tel: ${tel}`);
+  
+  // Redireciona para o WhatsApp do paciente
+  const telLimpo = tel.replace(/\D/g,'');
+  res.redirect(`https://wa.me/55${telLimpo}`);
+});
+
+// Rota de relatório
+app.get('/relatorio', (req, res) => {
+  const lista = carregarAtendimentos();
+  
+  if(lista.length === 0){
+    return res.send('<h2 style="font-family:sans-serif;padding:20px">Nenhum atendimento registrado ainda.</h2>');
+  }
+
+  // Agrupa por data
+  const porData = {};
+  lista.forEach(a => {
+    const dia = a.data.split(',')[0];
+    if(!porData[dia]) porData[dia] = [];
+    porData[dia].push(a);
+  });
+
+  // Conta por médico
+  const porMedico = {};
+  lista.forEach(a => {
+    porMedico[a.medico] = (porMedico[a.medico] || 0) + 1;
+  });
+
+  let html = `
+  <html><head><meta charset="utf-8">
+  <style>
+    body{font-family:'Segoe UI',sans-serif;background:#060d0b;color:#fff;padding:32px;max-width:800px;margin:0 auto}
+    h1{color:#b4e05a;margin-bottom:4px}
+    h2{color:#5ee0a0;margin:28px 0 12px;font-size:1rem;text-transform:uppercase;letter-spacing:.1em}
+    table{width:100%;border-collapse:collapse;margin-bottom:24px}
+    th{text-align:left;padding:10px 12px;background:rgba(180,224,90,.1);color:#b4e05a;font-size:.8rem;letter-spacing:.08em;text-transform:uppercase}
+    td{padding:10px 12px;border-bottom:1px solid rgba(255,255,255,.06);font-size:.88rem}
+    .badge{display:inline-block;padding:3px 10px;border-radius:999px;background:rgba(94,224,160,.1);color:#5ee0a0;font-size:.75rem}
+    .total{background:rgba(255,255,255,.04);border-radius:12px;padding:16px 20px;margin-bottom:28px;display:flex;gap:32px}
+    .total-item span{display:block;font-size:.72rem;color:rgba(255,255,255,.4);text-transform:uppercase;letter-spacing:.1em;margin-bottom:4px}
+    .total-item strong{font-size:1.6rem;color:#b4e05a}
+  </style>
+  </head><body>
+  <h1>📊 Relatório de Atendimentos</h1>
+  <p style="color:rgba(255,255,255,.4);font-size:.85rem;margin-bottom:24px">ConsultaJá24h · atualizado em tempo real</p>
+  
+  <div class="total">
+    <div class="total-item"><span>Total</span><strong>${lista.length}</strong></div>
+    ${Object.entries(porMedico).map(([m,n]) => `<div class="total-item"><span>${m}</span><strong>${n}</strong></div>`).join('')}
+  </div>`;
+
+  Object.entries(porData).reverse().forEach(([dia, ats]) => {
+    html += `<h2>${dia} — ${ats.length} atendimento${ats.length>1?'s':''}</h2>
+    <table><tr><th>Horário</th><th>Médico</th><th>Paciente</th><th>WhatsApp</th></tr>`;
+    ats.forEach(a => {
+      const hora = a.data.split(',')[1] || '';
+      html += `<tr>
+        <td>${hora.trim()}</td>
+        <td><span class="badge">${a.medico}</span></td>
+        <td>${a.paciente}</td>
+        <td><a href="https://wa.me/55${a.tel.replace(/\D/g,'')}" style="color:#5ee0a0">📱 ${a.tel}</a></td>
+      </tr>`;
+    });
+    html += '</table>';
+  });
+
+  html += '</body></html>';
+  res.send(html);
 });
 
 // ── HEALTH ───────────────────────────────────────────────
