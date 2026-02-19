@@ -113,6 +113,69 @@ app.get("/api/payment/:id", async (req, res) => {
   }
 });
 
+
+// ── NOTIFICAR MÉDICOS (email via Resend) ────────────────
+app.post("/api/notify", async (req, res) => {
+  try {
+    const { nome, tel, triagem } = req.body || {};
+    const RESEND_KEY = process.env.RESEND_API_KEY;
+
+    // Formata número como link do WhatsApp
+    const telLimpo = (tel || '').replace(/\D/g, '');
+    const waLink = telLimpo ? `https://wa.me/55${telLimpo}` : '—';
+
+    // Destinatários — adicione os emails dos médicos aqui
+    const destinatarios = [
+      'drgustavofons@gmail.com',
+      process.env.EMAIL_MEDICO_2 || ''
+    ].filter(Boolean);
+
+    const html = `
+      <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#060d0b;color:#fff;border-radius:12px;overflow:hidden">
+        <div style="background:linear-gradient(135deg,#b4e05a,#5ee0a0);padding:20px 28px">
+          <h2 style="margin:0;color:#051208;font-size:18px">🏥 Nova triagem — ConsultaJá24h</h2>
+        </div>
+        <div style="padding:28px">
+          <table style="width:100%;border-collapse:collapse;margin-bottom:24px">
+            <tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px;width:120px">Paciente</td><td style="padding:8px 0;font-weight:600">${nome || '—'}</td></tr>
+            <tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">WhatsApp</td><td style="padding:8px 0"><a href="${waLink}" style="background:#25D366;color:#fff;padding:6px 16px;border-radius:999px;text-decoration:none;font-size:13px;font-weight:600">📱 Chamar no WhatsApp</a></td></tr>
+          </table>
+          <div style="background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:10px;padding:18px">
+            <p style="margin:0 0 10px;font-size:12px;text-transform:uppercase;letter-spacing:.1em;color:rgba(255,255,255,.4)">Triagem completa</p>
+            <p style="margin:0;font-size:14px;line-height:1.7;color:rgba(255,255,255,.8);white-space:pre-wrap">${triagem || '—'}</p>
+          </div>
+          <p style="margin:20px 0 0;font-size:12px;color:rgba(255,255,255,.3)">Enviado automaticamente pelo sistema ConsultaJá24h</p>
+        </div>
+      </div>
+    `;
+
+    const resendRes = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${RESEND_KEY}`
+      },
+      body: JSON.stringify({
+        from: "ConsultaJá24h <onboarding@resend.dev>",
+        to: destinatarios,
+        subject: `🏥 Nova triagem — ${nome || 'Paciente'}`,
+        html
+      })
+    });
+
+    const resendData = await resendRes.json();
+    if (!resendRes.ok) {
+      console.error("Resend error:", resendData);
+      return res.status(500).json({ ok: false });
+    }
+
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error("Notify error:", e);
+    return res.status(500).json({ ok: false });
+  }
+});
+
 // ── HEALTH ───────────────────────────────────────────────
 app.get("/", (req, res) => res.send("API rodando"));
 app.get("/health", (req, res) => res.json({ ok: true }));
