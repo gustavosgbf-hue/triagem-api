@@ -343,6 +343,42 @@ app.get('/relatorio', (req, res) => {
   res.send(html);
 });
 
+
+// Rota de identificações
+app.get('/identificacoes', (req, res) => {
+  const lista = lerJSON('./identificacoes.json');
+
+  if(lista.length === 0){
+    return res.send('<h2 style="font-family:sans-serif;padding:20px">Nenhuma identificação registrada ainda.</h2>');
+  }
+
+  let html = `
+  <html><head><meta charset="utf-8">
+  <style>
+    body{font-family:'Segoe UI',sans-serif;background:#060d0b;color:#fff;padding:32px;max-width:800px;margin:0 auto}
+    h1{color:#b4e05a;margin-bottom:4px}
+    p{color:rgba(255,255,255,.4);font-size:.85rem;margin-bottom:24px}
+    table{width:100%;border-collapse:collapse}
+    th{text-align:left;padding:10px 12px;background:rgba(180,224,90,.1);color:#b4e05a;font-size:.8rem;letter-spacing:.08em;text-transform:uppercase}
+    td{padding:10px 12px;border-bottom:1px solid rgba(255,255,255,.06);font-size:.88rem}
+  </style>
+  </head><body>
+  <h1>📋 Identificações registradas</h1>
+  <p>${lista.length} registro${lista.length>1?'s':''} · antes do aceite dos termos</p>
+  <table>
+    <tr><th>Data</th><th>Nome</th><th>WhatsApp</th><th>IP</th></tr>
+    ${lista.slice().reverse().map(i => `<tr>
+      <td>${i.data}</td>
+      <td>${i.nome}</td>
+      <td><a href="https://wa.me/55${(i.tel||'').replace(/\D/g,'')}" style="color:#5ee0a0">📱 ${i.tel}</a></td>
+      <td style="color:rgba(255,255,255,.3);font-size:.75rem">${i.ip}</td>
+    </tr>`).join('')}
+  </table>
+  </body></html>`;
+
+  res.send(html);
+});
+
 // ── HEALTH ───────────────────────────────────────────────
 app.get("/", (req, res) => res.send("API rodando"));
 app.get("/health", (req, res) => res.json({ ok: true }));
