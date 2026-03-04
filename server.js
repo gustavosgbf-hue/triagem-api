@@ -152,7 +152,7 @@ app.get("/api/payment/:id", async (req, res) => {
 // ── NOTIFICAR MÉDICOS (email via Resend) ────────────────
 app.post("/api/notify", async (req, res) => {
   try {
-    const { nome, tel, triagem } = req.body || {};
+    const { nome, tel, cpf, triagem } = req.body || {};
     const RESEND_KEY = process.env.RESEND_API_KEY;
 
     const telLimpo = (tel || '').replace(/\D/g, '');
@@ -162,7 +162,6 @@ app.post("/api/notify", async (req, res) => {
       return `${BASE_URL}/atender?medico=${encodeURIComponent(nomeMedico)}&paciente=${encodeURIComponent(nome||'')}&tel=${encodeURIComponent(telLimpo)}`;
     }
 
-    // Monta linhas da tabela de triagem separadas por tópico
     function montarTabelaTriagem(texto) {
       if (!texto) return '<tr><td colspan="2" style="padding:8px 12px;color:rgba(255,255,255,.5)">—</td></tr>';
       return texto
@@ -197,6 +196,10 @@ app.post("/api/notify", async (req, res) => {
             <tr>
               <td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px;width:120px">Paciente</td>
               <td style="padding:8px 0;font-weight:600">${nome || '—'}</td>
+            </tr>
+            <tr>
+              <td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">CPF</td>
+              <td style="padding:8px 0;font-weight:600">${cpf || '—'}</td>
             </tr>
             <tr>
               <td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">WhatsApp</td>
@@ -239,10 +242,9 @@ app.post("/api/notify", async (req, res) => {
       console.error("Resend error:", resendData);
     }
 
-    // Salva no Google Sheets
     await appendToSheet("Atendimentos", [
       new Date().toLocaleString("pt-BR", { timeZone: "America/Fortaleza" }),
-      nome || "", tel || "", "Aguardando", "", triagem || ""
+      nome || "", tel || "", cpf || "", "Aguardando", "", triagem || ""
     ]);
 
     return res.json({ ok: true });
@@ -321,7 +323,7 @@ app.get('/atender', async (req, res) => {
   salvarAtendimento(medico || 'desconhecido', paciente || '—', tel);
   await appendToSheet("Atendimentos", [
     new Date().toLocaleString("pt-BR", { timeZone: "America/Fortaleza" }),
-    paciente || "", tel || "", "Assumido", medico || "", ""
+    paciente || "", tel || "", "", "Assumido", medico || "", ""
   ]);
   console.log(`[ATENDIMENTO] Médico: ${medico} | Paciente: ${paciente} | Tel: ${tel}`);
 
