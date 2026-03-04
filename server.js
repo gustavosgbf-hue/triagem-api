@@ -204,7 +204,7 @@ app.post("/api/notify", async (req, res) => {
             <tr>
               <td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">WhatsApp</td>
               <td style="padding:8px 0">
-                <a href="${linkMedico(\"Dr. Gustavo\")}" style="background:#25D366;color:#fff;padding:6px 16px;border-radius:999px;text-decoration:none;font-size:13px;font-weight:600">📱 Chamar no WhatsApp</a><div style="margin-top:6px;font-size:12px;color:rgba(255,255,255,.45)">${telLimpo}</div>
+                <a href="${linkMedico(`Dr. Gustavo`)}" style="background:#25D366;color:#fff;padding:6px 16px;border-radius:999px;text-decoration:none;font-size:13px;font-weight:600">📱 Chamar no WhatsApp</a><div style="margin-top:6px;font-size:12px;color:rgba(255,255,255,.45)">${telLimpo}</div>
               </td>
             </tr>
           </table>
