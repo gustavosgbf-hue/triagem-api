@@ -157,10 +157,29 @@ app.post("/api/notify", async (req, res) => {
 
     const telLimpo = (tel || '').replace(/\D/g, '');
     const BASE_URL = process.env.RENDER_EXTERNAL_URL || 'https://triagem-api.onrender.com';
-    const waLink = `https://wa.me/55${telLimpo}`; // ← FIX: estava indefinida no original
 
     function linkMedico(nomeMedico){
       return `${BASE_URL}/atender?medico=${encodeURIComponent(nomeMedico)}&paciente=${encodeURIComponent(nome||'')}&tel=${encodeURIComponent(telLimpo)}`;
+    }
+
+    // Monta linhas da tabela de triagem separadas por tópico
+    function montarTabelaTriagem(texto) {
+      if (!texto) return '<tr><td colspan="2" style="padding:8px 12px;color:rgba(255,255,255,.5)">—</td></tr>';
+      return texto
+        .split(/[,;]\s*(?=[A-ZÀÁÂÃÉÊÍÓÔÕÚÇ])/i)
+        .map(item => {
+          const colonIdx = item.indexOf(':');
+          if (colonIdx > 0) {
+            const key = item.slice(0, colonIdx).trim();
+            const val = item.slice(colonIdx + 1).trim();
+            return `<tr>
+              <td style="padding:9px 14px;color:rgba(255,255,255,.45);font-size:12px;white-space:nowrap;border-bottom:1px solid rgba(255,255,255,.06);vertical-align:top;width:160px">${key}</td>
+              <td style="padding:9px 14px;color:#fff;font-weight:500;font-size:13px;border-bottom:1px solid rgba(255,255,255,.06)">${val}</td>
+            </tr>`;
+          }
+          return `<tr><td colspan="2" style="padding:9px 14px;color:rgba(255,255,255,.7);font-size:13px;border-bottom:1px solid rgba(255,255,255,.06)">${item.trim()}</td></tr>`;
+        })
+        .join('');
     }
 
     const destinatarios = [
@@ -175,26 +194,27 @@ app.post("/api/notify", async (req, res) => {
         </div>
         <div style="padding:28px">
           <table style="width:100%;border-collapse:collapse;margin-bottom:24px">
-            <tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px;width:120px">Paciente</td><td style="padding:8px 0;font-weight:600">${nome || '—'}</td></tr>
-            <tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">WhatsApp</td><td style="padding:8px 0"><a href="${linkMedico("Dr. Gustavo")}" style="background:#25D366;color:#fff;padding:6px 16px;border-radius:999px;text-decoration:none;font-size:13px;font-weight:600">📱 Chamar no WhatsApp</a></td></tr>
+            <tr>
+              <td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px;width:120px">Paciente</td>
+              <td style="padding:8px 0;font-weight:600">${nome || '—'}</td>
+            </tr>
+            <tr>
+              <td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">WhatsApp</td>
+              <td style="padding:8px 0">
+                <a href="${linkMedico("Dr. Gustavo")}" style="background:#25D366;color:#fff;padding:6px 16px;border-radius:999px;text-decoration:none;font-size:13px;font-weight:600">📱 Chamar no WhatsApp</a>
+              </td>
+            </tr>
           </table>
-          <div style="background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:10px;padding:18px">
-            <p style="margin:0 0 10px;font-size:12px;text-transform:uppercase;letter-spacing:.1em;color:rgba(255,255,255,.4)">Triagem completa</p>
-            <p style="margin:0;font-size:14px;line-height:1.9;color:rgba(255,255,255,.8)">${
-  (triagem || '—')
-    .split(/,\s*(?=[A-ZÀÁÂÃÉÊÍÓÔÕÚÇ])/)
-    .map(item => {
-      const [key, ...val] = item.split(':');
-      return val.length
-        ? `<div style="display:flex;gap:8px;padding:6px 0;border-bottom:1px solid rgba(255,255,255,.06)">
-            <span style="color:rgba(255,255,255,.4);font-size:12px;min-width:180px;flex-shrink:0">${key.trim()}</span>
-            <span style="color:#fff;font-weight:500">${val.join(':').trim()}</span>
-           </div>`
-        : `<div style="padding:6px 0;border-bottom:1px solid rgba(255,255,255,.06);color:#fff">${item.trim()}</div>`;
-    })
-    .join('')
-}</p>
+
+          <div style="background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:10px;overflow:hidden">
+            <div style="padding:12px 14px;background:rgba(180,224,90,.08);border-bottom:1px solid rgba(255,255,255,.08)">
+              <p style="margin:0;font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:rgba(255,255,255,.4)">Triagem completa</p>
+            </div>
+            <table style="width:100%;border-collapse:collapse">
+              ${montarTabelaTriagem(triagem)}
+            </table>
           </div>
+
           <p style="margin:20px 0 0;font-size:12px;color:rgba(255,255,255,.3)">Enviado automaticamente pelo sistema ConsultaJá24h</p>
         </div>
       </div>
