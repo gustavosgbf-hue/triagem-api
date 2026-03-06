@@ -3,7 +3,7 @@ import cors from "cors";
 import { google } from "googleapis";
 import pg from "pg";
 import bcrypt from "bcrypt";
-
+import jwt from "jsonwebtoken";
 const { Pool } = pg;
 
 const pool = new Pool({
@@ -950,15 +950,27 @@ app.post("/api/medico/login", async (req, res) => {
       });
     }
 
-    return res.json({
-      ok: true,
-      medico: {
-        id: medico.id,
-        nome: medico.nome,
-        email: medico.email,
-        crm: medico.crm,
-      },
-    });
+const token = jwt.sign(
+  { id: medico.id, nome: medico.nome, crm: medico.crm },
+  process.env.JWT_SECRET || "fallback_secret",
+  { expiresIn: "8h" }
+);
+
+return res.json({
+  ok: true,
+  token,
+  medico: {
+    id: medico.id,
+    nome: medico.nome,
+    email: medico.email,
+    crm: medico.crm,
+  },
+});
+```
+
+**3. No Render**, adiciona a variável:
+```
+JWT_SECRET = cj24h_jwt_2026_xK9pQ
   } catch (err) {
     console.error("Erro em /api/medico/login:", err);
     return res.status(500).json({
