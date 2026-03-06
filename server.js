@@ -21,6 +21,30 @@ const MP_TOKEN = process.env.MP_ACCESS_TOKEN;
 if (!OPENAI_KEY) { console.error("OPENAI_API_KEY não definida"); process.exit(1); }
 if (!MP_TOKEN) { console.error("MP_ACCESS_TOKEN não definida"); process.exit(1); }
 
+// ── INIT BANCO — cria tabelas se não existirem ────────────
+async function initDB() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS mensagens (
+        id SERIAL PRIMARY KEY,
+        atendimento_id INTEGER NOT NULL,
+        autor TEXT NOT NULL,
+        autor_id INTEGER,
+        texto TEXT NOT NULL,
+        criado_em TIMESTAMP DEFAULT NOW()
+      )
+    `);
+    // adiciona colunas novas na fila_atendimentos se não existirem
+    await pool.query(`ALTER TABLE fila_atendimentos ADD COLUMN IF NOT EXISTS status_atendimento TEXT`);
+    await pool.query(`ALTER TABLE fila_atendimentos ADD COLUMN IF NOT EXISTS documentos_emitidos TEXT`);
+    await pool.query(`ALTER TABLE fila_atendimentos ADD COLUMN IF NOT EXISTS meet_link TEXT`);
+    console.log("[DB] Tabelas verificadas/criadas com sucesso");
+  } catch (e) {
+    console.error("[DB] Erro no initDB:", e.message);
+  }
+}
+initDB();
+
 // ── GOOGLE SHEETS ─────────────────────────────────────────────────
 const SPREADSHEET_ID = "1z-m4_zJQOIelzOkiUvU8L7VP0CHxJHC317Lb-q0GVCQ";
 
@@ -169,7 +193,6 @@ app.get("/api/payment/:id", async (req, res) => {
 });
 
 // ── NOTIFICAR MÉDICOS ────────────────────────────────────
-// ALTERAÇÃO 1: recebe e salva o campo `tipo` (chat ou video)
 app.post("/api/notify", async (req, res) => {
   try {
     const { nome, tel, cpf, triagem, tipo } = req.body || {};
@@ -199,7 +222,6 @@ app.post("/api/notify", async (req, res) => {
     }
 
     const tipoLabel = tipoConsulta === "video" ? "🎥 Vídeo" : "💬 Chat";
-
     const destinatarios = ["gustavosgbf@gmail.com", process.env.EMAIL_MEDICO_2 || ""].filter(Boolean);
 
     const html = `
@@ -268,17 +290,75 @@ app.post("/api/notify", async (req, res) => {
       tipoConsulta,
     ]);
 
-    // salva tipo correto vindo do frontend
-    await pool.query(
+    const insertResult = await pool.query(
       `INSERT INTO fila_atendimentos (nome, tel, cpf, tipo, triagem, status)
-       VALUES ($1, $2, $3, $4, $5, 'aguardando')`,
+       VALUES ($1, $2, $3, $4, $5, 'aguardando')
+       RETURNING id`,
       [nome || "—", tel || "—", cpf || "—", tipoConsulta, triagem || ""]
     );
 
-    return res.json({ ok: true });
+    const atendimentoId = insertResult.rows[0]?.id;
+    return res.json({ ok: true, atendimentoId });
   } catch (e) {
     console.error("Notify error:", e);
     return res.status(500).json({ ok: false });
+  }
+});
+
+// ── CHAT INTERNO — ENVIAR MENSAGEM ───────────────────────
+app.post("/api/chat/enviar", async (req, res) => {
+  try {
+    const { atendimentoId, autor, autorId, texto } = req.body || {};
+    if (!atendimentoId || !autor || !texto) {
+      return res.status(400).json({ ok: false, error: "Campos obrigatórios: atendimentoId, autor, texto" });
+    }
+    if (!["paciente", "medico"].includes(autor)) {
+      return res.status(400).json({ ok: false, error: "autor deve ser 'paciente' ou 'medico'" });
+    }
+    const result = await pool.query(
+      `INSERT INTO mensagens (atendimento_id, autor, autor_id, texto)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id, atendimento_id, autor, texto, criado_em`,
+      [atendimentoId, autor, autorId || null, texto.trim()]
+    );
+    return res.json({ ok: true, mensagem: result.rows[0] });
+  } catch (e) {
+    console.error("Erro em /api/chat/enviar:", e);
+    return res.status(500).json({ ok: false, error: "Erro ao enviar mensagem" });
+  }
+});
+
+// ── CHAT INTERNO — BUSCAR HISTÓRICO ─────────────────────
+app.get("/api/chat/:atendimentoId", async (req, res) => {
+  try {
+    const { atendimentoId } = req.params;
+    const result = await pool.query(
+      `SELECT id, atendimento_id, autor, texto, criado_em
+       FROM mensagens
+       WHERE atendimento_id = $1
+       ORDER BY criado_em ASC`,
+      [atendimentoId]
+    );
+    return res.json({ ok: true, mensagens: result.rows });
+  } catch (e) {
+    console.error("Erro em /api/chat/:id:", e);
+    return res.status(500).json({ ok: false, error: "Erro ao buscar mensagens" });
+  }
+});
+
+// ── STATUS DO ATENDIMENTO (paciente verifica se foi assumido) ──
+app.get("/api/atendimento/status/:id", async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, status, tipo, medico_nome, meet_link
+       FROM fila_atendimentos
+       WHERE id = $1`,
+      [req.params.id]
+    );
+    if (result.rowCount === 0) return res.status(404).json({ ok: false, error: "Atendimento não encontrado" });
+    return res.json({ ok: true, atendimento: result.rows[0] });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: "Erro ao buscar status" });
   }
 });
 
@@ -310,7 +390,7 @@ app.post("/api/consent", async (req, res) => {
   }
 });
 
-// ── ATENDER ───────────────────────────────────────────────
+// ── ATENDER (redirect antigo) ─────────────────────────────
 app.get("/atender", async (req, res) => {
   try {
     const { medico, paciente, tel } = req.query;
@@ -372,12 +452,16 @@ app.post("/api/medico/login", async (req, res) => {
     if (!email || !senha) return res.status(400).json({ ok: false, error: "E-mail e senha são obrigatórios" });
     const result = await pool.query("SELECT id, nome, email, crm, senha_hash, ativo FROM medicos WHERE email = $1 LIMIT 1", [email.trim().toLowerCase()]);
     if (result.rowCount === 0) return res.status(401).json({ ok: false, error: "Credenciais inválidas" });
-    const medico = result.rows[0];
-    if (!medico.ativo) return res.status(403).json({ ok: false, error: "Médico inativo" });
-    const senhaOk = await bcrypt.compare(senha, medico.senha_hash);
+    const med = result.rows[0];
+    if (!med.ativo) return res.status(403).json({ ok: false, error: "Médico inativo" });
+    const senhaOk = await bcrypt.compare(senha, med.senha_hash);
     if (!senhaOk) return res.status(401).json({ ok: false, error: "Credenciais inválidas" });
-    const token = jwt.sign({ id: medico.id, nome: medico.nome, crm: medico.crm }, process.env.JWT_SECRET || "fallback_secret", { expiresIn: "8h" });
-    return res.json({ ok: true, token, medico: { id: medico.id, nome: medico.nome, email: medico.email, crm: medico.crm } });
+    const token = jwt.sign(
+      { id: med.id, nome: med.nome, crm: med.crm },
+      process.env.JWT_SECRET || "fallback_secret",
+      { expiresIn: "8h" }
+    );
+    return res.json({ ok: true, token, medico: { id: med.id, nome: med.nome, email: med.email, crm: med.crm } });
   } catch (err) {
     return res.status(500).json({ ok: false, error: "Erro interno no login" });
   }
@@ -387,9 +471,9 @@ app.post("/api/medico/login", async (req, res) => {
 app.get("/api/fila", async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT id, nome, tel, cpf, tipo, triagem, status, medico_id, medico_nome, criado_em
+      `SELECT id, nome, tel, cpf, tipo, triagem, status, medico_id, medico_nome, meet_link, criado_em
        FROM fila_atendimentos
-       WHERE status = 'aguardando'
+       WHERE status IN ('aguardando', 'assumido')
        ORDER BY criado_em ASC`
     );
     return res.json({ ok: true, fila: result.rows });
@@ -417,8 +501,23 @@ app.post("/api/atendimento/assumir", async (req, res) => {
   }
 });
 
+// ── SALVAR LINK DO MEET ───────────────────────────────────
+app.post("/api/atendimento/meet", async (req, res) => {
+  try {
+    const { filaId, meetLink } = req.body || {};
+    if (!filaId || !meetLink) return res.status(400).json({ ok: false, error: "filaId e meetLink obrigatórios" });
+    const result = await pool.query(
+      `UPDATE fila_atendimentos SET meet_link = $1 WHERE id = $2 RETURNING id, meet_link`,
+      [meetLink.trim(), filaId]
+    );
+    if (result.rowCount === 0) return res.status(404).json({ ok: false, error: "Atendimento não encontrado" });
+    return res.json({ ok: true, meet_link: result.rows[0].meet_link });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: "Erro ao salvar link" });
+  }
+});
+
 // ── ENCERRAR ──────────────────────────────────────────────
-// ALTERAÇÃO 2: salva status e documentos_emitidos
 app.post("/api/atendimento/encerrar", async (req, res) => {
   try {
     const { filaId, status, documentos_emitidos } = req.body || {};
@@ -450,7 +549,7 @@ app.post("/api/plantao/entrar", async (req, res) => {
     await pool.query("UPDATE medicos SET status_online = true WHERE id = $1", [decoded.id]);
     return res.json({ ok: true });
   } catch (e) {
-    return res.json({ ok: true }); // não bloqueia mesmo sem token válido
+    return res.json({ ok: true });
   }
 });
 
@@ -467,7 +566,6 @@ app.post("/api/plantao/sair", async (req, res) => {
 });
 
 // ── RELATÓRIO ADMIN ───────────────────────────────────────
-// ALTERAÇÃO 3: mostra documentos_emitidos e tipo no relatório da fila
 app.get("/relatorio", checkAdmin, async (req, res) => {
   try {
     const result = await pool.query(
@@ -513,13 +611,8 @@ app.get("/relatorio", checkAdmin, async (req, res) => {
     </div>
     <table>
       <tr>
-        <th>Data</th>
-        <th>Paciente</th>
-        <th>WhatsApp</th>
-        <th>Modalidade</th>
-        <th>Médico</th>
-        <th>Status</th>
-        <th>Documentos</th>
+        <th>Data</th><th>Paciente</th><th>WhatsApp</th><th>Modalidade</th>
+        <th>Médico</th><th>Status</th><th>Documentos</th>
       </tr>
       ${lista.map(a => {
         const data = a.criado_em ? new Date(a.criado_em).toLocaleString('pt-BR', { timeZone: 'America/Fortaleza' }) : '—';
