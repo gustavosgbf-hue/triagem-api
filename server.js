@@ -671,6 +671,36 @@ app.get("/consentimentos", checkAdmin, async (req, res) => {
 // ── HEALTH ───────────────────────────────────────────────
 app.get("/", (req, res) => res.send("API rodando"));
 app.get("/health", (req, res) => res.json({ ok: true }));
+
+// Endpoint público para landing page: médicos online + tempo estimado de espera
+app.get("/api/disponibilidade", async (req, res) => {
+  try {
+    const [medRes, filaRes] = await Promise.all([
+      pool.query("SELECT COUNT(*) FROM medicos WHERE status_online = true AND ativo = true"),
+      pool.query("SELECT COUNT(*) FROM fila_atendimentos WHERE status = 'aguardando'")
+    ]);
+    const medicosOnline = parseInt(medRes.rows[0].count) || 0;
+    const pacientesAguardando = parseInt(filaRes.rows[0].count) || 0;
+
+    // Tempo estimado em minutos (cada consulta ~6 min, mínimo 3 min)
+    let tempoEstimado = 3;
+    if (medicosOnline > 0) {
+      tempoEstimado = Math.max(3, Math.ceil((pacientesAguardando / medicosOnline) * 6));
+    } else if (pacientesAguardando > 0) {
+      tempoEstimado = Math.max(10, pacientesAguardando * 6);
+    }
+
+    // Status: verde / amarelo / vermelho
+    let status = 'verde';
+    if (medicosOnline === 0) status = 'vermelho';
+    else if (tempoEstimado > 10) status = 'amarelo';
+
+    res.json({ ok: true, medicosOnline, pacientesAguardando, tempoEstimado, status });
+  } catch(e) {
+    res.json({ ok: false, medicosOnline: 0, tempoEstimado: 5, status: 'verde' });
+  }
+});
+
 app.get("/api/test-db", async (req, res) => {
   try {
     const result = await pool.query("SELECT NOW()");
