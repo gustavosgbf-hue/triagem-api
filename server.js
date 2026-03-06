@@ -1,714 +1,134 @@
-import express from "express";
-import cors from "cors";
-import { google } from "googleapis";
-import pg from "pg";
-import bcrypt from "bcrypt";
-import jwt from "jsonwebtoken";
-const { Pool } = pg;
+Preciso que você faça alguns ajustes no projeto atual do ConsultaJá24h.
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
-});
+O server.js já está funcionando, mas preciso melhorar o acesso aos relatórios e restaurar o log no Google Sheets.
 
-const app = express();
-app.use(cors());
-app.use(express.json({ limit: "1mb" }));
+Faça as seguintes alterações com cuidado para não quebrar o fluxo atual.
 
-const OPENAI_KEY = process.env.OPENAI_API_KEY;
-const MP_TOKEN = process.env.MP_ACCESS_TOKEN;
+Permitir acesso ADMIN por URL
 
-if (!OPENAI_KEY) { console.error("OPENAI_API_KEY não definida"); process.exit(1); }
-if (!MP_TOKEN) { console.error("MP_ACCESS_TOKEN não definida"); process.exit(1); }
+Hoje as rotas:
 
-// ── INIT BANCO — cria tabelas se não existirem ────────────
-async function initDB() {
-  try {
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS mensagens (
-        id SERIAL PRIMARY KEY,
-        atendimento_id INTEGER NOT NULL,
-        autor TEXT NOT NULL,
-        autor_id INTEGER,
-        texto TEXT NOT NULL,
-        criado_em TIMESTAMP DEFAULT NOW()
-      )
-    `);
-    // adiciona colunas novas na fila_atendimentos se não existirem
-    await pool.query(`ALTER TABLE fila_atendimentos ADD COLUMN IF NOT EXISTS status_atendimento TEXT`);
-    await pool.query(`ALTER TABLE fila_atendimentos ADD COLUMN IF NOT EXISTS documentos_emitidos TEXT`);
-    await pool.query(`ALTER TABLE fila_atendimentos ADD COLUMN IF NOT EXISTS meet_link TEXT`);
-    console.log("[DB] Tabelas verificadas/criadas com sucesso");
-  } catch (e) {
-    console.error("[DB] Erro no initDB:", e.message);
-  }
-}
-initDB();
+/relatorio
+/identificacoes
+/consentimentos
 
-// ── GOOGLE SHEETS ─────────────────────────────────────────────────
-const SPREADSHEET_ID = "1z-m4_zJQOIelzOkiUvU8L7VP0CHxJHC317Lb-q0GVCQ";
+só funcionam quando a senha admin é enviada via header x-admin-password.
 
-const serviceAccount = {
-  type: "service_account",
-  project_id: "consultaja24h",
-  private_key_id: process.env.GOOGLE_PRIVATE_KEY_ID || "",
-  private_key: (process.env.GOOGLE_PRIVATE_KEY || "").replace(/\\n/g, "\n"),
-  client_email: process.env.GOOGLE_CLIENT_EMAIL || "",
-  client_id: process.env.GOOGLE_CLIENT_ID || "",
-  auth_uri: "https://accounts.google.com/o/oauth2/auth",
-  token_uri: "https://oauth2.googleapis.com/token",
-};
+O navegador não envia esse header, então quero permitir também senha via query string.
 
-async function appendToSheet(sheetName, values) {
-  try {
-    const auth = new google.auth.GoogleAuth({
-      credentials: serviceAccount,
-      scopes: ["https://www.googleapis.com/auth/spreadsheets"],
-    });
-    const sheets = google.sheets({ version: "v4", auth });
-    await sheets.spreadsheets.values.append({
-      spreadsheetId: SPREADSHEET_ID,
-      range: `${sheetName}!A1`,
-      valueInputOption: "USER_ENTERED",
-      requestBody: { values: [values] },
-    });
-  } catch (e) {
-    console.error(`[SHEETS] Erro ao salvar em ${sheetName}:`, e.message);
-  }
-}
+Altere o middleware de verificação admin para aceitar:
 
-// ── OPENAI ───────────────────────────────────────────────
-async function callOpenAI({ system, messages }) {
-  const res = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${OPENAI_KEY}`,
-    },
-    body: JSON.stringify({
-      model: "gpt-4o-mini",
-      temperature: 0.3,
-      messages: [
-        { role: "system", content: String(system ?? "") },
-        ...(messages || [])
-          .filter((m) => m?.role !== "system")
-          .map((m) => ({ role: m.role, content: String(m.content ?? "") })),
-      ],
-    }),
-  });
+header: x-admin-password
 
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) return { ok: false, error: data?.error?.message || JSON.stringify(data) };
-  return { ok: true, text: data?.choices?.[0]?.message?.content || "" };
-}
+OU query: ?senha=
 
-async function handleChat(req, res) {
-  try {
-    const { system, messages } = req.body || {};
-    if (!system || !Array.isArray(messages)) {
-      return res.status(400).json({ ok: false, error: "Payload inválido" });
-    }
-    const out = await callOpenAI({ system, messages });
-    if (!out.ok) {
-      return res.status(503).json({ text: "Sistema temporariamente indisponível. Tente novamente em instantes." });
-    }
-    return res.json({ text: out.text });
-  } catch (e) {
-    console.error(e);
-    return res.status(500).json({ text: "Erro interno temporário." });
-  }
-}
+Exemplo de código esperado:
 
-// ── ADMIN — PROTEÇÃO ──────────────────────────────
 function checkAdmin(req, res, next) {
-  const senha = req.headers["x-admin-password"];
-  const senhaAdmin = process.env.ADMIN_PASSWORD;
-  if (!senhaAdmin) return res.status(500).send("ADMIN_PASSWORD não configurada");
-  if (!senha || senha !== senhaAdmin) return res.status(403).send("Acesso negado");
+  const senha = req.headers["x-admin-password"] || req.query.senha;
+
+  if (senha !== process.env.ADMIN_PASSWORD) {
+    return res.status(403).send("Acesso negado");
+  }
+
   next();
 }
 
-// ── ROTAS ABERTAS ────────────────────────────────────────
-app.post("/api/triage", handleChat);
-app.post("/api/doctor", handleChat);
+Assim os links devem funcionar diretamente no navegador:
 
-// ── MERCADO PAGO — GERAR PIX ─────────────────────────────
-app.post("/api/payment", async (req, res) => {
-  try {
-    const { email, nome } = req.body || {};
-    const idempotency = `consult-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+https://triagem-api.onrender.com/relatorio?senha=ADMIN_PASSWORD
 
-    const mpRes = await fetch("https://api.mercadopago.com/v1/payments", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${MP_TOKEN}`,
-        "X-Idempotency-Key": idempotency,
-      },
-      body: JSON.stringify({
-        transaction_amount: 49.9,
-        description: "Consulta Médica Online – Pronto Atendimento Online",
-        payment_method_id: "pix",
-        payer: {
-          email: email || "paciente@prontoatendimento.com",
-          first_name: (nome || "Paciente").split(" ")[0],
-          last_name: (nome || "Paciente").split(" ").slice(1).join(" ") || "Online",
-        },
-      }),
-    });
+https://triagem-api.onrender.com/identificacoes?senha=ADMIN_PASSWORD
 
-    const data = await mpRes.json();
-    if (!mpRes.ok) {
-      console.error("MP error:", data);
-      return res.status(500).json({ ok: false, error: data.message || "Erro ao gerar pagamento" });
-    }
+https://triagem-api.onrender.com/consentimentos?senha=ADMIN_PASSWORD
 
-    return res.json({
-      ok: true,
-      payment_id: data.id,
-      status: data.status,
-      qr_code: data.point_of_interaction?.transaction_data?.qr_code,
-      qr_code_base64: data.point_of_interaction?.transaction_data?.qr_code_base64,
-    });
-  } catch (e) {
-    console.error("Erro em /api/payment:", e);
-    return res.status(500).json({ ok: false, error: "Erro interno" });
-  }
-});
+Não remover o suporte ao header.
 
-// ── MERCADO PAGO — CHECAR STATUS ─────────────────────────
-app.get("/api/payment/:id", async (req, res) => {
-  try {
-    const mpRes = await fetch(`https://api.mercadopago.com/v1/payments/${req.params.id}`, {
-      headers: { Authorization: `Bearer ${MP_TOKEN}` },
-    });
-    const data = await mpRes.json();
-    if (!mpRes.ok) {
-      return res.status(500).json({ ok: false, error: data.message || "Erro ao consultar pagamento" });
-    }
-    return res.json({ ok: true, status: data.status });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: "Erro ao consultar pagamento" });
-  }
-});
+Restaurar log no Google Sheets
 
-// ── NOTIFICAR MÉDICOS ────────────────────────────────────
-app.post("/api/notify", async (req, res) => {
-  try {
-    const { nome, tel, cpf, triagem, tipo } = req.body || {};
-    const tipoConsulta = tipo === "video" ? "video" : "chat";
-    const RESEND_KEY = process.env.RESEND_API_KEY;
-    const telLimpo = (tel || "").replace(/\D/g, "");
-    const BASE_URL = process.env.RENDER_EXTERNAL_URL || "https://triagem-api.onrender.com";
+Antes o sistema salvava registros no Google Sheets e isso parou de funcionar.
 
-    function linkMedico(nomeMedico) {
-      return `${BASE_URL}/atender?medico=${encodeURIComponent(nomeMedico)}&paciente=${encodeURIComponent(nome || "")}&tel=${encodeURIComponent(telLimpo)}`;
-    }
+Preciso restaurar essa integração.
 
-    function montarTabelaTriagem(texto) {
-      if (!texto) return '<tr><td colspan="2" style="padding:8px 12px;color:rgba(255,255,255,.5)">—</td></tr>';
-      return texto.split(/[,;]\s*(?=[A-ZÀÁÂÃÉÊÍÓÔÕÚÇ])/i).map((item) => {
-        const colonIdx = item.indexOf(":");
-        if (colonIdx > 0) {
-          const key = item.slice(0, colonIdx).trim();
-          const val = item.slice(colonIdx + 1).trim();
-          return `<tr>
-            <td style="padding:9px 14px;color:rgba(255,255,255,.45);font-size:12px;white-space:nowrap;border-bottom:1px solid rgba(255,255,255,.06);vertical-align:top;width:160px">${key}</td>
-            <td style="padding:9px 14px;color:#fff;font-weight:500;font-size:13px;border-bottom:1px solid rgba(255,255,255,.06)">${val}</td>
-          </tr>`;
-        }
-        return `<tr><td colspan="2" style="padding:9px 14px;color:rgba(255,255,255,.7);font-size:13px;border-bottom:1px solid rgba(255,255,255,.06)">${item.trim()}</td></tr>`;
-      }).join("");
-    }
+Usar:
 
-    const tipoLabel = tipoConsulta === "video" ? "🎥 Vídeo" : "💬 Chat";
-    const destinatarios = ["gustavosgbf@gmail.com", process.env.EMAIL_MEDICO_2 || ""].filter(Boolean);
+googleapis
+service account JSON
+SPREADSHEET_ID já existente no projeto
 
-    const html = `
-      <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#060d0b;color:#fff;border-radius:12px;overflow:hidden">
-        <div style="background:linear-gradient(135deg,#b4e05a,#5ee0a0);padding:20px 28px">
-          <h2 style="margin:0;color:#051208;font-size:18px">🏥 Nova triagem — ConsultaJá24h</h2>
-        </div>
-        <div style="padding:28px">
-          <table style="width:100%;border-collapse:collapse;margin-bottom:24px">
-            <tr>
-              <td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px;width:120px">Paciente</td>
-              <td style="padding:8px 0;font-weight:600">${nome || "—"}</td>
-            </tr>
-            <tr>
-              <td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">CPF</td>
-              <td style="padding:8px 0;font-weight:600">${cpf || "—"}</td>
-            </tr>
-            <tr>
-              <td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">Modalidade</td>
-              <td style="padding:8px 0;font-weight:600">${tipoLabel}</td>
-            </tr>
-            <tr>
-              <td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">WhatsApp</td>
-              <td style="padding:8px 0">
-                <a href="${linkMedico("Dr. Gustavo")}" style="background:#25D366;color:#fff;padding:6px 16px;border-radius:999px;text-decoration:none;font-size:13px;font-weight:600">📱 Chamar no WhatsApp</a>
-                <div style="margin-top:6px;font-size:12px;color:rgba(255,255,255,.45)">${telLimpo}</div>
-              </td>
-            </tr>
-          </table>
+Planilha deve registrar:
 
-          <div style="background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:10px;overflow:hidden">
-            <div style="padding:12px 14px;background:rgba(180,224,90,.08);border-bottom:1px solid rgba(255,255,255,.08)">
-              <p style="margin:0;font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:rgba(255,255,255,.4)">Triagem completa</p>
-            </div>
-            <table style="width:100%;border-collapse:collapse">
-              ${montarTabelaTriagem(triagem)}
-            </table>
-          </div>
+IDENTIFICAÇÕES
+nome
+cpf
+telefone
+email
+data
+hora
 
-          <p style="margin:20px 0 0;font-size:12px;color:rgba(255,255,255,.3)">Enviado automaticamente pelo sistema ConsultaJá24h</p>
-        </div>
-      </div>`;
+CONSENTIMENTOS
+cpf
+aceitou_termos
+data
+hora
 
-    const resendRes = await fetch("https://api.resend.com/emails", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${RESEND_KEY}` },
-      body: JSON.stringify({
-        from: "ConsultaJá24h <onboarding@resend.dev>",
-        to: destinatarios,
-        subject: `🏥 Nova triagem — ${nome || "Paciente"} (${tipoLabel})`,
-        html,
-      }),
-    });
+ATENDIMENTOS
+id_atendimento
+nome
+cpf
+telefone
+modalidade
+data
+hora
+status
 
-    const resendData = await resendRes.json();
-    if (!resendRes.ok) console.error("Resend error:", resendData);
+Se a escrita no Sheets falhar, não quebrar o fluxo da API.
 
-    await appendToSheet("Atendimentos", [
-      new Date().toLocaleString("pt-BR", { timeZone: "America/Fortaleza" }),
-      nome || "",
-      tel || "",
-      cpf || "",
-      "Aguardando",
-      "",
-      triagem || "",
-      tipoConsulta,
-    ]);
+Apenas logar erro no console.
 
-    const insertResult = await pool.query(
-      `INSERT INTO fila_atendimentos (nome, tel, cpf, tipo, triagem, status)
-       VALUES ($1, $2, $3, $4, $5, 'aguardando')
-       RETURNING id`,
-      [nome || "—", tel || "—", cpf || "—", tipoConsulta, triagem || ""]
-    );
+Melhorar endpoint /relatorio
 
-    const atendimentoId = insertResult.rows[0]?.id;
-    return res.json({ ok: true, atendimentoId });
-  } catch (e) {
-    console.error("Notify error:", e);
-    return res.status(500).json({ ok: false });
-  }
-});
+O endpoint /relatorio deve mostrar:
 
-// ── CHAT INTERNO — ENVIAR MENSAGEM ───────────────────────
-app.post("/api/chat/enviar", async (req, res) => {
-  try {
-    const { atendimentoId, autor, autorId, texto } = req.body || {};
-    if (!atendimentoId || !autor || !texto) {
-      return res.status(400).json({ ok: false, error: "Campos obrigatórios: atendimentoId, autor, texto" });
-    }
-    if (!["paciente", "medico"].includes(autor)) {
-      return res.status(400).json({ ok: false, error: "autor deve ser 'paciente' ou 'medico'" });
-    }
-    const result = await pool.query(
-      `INSERT INTO mensagens (atendimento_id, autor, autor_id, texto)
-       VALUES ($1, $2, $3, $4)
-       RETURNING id, atendimento_id, autor, texto, criado_em`,
-      [atendimentoId, autor, autorId || null, texto.trim()]
-    );
-    return res.json({ ok: true, mensagem: result.rows[0] });
-  } catch (e) {
-    console.error("Erro em /api/chat/enviar:", e);
-    return res.status(500).json({ ok: false, error: "Erro ao enviar mensagem" });
-  }
-});
+atendimentos
 
-// ── CHAT INTERNO — BUSCAR HISTÓRICO ─────────────────────
-app.get("/api/chat/:atendimentoId", async (req, res) => {
-  try {
-    const { atendimentoId } = req.params;
-    const result = await pool.query(
-      `SELECT id, atendimento_id, autor, texto, criado_em
-       FROM mensagens
-       WHERE atendimento_id = $1
-       ORDER BY criado_em ASC`,
-      [atendimentoId]
-    );
-    return res.json({ ok: true, mensagens: result.rows });
-  } catch (e) {
-    console.error("Erro em /api/chat/:id:", e);
-    return res.status(500).json({ ok: false, error: "Erro ao buscar mensagens" });
-  }
-});
+identificações
 
-// ── STATUS DO ATENDIMENTO (paciente verifica se foi assumido) ──
-app.get("/api/atendimento/status/:id", async (req, res) => {
-  try {
-    const result = await pool.query(
-      `SELECT id, status, tipo, medico_nome, meet_link
-       FROM fila_atendimentos
-       WHERE id = $1`,
-      [req.params.id]
-    );
-    if (result.rowCount === 0) return res.status(404).json({ ok: false, error: "Atendimento não encontrado" });
-    return res.json({ ok: true, atendimento: result.rows[0] });
-  } catch (e) {
-    return res.status(500).json({ ok: false, error: "Erro ao buscar status" });
-  }
-});
+consentimentos
 
-// ── IDENTIFICAÇÃO ────────────────────────────────────────
-app.post("/api/identify", async (req, res) => {
-  try {
-    const { nome, tel } = req.body || {};
-    const agora = new Date().toLocaleString("pt-BR", { timeZone: "America/Fortaleza" });
-    const ip = req.headers["x-forwarded-for"] || req.socket?.remoteAddress || "—";
-    await pool.query("INSERT INTO identificacoes (nome, tel, data, ip) VALUES ($1,$2,$3,$4)", [nome || "—", tel || "—", agora, ip]);
-    await appendToSheet("Identificacoes", [agora, nome || "", tel || "", ip]);
-    return res.json({ ok: true });
-  } catch (e) {
-    return res.status(500).json({ ok: false });
-  }
-});
+status
 
-// ── CONSENTIMENTO ────────────────────────────────────────
-app.post("/api/consent", async (req, res) => {
-  try {
-    const { nome, tel, versao } = req.body || {};
-    const agora = new Date().toLocaleString("pt-BR", { timeZone: "America/Fortaleza" });
-    const ip = req.headers["x-forwarded-for"] || req.socket?.remoteAddress || "—";
-    await pool.query("INSERT INTO consentimentos (nome, tel, versao, data, ip) VALUES ($1,$2,$3,$4,$5)", [nome || "—", tel || "—", versao || "v1.0", agora, ip]);
-    await appendToSheet("Consentimentos", [agora, nome || "", tel || "", versao || "v1.0", ip]);
-    return res.json({ ok: true });
-  } catch (e) {
-    return res.status(500).json({ ok: false });
-  }
-});
+horário
 
-// ── ATENDER (redirect antigo) ─────────────────────────────
-app.get("/atender", async (req, res) => {
-  try {
-    const { medico, paciente, tel } = req.query;
-    if (!tel) return res.status(400).send("Parâmetros inválidos");
-    const agora = new Date().toLocaleString("pt-BR", { timeZone: "America/Fortaleza" });
-    await pool.query("INSERT INTO logs_atendimentos (medico, paciente, tel, data) VALUES ($1,$2,$3,$4)", [medico || "desconhecido", paciente || "—", tel, agora]);
-    await appendToSheet("Atendimentos", [agora, paciente || "", tel || "", "", "Assumido", medico || "", ""]);
-    const telLimpo = String(tel).replace(/\D/g, "");
-    return res.redirect(`https://wa.me/55${telLimpo}`);
-  } catch (e) {
-    return res.status(500).send("Erro ao assumir atendimento");
-  }
-});
+Formatado em tabela HTML simples para leitura no navegador.
 
-// ── ADMIN — MÉDICOS ───────────────────────────────────────
-app.post("/api/admin/medico/criar", checkAdmin, async (req, res) => {
-  try {
-    const { nome, email, crm, senha } = req.body || {};
-    if (!nome || !email || !crm || !senha) return res.status(400).json({ ok: false, error: "Campos obrigatórios faltando" });
-    const senha_hash = await bcrypt.hash(senha, 10);
-    const result = await pool.query(
-      `INSERT INTO medicos (nome, email, senha_hash, crm, status_online, ativo)
-       VALUES ($1, $2, $3, $4, false, true)
-       RETURNING id, nome, email, crm, status_online, ativo, created_at`,
-      [nome, email.trim().toLowerCase(), senha_hash, crm]
-    );
-    return res.json({ ok: true, medico: result.rows[0] });
-  } catch (err) {
-    if (err.code === "23505") return res.status(400).json({ ok: false, error: "E-mail já cadastrado" });
-    return res.status(500).json({ ok: false, error: err.message });
-  }
-});
+Garantir que não quebre:
 
-app.get("/api/admin/medicos", checkAdmin, async (req, res) => {
-  try {
-    const result = await pool.query("SELECT id, nome, email, crm, status_online, ativo, created_at FROM medicos ORDER BY id DESC");
-    return res.json({ ok: true, medicos: result.rows });
-  } catch (err) {
-    return res.status(500).json({ ok: false, error: err.message });
-  }
-});
+triagem.html
+painel.html
+chat
+fila
+meet_link
+assumir atendimento
+encerrar atendimento
 
-app.patch("/api/admin/medico/:id", checkAdmin, async (req, res) => {
-  try {
-    const { ativo } = req.body || {};
-    if (typeof ativo !== "boolean") return res.status(400).json({ ok: false, error: "Campo 'ativo' deve ser boolean" });
-    const result = await pool.query("UPDATE medicos SET ativo = $1 WHERE id = $2 RETURNING id, nome, ativo", [ativo, req.params.id]);
-    if (result.rowCount === 0) return res.status(404).json({ ok: false, error: "Médico não encontrado" });
-    return res.json({ ok: true, medico: result.rows[0] });
-  } catch (err) {
-    return res.status(500).json({ ok: false, error: err.message });
-  }
-});
+Essas partes já estão funcionando e não devem ser alteradas.
 
-// ── LOGIN MÉDICO ──────────────────────────────────────────
-app.post("/api/medico/login", async (req, res) => {
-  try {
-    const { email, senha } = req.body || {};
-    if (!email || !senha) return res.status(400).json({ ok: false, error: "E-mail e senha são obrigatórios" });
-    const result = await pool.query("SELECT id, nome, email, crm, senha_hash, ativo FROM medicos WHERE email = $1 LIMIT 1", [email.trim().toLowerCase()]);
-    if (result.rowCount === 0) return res.status(401).json({ ok: false, error: "Credenciais inválidas" });
-    const med = result.rows[0];
-    if (!med.ativo) return res.status(403).json({ ok: false, error: "Médico inativo" });
-    const senhaOk = await bcrypt.compare(senha, med.senha_hash);
-    if (!senhaOk) return res.status(401).json({ ok: false, error: "Credenciais inválidas" });
-    const token = jwt.sign(
-      { id: med.id, nome: med.nome, crm: med.crm },
-      process.env.JWT_SECRET || "fallback_secret",
-      { expiresIn: "8h" }
-    );
-    return res.json({ ok: true, token, medico: { id: med.id, nome: med.nome, email: med.email, crm: med.crm } });
-  } catch (err) {
-    return res.status(500).json({ ok: false, error: "Erro interno no login" });
-  }
-});
+Conferir se o retorno de /api/chat/enviar continua retornando:
 
-// ── FILA ──────────────────────────────────────────────────
-app.get("/api/fila", async (req, res) => {
-  try {
-    const result = await pool.query(
-      `SELECT id, nome, tel, cpf, tipo, triagem, status, medico_id, medico_nome, meet_link, criado_em
-       FROM fila_atendimentos
-       WHERE status IN ('aguardando', 'assumido')
-       ORDER BY criado_em ASC`
-    );
-    return res.json({ ok: true, fila: result.rows });
-  } catch (err) {
-    return res.status(500).json({ ok: false, error: "Erro ao carregar fila" });
-  }
-});
+{
+  id,
+  texto,
+  autor,
+  created_at
+}
 
-// ── ASSUMIR ───────────────────────────────────────────────
-app.post("/api/atendimento/assumir", async (req, res) => {
-  try {
-    const { filaId, medicoId, medicoNome } = req.body || {};
-    if (!filaId || !medicoId || !medicoNome) return res.status(400).json({ ok: false, error: "Dados obrigatórios faltando" });
-    const result = await pool.query(
-      `UPDATE fila_atendimentos
-       SET status = 'assumido', medico_id = $1, medico_nome = $2, assumido_em = NOW()
-       WHERE id = $3 AND status = 'aguardando'
-       RETURNING *`,
-      [medicoId, medicoNome, filaId]
-    );
-    if (result.rowCount === 0) return res.status(409).json({ ok: false, error: "Paciente já foi assumido" });
-    return res.json({ ok: true, atendimento: result.rows[0] });
-  } catch (err) {
-    return res.status(500).json({ ok: false, error: "Erro ao assumir atendimento" });
-  }
-});
+Porque o frontend depende disso.
 
-// ── SALVAR LINK DO MEET ───────────────────────────────────
-app.post("/api/atendimento/meet", async (req, res) => {
-  try {
-    const { filaId, meetLink } = req.body || {};
-    if (!filaId || !meetLink) return res.status(400).json({ ok: false, error: "filaId e meetLink obrigatórios" });
-    const result = await pool.query(
-      `UPDATE fila_atendimentos SET meet_link = $1 WHERE id = $2 RETURNING id, meet_link`,
-      [meetLink.trim(), filaId]
-    );
-    if (result.rowCount === 0) return res.status(404).json({ ok: false, error: "Atendimento não encontrado" });
-    return res.json({ ok: true, meet_link: result.rows[0].meet_link });
-  } catch (err) {
-    return res.status(500).json({ ok: false, error: "Erro ao salvar link" });
-  }
-});
+Após implementar, me mostre:
 
-// ── ENCERRAR ──────────────────────────────────────────────
-app.post("/api/atendimento/encerrar", async (req, res) => {
-  try {
-    const { filaId, status, documentos_emitidos } = req.body || {};
-    if (!filaId) return res.status(400).json({ ok: false, error: "filaId é obrigatório" });
-    const result = await pool.query(
-      `UPDATE fila_atendimentos
-       SET status = 'encerrado',
-           encerrado_em = NOW(),
-           status_atendimento = $2,
-           documentos_emitidos = $3
-       WHERE id = $1
-       RETURNING *`,
-      [filaId, status || "Encerrado", documentos_emitidos || "Nenhum"]
-    );
-    if (result.rowCount === 0) return res.status(404).json({ ok: false, error: "Atendimento não encontrado" });
-    return res.json({ ok: true, atendimento: result.rows[0] });
-  } catch (err) {
-    console.error("Erro em /api/atendimento/encerrar:", err);
-    return res.status(500).json({ ok: false, error: "Erro ao encerrar atendimento" });
-  }
-});
+trecho do novo middleware admin
 
-// ── PLANTÃO ───────────────────────────────────────────────
-app.post("/api/plantao/entrar", async (req, res) => {
-  try {
-    const auth = req.headers["authorization"] || "";
-    const token = auth.replace("Bearer ", "");
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || "fallback_secret");
-    await pool.query("UPDATE medicos SET status_online = true WHERE id = $1", [decoded.id]);
-    return res.json({ ok: true });
-  } catch (e) {
-    return res.json({ ok: true });
-  }
-});
+trecho do Google Sheets funcionando
 
-app.post("/api/plantao/sair", async (req, res) => {
-  try {
-    const auth = req.headers["authorization"] || "";
-    const token = auth.replace("Bearer ", "");
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || "fallback_secret");
-    await pool.query("UPDATE medicos SET status_online = false WHERE id = $1", [decoded.id]);
-    return res.json({ ok: true });
-  } catch (e) {
-    return res.json({ ok: true });
-  }
-});
-
-// ── RELATÓRIO ADMIN ───────────────────────────────────────
-app.get("/relatorio", checkAdmin, async (req, res) => {
-  try {
-    const result = await pool.query(
-      `SELECT nome, tel, tipo, triagem, status, medico_nome, documentos_emitidos, criado_em, encerrado_em
-       FROM fila_atendimentos
-       ORDER BY criado_em DESC`
-    );
-    const lista = result.rows;
-
-    if (lista.length === 0) return res.send('<h2 style="font-family:sans-serif;padding:20px">Nenhum atendimento registrado ainda.</h2>');
-
-    const total = lista.length;
-    const encerrados = lista.filter(a => a.status === 'encerrado').length;
-    const aguardando = lista.filter(a => a.status === 'aguardando').length;
-
-    const html = `
-    <html><head><meta charset="utf-8"><title>Relatório ConsultaJá24h</title>
-    <style>
-      body{font-family:'Segoe UI',sans-serif;background:#060d0b;color:#fff;padding:32px;max-width:1000px;margin:0 auto}
-      h1{color:#b4e05a;margin-bottom:4px}
-      p.sub{color:rgba(255,255,255,.4);font-size:.85rem;margin-bottom:24px}
-      table{width:100%;border-collapse:collapse;margin-bottom:32px;font-size:.85rem}
-      th{text-align:left;padding:10px 12px;background:rgba(180,224,90,.1);color:#b4e05a;font-size:.75rem;letter-spacing:.08em;text-transform:uppercase}
-      td{padding:10px 12px;border-bottom:1px solid rgba(255,255,255,.06);vertical-align:top}
-      .badge{display:inline-block;padding:2px 10px;border-radius:999px;font-size:.72rem;font-weight:600}
-      .badge.encerrado{background:rgba(94,224,160,.1);color:#5ee0a0}
-      .badge.aguardando{background:rgba(255,189,46,.1);color:#ffbd2e}
-      .badge.assumido{background:rgba(180,224,90,.1);color:#b4e05a}
-      .badge.chat{background:rgba(37,211,102,.1);color:#25d366}
-      .badge.video{background:rgba(94,224,160,.1);color:#5ee0a0}
-      .totais{display:flex;gap:24px;flex-wrap:wrap;background:rgba(255,255,255,.04);border-radius:12px;padding:16px 20px;margin-bottom:28px}
-      .t-item span{display:block;font-size:.7rem;color:rgba(255,255,255,.4);text-transform:uppercase;letter-spacing:.1em;margin-bottom:4px}
-      .t-item strong{font-size:1.5rem;color:#b4e05a}
-      a{color:#5ee0a0;text-decoration:none}
-    </style>
-    </head><body>
-    <h1>📊 Atendimentos — ConsultaJá24h</h1>
-    <p class="sub">Painel administrativo · PostgreSQL</p>
-    <div class="totais">
-      <div class="t-item"><span>Total</span><strong>${total}</strong></div>
-      <div class="t-item"><span>Encerrados</span><strong>${encerrados}</strong></div>
-      <div class="t-item"><span>Na fila</span><strong>${aguardando}</strong></div>
-    </div>
-    <table>
-      <tr>
-        <th>Data</th><th>Paciente</th><th>WhatsApp</th><th>Modalidade</th>
-        <th>Médico</th><th>Status</th><th>Documentos</th>
-      </tr>
-      ${lista.map(a => {
-        const data = a.criado_em ? new Date(a.criado_em).toLocaleString('pt-BR', { timeZone: 'America/Fortaleza' }) : '—';
-        const tel = String(a.tel || '').replace(/\D/g, '');
-        const tipo = a.tipo === 'video' ? '<span class="badge video">🎥 Vídeo</span>' : '<span class="badge chat">💬 Chat</span>';
-        const status = `<span class="badge ${a.status}">${a.status}</span>`;
-        return `<tr>
-          <td style="font-size:.78rem;color:rgba(255,255,255,.5)">${data}</td>
-          <td>${a.nome || '—'}</td>
-          <td><a href="https://wa.me/55${tel}">📱 ${a.tel || '—'}</a></td>
-          <td>${tipo}</td>
-          <td>${a.medico_nome || '—'}</td>
-          <td>${status}</td>
-          <td style="font-size:.8rem;color:rgba(255,255,255,.6)">${a.documentos_emitidos || '—'}</td>
-        </tr>`;
-      }).join('')}
-    </table>
-    </body></html>`;
-
-    return res.send(html);
-  } catch (e) {
-    console.error("Erro em /relatorio:", e);
-    return res.status(500).send("Erro ao carregar relatório");
-  }
-});
-
-// ── OUTROS RELATÓRIOS ─────────────────────────────────────
-app.get("/identificacoes", checkAdmin, async (req, res) => {
-  try {
-    const result = await pool.query("SELECT nome, tel, data, ip FROM identificacoes ORDER BY id DESC");
-    const lista = result.rows;
-    if (lista.length === 0) return res.send('<h2 style="font-family:sans-serif;padding:20px">Nenhuma identificação registrada.</h2>');
-    const html = `<html><head><meta charset="utf-8"><style>body{font-family:'Segoe UI',sans-serif;background:#060d0b;color:#fff;padding:32px;max-width:800px;margin:0 auto}h1{color:#b4e05a}table{width:100%;border-collapse:collapse}th{text-align:left;padding:10px 12px;background:rgba(180,224,90,.1);color:#b4e05a;font-size:.8rem;text-transform:uppercase}td{padding:10px 12px;border-bottom:1px solid rgba(255,255,255,.06);font-size:.88rem}a{color:#5ee0a0}</style></head><body>
-    <h1>📋 Identificações</h1><p style="color:rgba(255,255,255,.4)">${lista.length} registros</p>
-    <table><tr><th>Data</th><th>Nome</th><th>WhatsApp</th><th>IP</th></tr>
-    ${lista.map(i => `<tr><td>${i.data}</td><td>${i.nome}</td><td><a href="https://wa.me/55${String(i.tel||'').replace(/\D/g,'')}">📱 ${i.tel}</a></td><td style="color:rgba(255,255,255,.3);font-size:.75rem">${i.ip}</td></tr>`).join('')}
-    </table></body></html>`;
-    res.send(html);
-  } catch (e) { res.status(500).send("Erro"); }
-});
-
-app.get("/consentimentos", checkAdmin, async (req, res) => {
-  try {
-    const result = await pool.query("SELECT nome, tel, versao, data, ip FROM consentimentos ORDER BY id DESC");
-    const lista = result.rows;
-    if (lista.length === 0) return res.send('<h2 style="font-family:sans-serif;padding:20px">Nenhum consentimento registrado.</h2>');
-    const html = `<html><head><meta charset="utf-8"><style>body{font-family:'Segoe UI',sans-serif;background:#060d0b;color:#fff;padding:32px;max-width:800px;margin:0 auto}h1{color:#b4e05a}table{width:100%;border-collapse:collapse}th{text-align:left;padding:10px 12px;background:rgba(180,224,90,.1);color:#b4e05a;font-size:.8rem;text-transform:uppercase}td{padding:10px 12px;border-bottom:1px solid rgba(255,255,255,.06);font-size:.88rem}.badge{display:inline-block;padding:3px 10px;border-radius:999px;background:rgba(94,224,160,.1);color:#5ee0a0;font-size:.75rem}a{color:#5ee0a0}</style></head><body>
-    <h1>✅ Consentimentos LGPD</h1><p style="color:rgba(255,255,255,.4)">${lista.length} aceites</p>
-    <table><tr><th>Data</th><th>Nome</th><th>WhatsApp</th><th>Versão</th><th>IP</th></tr>
-    ${lista.map(i => `<tr><td>${i.data}</td><td>${i.nome}</td><td><a href="https://wa.me/55${String(i.tel||'').replace(/\D/g,'')}">📱 ${i.tel}</a></td><td><span class="badge">${i.versao}</span></td><td style="color:rgba(255,255,255,.3);font-size:.75rem">${i.ip}</td></tr>`).join('')}
-    </table></body></html>`;
-    res.send(html);
-  } catch (e) { res.status(500).send("Erro"); }
-});
-
-// ── HEALTH ───────────────────────────────────────────────
-app.get("/", (req, res) => res.send("API rodando"));
-app.get("/health", (req, res) => res.json({ ok: true }));
-
-// Endpoint público para landing page: médicos online + tempo estimado de espera
-app.get("/api/disponibilidade", async (req, res) => {
-  try {
-    const [medRes, filaRes] = await Promise.all([
-      pool.query("SELECT COUNT(*) FROM medicos WHERE status_online = true AND ativo = true"),
-      pool.query("SELECT COUNT(*) FROM fila_atendimentos WHERE status = 'aguardando'")
-    ]);
-    const medicosOnline = parseInt(medRes.rows[0].count) || 0;
-    const pacientesAguardando = parseInt(filaRes.rows[0].count) || 0;
-
-    // Tempo estimado em minutos (cada consulta ~6 min, mínimo 3 min)
-    let tempoEstimado = 3;
-    if (medicosOnline > 0) {
-      tempoEstimado = Math.max(3, Math.ceil((pacientesAguardando / medicosOnline) * 6));
-    } else if (pacientesAguardando > 0) {
-      tempoEstimado = Math.max(10, pacientesAguardando * 6);
-    }
-
-    // Status: verde / amarelo / vermelho
-    let status = 'verde';
-    if (medicosOnline === 0) status = 'vermelho';
-    else if (tempoEstimado > 10) status = 'amarelo';
-
-    res.json({ ok: true, medicosOnline, pacientesAguardando, tempoEstimado, status });
-  } catch(e) {
-    res.json({ ok: false, medicosOnline: 0, tempoEstimado: 5, status: 'verde' });
-  }
-});
-
-app.get("/api/test-db", async (req, res) => {
-  try {
-    const result = await pool.query("SELECT NOW()");
-    res.json(result.rows[0]);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log("Servidor rodando na porta", PORT));
+confirmação de que os 3 endpoints funcionam no navegador.
