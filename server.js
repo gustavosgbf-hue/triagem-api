@@ -1,10 +1,9 @@
 import express from "express";
 import cors from "cors";
-import fs from "fs";
 import { google } from "googleapis";
 import pg from "pg";
+import bcrypt from "bcrypt";
 
-const { existsSync, readFileSync, writeFileSync } = fs;
 const { Pool } = pg;
 
 const pool = new Pool({
@@ -31,7 +30,6 @@ if (!MP_TOKEN) {
 // ── GOOGLE SHEETS ─────────────────────────────────────────────────
 const SPREADSHEET_ID = "1z-m4_zJQOIelzOkiUvU8L7VP0CHxJHC317Lb-q0GVCQ";
 
-// MANTENHA AQUI O SEU serviceAccount EXATAMENTE COMO JÁ ESTÁ NO SEU ARQUIVO
 const serviceAccount = {
   type: "service_account",
   project_id: "consultaja24h",
@@ -84,6 +82,7 @@ async function callOpenAI({ system, messages }) {
   });
 
   const data = await res.json().catch(() => ({}));
+
   if (!res.ok) {
     return {
       ok: false,
@@ -97,6 +96,7 @@ async function callOpenAI({ system, messages }) {
 async function handleChat(req, res) {
   try {
     const { system, messages } = req.body || {};
+
     if (!system || !Array.isArray(messages)) {
       return res.status(400).json({ ok: false, error: "Payload inválido" });
     }
@@ -115,14 +115,24 @@ async function handleChat(req, res) {
     return res.status(500).json({ text: "Erro interno temporário." });
   }
 }
+
+// ── ADMIN — PROTEÇÃO SEGURA ──────────────────────────────
 function checkAdmin(req, res, next) {
   const senha = req.headers["x-admin-password"];
-  if (senha !== process.env.ADMIN_PASSWORD) {
+  const senhaAdmin = process.env.ADMIN_PASSWORD;
+
+  if (!senhaAdmin) {
+    return res.status(500).send("ADMIN_PASSWORD não configurada");
+  }
+
+  if (!senha || senha !== senhaAdmin) {
     return res.status(403).send("Acesso negado");
   }
+
   next();
 }
 
+// ── ROTAS ABERTAS ────────────────────────────────────────
 app.post("/api/triage", handleChat);
 app.post("/api/doctor", handleChat);
 
@@ -130,9 +140,7 @@ app.post("/api/doctor", handleChat);
 app.post("/api/payment", async (req, res) => {
   try {
     const { email, nome } = req.body || {};
-    const idempotency = `consult-${Date.now()}-${Math.random()
-      .toString(36)
-      .slice(2)}`;
+    const idempotency = `consult-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
     const mpRes = await fetch("https://api.mercadopago.com/v1/payments", {
       method: "POST",
@@ -148,8 +156,7 @@ app.post("/api/payment", async (req, res) => {
         payer: {
           email: email || "paciente@prontoatendimento.com",
           first_name: (nome || "Paciente").split(" ")[0],
-          last_name:
-            (nome || "Paciente").split(" ").slice(1).join(" ") || "Online",
+          last_name: (nome || "Paciente").split(" ").slice(1).join(" ") || "Online",
         },
       }),
     });
@@ -158,9 +165,10 @@ app.post("/api/payment", async (req, res) => {
 
     if (!mpRes.ok) {
       console.error("MP error:", data);
-      return res
-        .status(500)
-        .json({ ok: false, error: data.message || "Erro ao gerar pagamento" });
+      return res.status(500).json({
+        ok: false,
+        error: data.message || "Erro ao gerar pagamento",
+      });
     }
 
     return res.json({
@@ -171,7 +179,7 @@ app.post("/api/payment", async (req, res) => {
       qr_code_base64: data.point_of_interaction?.transaction_data?.qr_code_base64,
     });
   } catch (e) {
-    console.error(e);
+    console.error("Erro em /api/payment:", e);
     return res.status(500).json({ ok: false, error: "Erro interno" });
   }
 });
@@ -185,12 +193,24 @@ app.get("/api/payment/:id", async (req, res) => {
         headers: { Authorization: `Bearer ${MP_TOKEN}` },
       }
     );
+
     const data = await mpRes.json();
+
+    if (!mpRes.ok) {
+      console.error("MP status error:", data);
+      return res.status(500).json({
+        ok: false,
+        error: data.message || "Erro ao consultar pagamento",
+      });
+    }
+
     return res.json({ ok: true, status: data.status });
   } catch (e) {
-    return res
-      .status(500)
-      .json({ ok: false, error: "Erro ao consultar pagamento" });
+    console.error("Erro em /api/payment/:id", e);
+    return res.status(500).json({
+      ok: false,
+      error: "Erro ao consultar pagamento",
+    });
   }
 });
 
@@ -199,7 +219,6 @@ app.post("/api/notify", async (req, res) => {
   try {
     const { nome, tel, cpf, triagem } = req.body || {};
     const RESEND_KEY = process.env.RESEND_API_KEY;
-
     const telLimpo = (tel || "").replace(/\D/g, "");
     const BASE_URL =
       process.env.RENDER_EXTERNAL_URL || "https://triagem-api.onrender.com";
@@ -221,14 +240,17 @@ app.post("/api/notify", async (req, res) => {
         .split(/[,;]\s*(?=[A-ZÀÁÂÃÉÊÍÓÔÕÚÇ])/i)
         .map((item) => {
           const colonIdx = item.indexOf(":");
+
           if (colonIdx > 0) {
             const key = item.slice(0, colonIdx).trim();
             const val = item.slice(colonIdx + 1).trim();
+
             return `<tr>
               <td style="padding:9px 14px;color:rgba(255,255,255,.45);font-size:12px;white-space:nowrap;border-bottom:1px solid rgba(255,255,255,.06);vertical-align:top;width:160px">${key}</td>
               <td style="padding:9px 14px;color:#fff;font-weight:500;font-size:13px;border-bottom:1px solid rgba(255,255,255,.06)">${val}</td>
             </tr>`;
           }
+
           return `<tr><td colspan="2" style="padding:9px 14px;color:rgba(255,255,255,.7);font-size:13px;border-bottom:1px solid rgba(255,255,255,.06)">${item.trim()}</td></tr>`;
         })
         .join("");
@@ -259,7 +281,8 @@ app.post("/api/notify", async (req, res) => {
               <td style="padding:8px 0">
                 <a href="${linkMedico(
                   "Dr. Gustavo"
-                )}" style="background:#25D366;color:#fff;padding:6px 16px;border-radius:999px;text-decoration:none;font-size:13px;font-weight:600">📱 Chamar no WhatsApp</a><div style="margin-top:6px;font-size:12px;color:rgba(255,255,255,.45)">${telLimpo}</div>
+                )}" style="background:#25D366;color:#fff;padding:6px 16px;border-radius:999px;text-decoration:none;font-size:13px;font-weight:600">📱 Chamar no WhatsApp</a>
+                <div style="margin-top:6px;font-size:12px;color:rgba(255,255,255,.45)">${telLimpo}</div>
               </td>
             </tr>
           </table>
@@ -275,8 +298,7 @@ app.post("/api/notify", async (req, res) => {
 
           <p style="margin:20px 0 0;font-size:12px;color:rgba(255,255,255,.3)">Enviado automaticamente pelo sistema ConsultaJá24h</p>
         </div>
-      </div>
-    `;
+      </div>`;
 
     const resendRes = await fetch("https://api.resend.com/emails", {
       method: "POST",
@@ -293,6 +315,7 @@ app.post("/api/notify", async (req, res) => {
     });
 
     const resendData = await resendRes.json();
+
     if (!resendRes.ok) {
       console.error("Resend error:", resendData);
     }
@@ -314,18 +337,7 @@ app.post("/api/notify", async (req, res) => {
   }
 });
 
-// ── IDENTIFICAÇÃO E CONSENTIMENTO LGPD ──────────────────
-function lerJSON(arquivo) {
-  try {
-    if (existsSync(arquivo)) return JSON.parse(readFileSync(arquivo, "utf8"));
-  } catch (e) {}
-  return [];
-}
-
-function salvarJSON(arquivo, lista) {
-  writeFileSync(arquivo, JSON.stringify(lista, null, 2));
-}
-
+// ── IDENTIFICAÇÃO ────────────────────────────────────────
 app.post("/api/identify", async (req, res) => {
   try {
     const { nome, tel } = req.body || {};
@@ -335,19 +347,21 @@ app.post("/api/identify", async (req, res) => {
     const ip = req.headers["x-forwarded-for"] || req.socket?.remoteAddress || "—";
 
     await pool.query(
-  "INSERT INTO identificacoes (nome, tel, data, ip) VALUES ($1,$2,$3,$4)",
-  [nome || "—", tel || "—", agora, ip]
-);
+      "INSERT INTO identificacoes (nome, tel, data, ip) VALUES ($1,$2,$3,$4)",
+      [nome || "—", tel || "—", agora, ip]
+    );
 
     await appendToSheet("Identificacoes", [agora, nome || "", tel || "", ip]);
     console.log(`[IDENTIFY] ${nome} | ${tel}`);
 
     return res.json({ ok: true });
   } catch (e) {
+    console.error("Identify error:", e);
     return res.status(500).json({ ok: false });
   }
 });
 
+// ── CONSENTIMENTO ────────────────────────────────────────
 app.post("/api/consent", async (req, res) => {
   try {
     const { nome, tel, versao } = req.body || {};
@@ -357,9 +371,9 @@ app.post("/api/consent", async (req, res) => {
     const ip = req.headers["x-forwarded-for"] || req.socket?.remoteAddress || "—";
 
     await pool.query(
-  "INSERT INTO consentimentos (nome, tel, versao, data, ip) VALUES ($1,$2,$3,$4,$5)",
-  [nome || "—", tel || "—", versao || "v1.0", agora, ip]
-);
+      "INSERT INTO consentimentos (nome, tel, versao, data, ip) VALUES ($1,$2,$3,$4,$5)",
+      [nome || "—", tel || "—", versao || "v1.0", agora, ip]
+    );
 
     await appendToSheet("Consentimentos", [
       agora,
@@ -372,224 +386,311 @@ app.post("/api/consent", async (req, res) => {
     console.log(`[CONSENT] ${nome} | ${tel} | ${versao}`);
     return res.json({ ok: true });
   } catch (e) {
+    console.error("Consent error:", e);
     return res.status(500).json({ ok: false });
   }
 });
 
-// ── RASTREAMENTO DE ATENDIMENTOS ────────────────────────
-const ARQUIVO = "./atendimentos.json";
-
-function carregarAtendimentos() {
-  try {
-    if (fs.existsSync(ARQUIVO)) return JSON.parse(fs.readFileSync(ARQUIVO, "utf8"));
-  } catch (e) {}
-  return [];
-}
-
-function salvarAtendimento(medico, paciente, tel) {
-  const lista = carregarAtendimentos();
-  lista.push({
-    medico,
-    paciente,
-    tel,
-    data: new Date().toLocaleString("pt-BR", {
-      timeZone: "America/Fortaleza",
-    }),
-  });
-  fs.writeFileSync(ARQUIVO, JSON.stringify(lista, null, 2));
-}
-
+// ── ATENDER (redireciona médico para WhatsApp) ───────────
 app.get("/atender", async (req, res) => {
-  const { medico, paciente, tel } = req.query;
-  if (!tel) return res.status(400).send("Parâmetros inválidos");
+  try {
+    const { medico, paciente, tel } = req.query;
 
-  await pool.query(
-  "INSERT INTO logs_atendimentos (medico, paciente, tel, data) VALUES ($1,$2,$3,$4)",
-  [
-    medico || "desconhecido",
-    paciente || "—",
-    tel,
-    new Date().toLocaleString("pt-BR", {
+    if (!tel) {
+      return res.status(400).send("Parâmetros inválidos");
+    }
+
+    const agora = new Date().toLocaleString("pt-BR", {
       timeZone: "America/Fortaleza",
-    }),
-  ]
-);
-
-  await appendToSheet("Atendimentos", [
-    new Date().toLocaleString("pt-BR", { timeZone: "America/Fortaleza" }),
-    paciente || "",
-    tel || "",
-    "",
-    "Assumido",
-    medico || "",
-    "",
-  ]);
-
-  console.log(`[ATENDIMENTO] Médico: ${medico} | Paciente: ${paciente} | Tel: ${tel}`);
-
-  const telLimpo = tel.replace(/\D/g, "");
-  res.redirect(`https://wa.me/55${telLimpo}`);
-});
-
-// ── RELATÓRIOS ───────────────────────────────────────────
-app.get("/relatorio", checkAdmin, (req, res) => {
-  const lista = carregarAtendimentos();
-
-  if (lista.length === 0) {
-    return res.send(
-      '<h2 style="font-family:sans-serif;padding:20px">Nenhum atendimento registrado ainda.</h2>'
-    );
-  }
-
-  const porData = {};
-  lista.forEach((a) => {
-    const dia = a.data.split(",")[0];
-    if (!porData[dia]) porData[dia] = [];
-    porData[dia].push(a);
-  });
-
-  const porMedico = {};
-  lista.forEach((a) => {
-    porMedico[a.medico] = (porMedico[a.medico] || 0) + 1;
-  });
-
-  let html = `
-  <html><head><meta charset="utf-8">
-  <style>
-    body{font-family:'Segoe UI',sans-serif;background:#060d0b;color:#fff;padding:32px;max-width:800px;margin:0 auto}
-    h1{color:#b4e05a;margin-bottom:4px}
-    h2{color:#5ee0a0;margin:28px 0 12px;font-size:1rem;text-transform:uppercase;letter-spacing:.1em}
-    table{width:100%;border-collapse:collapse;margin-bottom:24px}
-    th{text-align:left;padding:10px 12px;background:rgba(180,224,90,.1);color:#b4e05a;font-size:.8rem;letter-spacing:.08em;text-transform:uppercase}
-    td{padding:10px 12px;border-bottom:1px solid rgba(255,255,255,.06);font-size:.88rem}
-    .badge{display:inline-block;padding:3px 10px;border-radius:999px;background:rgba(94,224,160,.1);color:#5ee0a0;font-size:.75rem}
-    .total{background:rgba(255,255,255,.04);border-radius:12px;padding:16px 20px;margin-bottom:28px;display:flex;gap:32px}
-    .total-item span{display:block;font-size:.72rem;color:rgba(255,255,255,.4);text-transform:uppercase;letter-spacing:.1em;margin-bottom:4px}
-    .total-item strong{font-size:1.6rem;color:#b4e05a}
-    a{color:#5ee0a0}
-  </style>
-  </head><body>
-  <h1>📊 Relatório de Atendimentos</h1>
-  <p style="color:rgba(255,255,255,.4);font-size:.85rem;margin-bottom:24px">ConsultaJá24h · atualizado em tempo real</p>
-  <div class="total">
-    <div class="total-item"><span>Total</span><strong>${lista.length}</strong></div>
-    ${Object.entries(porMedico)
-      .map(
-        ([m, n]) =>
-          `<div class="total-item"><span>${m}</span><strong>${n}</strong></div>`
-      )
-      .join("")}
-  </div>`;
-
-  Object.entries(porData)
-    .reverse()
-    .forEach(([dia, ats]) => {
-      html += `<h2>${dia} — ${ats.length} atendimento${
-        ats.length > 1 ? "s" : ""
-      }</h2>
-      <table><tr><th>Horário</th><th>Médico</th><th>Paciente</th><th>WhatsApp</th></tr>`;
-      ats.forEach((a) => {
-        const hora = a.data.split(",")[1] || "";
-        html += `<tr>
-          <td>${hora.trim()}</td>
-          <td><span class="badge">${a.medico}</span></td>
-          <td>${a.paciente}</td>
-          <td><a href="https://wa.me/55${a.tel.replace(/\D/g, "")}">📱 ${a.tel}</a></td>
-        </tr>`;
-      });
-      html += "</table>";
     });
 
-  html += "</body></html>";
-  res.send(html);
+    await pool.query(
+      "INSERT INTO logs_atendimentos (medico, paciente, tel, data) VALUES ($1,$2,$3,$4)",
+      [medico || "desconhecido", paciente || "—", tel, agora]
+    );
+
+    await appendToSheet("Atendimentos", [
+      agora,
+      paciente || "",
+      tel || "",
+      "",
+      "Assumido",
+      medico || "",
+      "",
+    ]);
+
+    console.log(
+      `[ATENDIMENTO] Médico: ${medico} | Paciente: ${paciente} | Tel: ${tel}`
+    );
+
+    const telLimpo = String(tel).replace(/\D/g, "");
+    return res.redirect(`https://wa.me/55${telLimpo}`);
+  } catch (e) {
+    console.error("Erro em /atender:", e);
+    return res.status(500).send("Erro ao assumir atendimento");
+  }
 });
 
-app.get("/identificacoes", checkAdmin, (req, res) => {
-  const lista = lerJSON("./identificacoes.json");
+// ── ADMIN — CADASTRAR MÉDICO ─────────────────────────────
+app.post("/api/admin/medico/criar", checkAdmin, async (req, res) => {
+  try {
+    const { nome, email, crm, senha } = req.body || {};
 
-  if (lista.length === 0) {
-    return res.send(
-      '<h2 style="font-family:sans-serif;padding:20px">Nenhuma identificação registrada ainda.</h2>'
+    if (!nome || !email || !crm || !senha) {
+      return res.status(400).json({
+        ok: false,
+        error: "Campos obrigatórios faltando",
+      });
+    }
+
+    const senha_hash = await bcrypt.hash(senha, 10);
+
+    const result = await pool.query(
+      `INSERT INTO medicos (nome, email, senha_hash, crm, status_online, ativo)
+       VALUES ($1, $2, $3, $4, false, true)
+       RETURNING id, nome, email, crm, status_online, ativo, created_at`,
+      [nome, email, senha_hash, crm]
     );
+
+    return res.json({ ok: true, medico: result.rows[0] });
+  } catch (err) {
+    console.error("Erro ao criar médico:", err);
+
+    if (err.code === "23505") {
+      return res.status(400).json({
+        ok: false,
+        error: "E-mail já cadastrado",
+      });
+    }
+
+    return res.status(500).json({ ok: false, error: err.message });
   }
-
-  const html = `
-  <html><head><meta charset="utf-8">
-  <style>
-    body{font-family:'Segoe UI',sans-serif;background:#060d0b;color:#fff;padding:32px;max-width:800px;margin:0 auto}
-    h1{color:#b4e05a;margin-bottom:4px}
-    p{color:rgba(255,255,255,.4);font-size:.85rem;margin-bottom:24px}
-    table{width:100%;border-collapse:collapse}
-    th{text-align:left;padding:10px 12px;background:rgba(180,224,90,.1);color:#b4e05a;font-size:.8rem;letter-spacing:.08em;text-transform:uppercase}
-    td{padding:10px 12px;border-bottom:1px solid rgba(255,255,255,.06);font-size:.88rem}
-    a{color:#5ee0a0}
-  </style>
-  </head><body>
-  <h1>📋 Identificações registradas</h1>
-  <p>${lista.length} registro${lista.length > 1 ? "s" : ""} · antes do aceite dos termos</p>
-  <table>
-    <tr><th>Data</th><th>Nome</th><th>WhatsApp</th><th>IP</th></tr>
-    ${lista
-      .slice()
-      .reverse()
-      .map(
-        (i) => `<tr>
-      <td>${i.data}</td>
-      <td>${i.nome}</td>
-      <td><a href="https://wa.me/55${(i.tel || "").replace(/\D/g, "")}">📱 ${i.tel}</a></td>
-      <td style="color:rgba(255,255,255,.3);font-size:.75rem">${i.ip}</td>
-    </tr>`
-      )
-      .join("")}
-  </table>
-  </body></html>`;
-
-  res.send(html);
 });
 
-app.get("/consentimentos", checkAdmin, (req, res) => {
-  const lista = lerJSON("./consentimentos.json");
-
-  if (lista.length === 0) {
-    return res.send(
-      '<h2 style="font-family:sans-serif;padding:20px">Nenhum consentimento registrado ainda.</h2>'
+// ── ADMIN — LISTAR MÉDICOS ───────────────────────────────
+app.get("/api/admin/medicos", checkAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT id, nome, email, crm, status_online, ativo, created_at FROM medicos ORDER BY id DESC"
     );
+
+    return res.json({ ok: true, medicos: result.rows });
+  } catch (err) {
+    console.error("Erro ao listar médicos:", err);
+    return res.status(500).json({ ok: false, error: err.message });
   }
+});
 
-  const html = `
-  <html><head><meta charset="utf-8">
-  <style>
-    body{font-family:'Segoe UI',sans-serif;background:#060d0b;color:#fff;padding:32px;max-width:800px;margin:0 auto}
-    h1{color:#b4e05a;margin-bottom:4px}
-    p{color:rgba(255,255,255,.4);font-size:.85rem;margin-bottom:24px}
-    table{width:100%;border-collapse:collapse}
-    th{text-align:left;padding:10px 12px;background:rgba(180,224,90,.1);color:#b4e05a;font-size:.8rem;letter-spacing:.08em;text-transform:uppercase}
-    td{padding:10px 12px;border-bottom:1px solid rgba(255,255,255,.06);font-size:.88rem}
-    .badge{display:inline-block;padding:3px 10px;border-radius:999px;background:rgba(94,224,160,.1);color:#5ee0a0;font-size:.75rem}
-    a{color:#5ee0a0}
-  </style>
-  </head><body>
-  <h1>✅ Consentimentos LGPD</h1>
-  <p>${lista.length} aceite${lista.length > 1 ? "s" : ""} registrados com identidade vinculada</p>
-  <table>
-    <tr><th>Data</th><th>Nome</th><th>WhatsApp</th><th>Versão</th><th>IP</th></tr>
-    ${lista
-      .slice()
+// ── ADMIN — ATIVAR/DESATIVAR MÉDICO ──────────────────────
+app.patch("/api/admin/medico/:id", checkAdmin, async (req, res) => {
+  try {
+    const { ativo } = req.body || {};
+
+    if (typeof ativo !== "boolean") {
+      return res.status(400).json({
+        ok: false,
+        error: "Campo 'ativo' deve ser boolean",
+      });
+    }
+
+    const result = await pool.query(
+      "UPDATE medicos SET ativo = $1 WHERE id = $2 RETURNING id, nome, ativo",
+      [ativo, req.params.id]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({
+        ok: false,
+        error: "Médico não encontrado",
+      });
+    }
+
+    return res.json({ ok: true, medico: result.rows[0] });
+  } catch (err) {
+    console.error("Erro ao atualizar médico:", err);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ── RELATÓRIOS ADMIN (lendo do PostgreSQL) ───────────────
+app.get("/relatorio", checkAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT medico, paciente, tel, data FROM logs_atendimentos ORDER BY id DESC"
+    );
+    const lista = result.rows;
+
+    if (lista.length === 0) {
+      return res.send(
+        '<h2 style="font-family:sans-serif;padding:20px">Nenhum atendimento registrado ainda.</h2>'
+      );
+    }
+
+    const porData = {};
+    lista.forEach((a) => {
+      const dia = String(a.data).split(",")[0];
+      if (!porData[dia]) porData[dia] = [];
+      porData[dia].push(a);
+    });
+
+    const porMedico = {};
+    lista.forEach((a) => {
+      porMedico[a.medico] = (porMedico[a.medico] || 0) + 1;
+    });
+
+    let html = `
+    <html><head><meta charset="utf-8">
+    <style>
+      body{font-family:'Segoe UI',sans-serif;background:#060d0b;color:#fff;padding:32px;max-width:800px;margin:0 auto}
+      h1{color:#b4e05a;margin-bottom:4px}
+      h2{color:#5ee0a0;margin:28px 0 12px;font-size:1rem;text-transform:uppercase;letter-spacing:.1em}
+      table{width:100%;border-collapse:collapse;margin-bottom:24px}
+      th{text-align:left;padding:10px 12px;background:rgba(180,224,90,.1);color:#b4e05a;font-size:.8rem;letter-spacing:.08em;text-transform:uppercase}
+      td{padding:10px 12px;border-bottom:1px solid rgba(255,255,255,.06);font-size:.88rem}
+      .badge{display:inline-block;padding:3px 10px;border-radius:999px;background:rgba(94,224,160,.1);color:#5ee0a0;font-size:.75rem}
+      .total{background:rgba(255,255,255,.04);border-radius:12px;padding:16px 20px;margin-bottom:28px;display:flex;gap:32px;flex-wrap:wrap}
+      .total-item span{display:block;font-size:.72rem;color:rgba(255,255,255,.4);text-transform:uppercase;letter-spacing:.1em;margin-bottom:4px}
+      .total-item strong{font-size:1.6rem;color:#b4e05a}
+      a{color:#5ee0a0}
+    </style>
+    </head><body>
+    <h1>📊 Relatório de Atendimentos</h1>
+    <p style="color:rgba(255,255,255,.4);font-size:.85rem;margin-bottom:24px">ConsultaJá24h · PostgreSQL</p>
+    <div class="total">
+      <div class="total-item"><span>Total</span><strong>${lista.length}</strong></div>
+      ${Object.entries(porMedico)
+        .map(
+          ([m, n]) =>
+            `<div class="total-item"><span>${m}</span><strong>${n}</strong></div>`
+        )
+        .join("")}
+    </div>`;
+
+    Object.entries(porData)
       .reverse()
-      .map(
-        (i) => `<tr>
-      <td>${i.data}</td>
-      <td>${i.nome}</td>
-      <td><a href="https://wa.me/55${(i.tel || "").replace(/\D/g, "")}">📱 ${i.tel}</a></td>
-      <td><span class="badge">${i.versao}</span></td>
-      <td style="color:rgba(255,255,255,.3);font-size:.75rem">${i.ip}</td>
-    </tr>`
-      )
-      .join("")}
-  </table>
-  </body></html>`;
+      .forEach(([dia, ats]) => {
+        html += `<h2>${dia} — ${ats.length} atendimento${ats.length > 1 ? "s" : ""}</h2>
+        <table><tr><th>Horário</th><th>Médico</th><th>Paciente</th><th>WhatsApp</th></tr>`;
 
-  res.send(html);
+        ats.forEach((a) => {
+          const hora = String(a.data).split(",")[1] || "";
+          html += `<tr>
+            <td>${hora.trim()}</td>
+            <td><span class="badge">${a.medico}</span></td>
+            <td>${a.paciente}</td>
+            <td><a href="https://wa.me/55${String(a.tel || "").replace(/\D/g, "")}">📱 ${a.tel}</a></td>
+          </tr>`;
+        });
+
+        html += "</table>";
+      });
+
+    html += "</body></html>";
+    res.send(html);
+  } catch (e) {
+    console.error("Erro em /relatorio:", e);
+    res.status(500).send("Erro ao carregar relatório");
+  }
+});
+
+app.get("/identificacoes", checkAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT nome, tel, data, ip FROM identificacoes ORDER BY id DESC"
+    );
+    const lista = result.rows;
+
+    if (lista.length === 0) {
+      return res.send(
+        '<h2 style="font-family:sans-serif;padding:20px">Nenhuma identificação registrada ainda.</h2>'
+      );
+    }
+
+    const html = `
+    <html><head><meta charset="utf-8">
+    <style>
+      body{font-family:'Segoe UI',sans-serif;background:#060d0b;color:#fff;padding:32px;max-width:800px;margin:0 auto}
+      h1{color:#b4e05a;margin-bottom:4px}
+      p{color:rgba(255,255,255,.4);font-size:.85rem;margin-bottom:24px}
+      table{width:100%;border-collapse:collapse}
+      th{text-align:left;padding:10px 12px;background:rgba(180,224,90,.1);color:#b4e05a;font-size:.8rem;letter-spacing:.08em;text-transform:uppercase}
+      td{padding:10px 12px;border-bottom:1px solid rgba(255,255,255,.06);font-size:.88rem}
+      a{color:#5ee0a0}
+    </style>
+    </head><body>
+    <h1>📋 Identificações registradas</h1>
+    <p>${lista.length} registro${lista.length > 1 ? "s" : ""} · antes do aceite dos termos</p>
+    <table>
+      <tr><th>Data</th><th>Nome</th><th>WhatsApp</th><th>IP</th></tr>
+      ${lista
+        .map(
+          (i) => `<tr>
+        <td>${i.data}</td>
+        <td>${i.nome}</td>
+        <td><a href="https://wa.me/55${String(i.tel || "").replace(/\D/g, "")}">📱 ${i.tel}</a></td>
+        <td style="color:rgba(255,255,255,.3);font-size:.75rem">${i.ip}</td>
+      </tr>`
+        )
+        .join("")}
+    </table>
+    </body></html>`;
+
+    res.send(html);
+  } catch (e) {
+    console.error("Erro em /identificacoes:", e);
+    res.status(500).send("Erro ao carregar identificações");
+  }
+});
+
+app.get("/consentimentos", checkAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT nome, tel, versao, data, ip FROM consentimentos ORDER BY id DESC"
+    );
+    const lista = result.rows;
+
+    if (lista.length === 0) {
+      return res.send(
+        '<h2 style="font-family:sans-serif;padding:20px">Nenhum consentimento registrado ainda.</h2>'
+      );
+    }
+
+    const html = `
+    <html><head><meta charset="utf-8">
+    <style>
+      body{font-family:'Segoe UI',sans-serif;background:#060d0b;color:#fff;padding:32px;max-width:800px;margin:0 auto}
+      h1{color:#b4e05a;margin-bottom:4px}
+      p{color:rgba(255,255,255,.4);font-size:.85rem;margin-bottom:24px}
+      table{width:100%;border-collapse:collapse}
+      th{text-align:left;padding:10px 12px;background:rgba(180,224,90,.1);color:#b4e05a;font-size:.8rem;letter-spacing:.08em;text-transform:uppercase}
+      td{padding:10px 12px;border-bottom:1px solid rgba(255,255,255,.06);font-size:.88rem}
+      .badge{display:inline-block;padding:3px 10px;border-radius:999px;background:rgba(94,224,160,.1);color:#5ee0a0;font-size:.75rem}
+      a{color:#5ee0a0}
+    </style>
+    </head><body>
+    <h1>✅ Consentimentos LGPD</h1>
+    <p>${lista.length} aceite${lista.length > 1 ? "s" : ""} registrados com identidade vinculada</p>
+    <table>
+      <tr><th>Data</th><th>Nome</th><th>WhatsApp</th><th>Versão</th><th>IP</th></tr>
+      ${lista
+        .map(
+          (i) => `<tr>
+        <td>${i.data}</td>
+        <td>${i.nome}</td>
+        <td><a href="https://wa.me/55${String(i.tel || "").replace(/\D/g, "")}">📱 ${i.tel}</a></td>
+        <td><span class="badge">${i.versao}</span></td>
+        <td style="color:rgba(255,255,255,.3);font-size:.75rem">${i.ip}</td>
+      </tr>`
+        )
+        .join("")}
+    </table>
+    </body></html>`;
+
+    res.send(html);
+  } catch (e) {
+    console.error("Erro em /consentimentos:", e);
+    res.status(500).send("Erro ao carregar consentimentos");
+  }
 });
 
 // ── HEALTH ───────────────────────────────────────────────
