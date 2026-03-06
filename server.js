@@ -334,9 +334,10 @@ app.post("/api/identify", async (req, res) => {
     });
     const ip = req.headers["x-forwarded-for"] || req.socket?.remoteAddress || "—";
 
-    const lista = lerJSON("./identificacoes.json");
-    lista.push({ nome: nome || "—", tel: tel || "—", data: agora, ip });
-    salvarJSON("./identificacoes.json", lista);
+    await pool.query(
+  "INSERT INTO identificacoes (nome, tel, data, ip) VALUES ($1,$2,$3,$4)",
+  [nome || "—", tel || "—", agora, ip]
+);
 
     await appendToSheet("Identificacoes", [agora, nome || "", tel || "", ip]);
     console.log(`[IDENTIFY] ${nome} | ${tel}`);
@@ -355,15 +356,10 @@ app.post("/api/consent", async (req, res) => {
     });
     const ip = req.headers["x-forwarded-for"] || req.socket?.remoteAddress || "—";
 
-    const lista = lerJSON("./consentimentos.json");
-    lista.push({
-      nome: nome || "—",
-      tel: tel || "—",
-      versao: versao || "v1.0",
-      data: agora,
-      ip,
-    });
-    salvarJSON("./consentimentos.json", lista);
+    await pool.query(
+  "INSERT INTO consentimentos (nome, tel, versao, data, ip) VALUES ($1,$2,$3,$4,$5)",
+  [nome || "—", tel || "—", versao || "v1.0", agora, ip]
+);
 
     await appendToSheet("Consentimentos", [
       agora,
@@ -407,7 +403,17 @@ app.get("/atender", async (req, res) => {
   const { medico, paciente, tel } = req.query;
   if (!tel) return res.status(400).send("Parâmetros inválidos");
 
-  salvarAtendimento(medico || "desconhecido", paciente || "—", tel);
+  await pool.query(
+  "INSERT INTO logs_atendimentos (medico, paciente, tel, data) VALUES ($1,$2,$3,$4)",
+  [
+    medico || "desconhecido",
+    paciente || "—",
+    tel,
+    new Date().toLocaleString("pt-BR", {
+      timeZone: "America/Fortaleza",
+    }),
+  ]
+);
 
   await appendToSheet("Atendimentos", [
     new Date().toLocaleString("pt-BR", { timeZone: "America/Fortaleza" }),
