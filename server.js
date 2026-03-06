@@ -693,6 +693,216 @@ app.get("/consentimentos", checkAdmin, async (req, res) => {
   }
 });
 
+app.get("/admin-relatorio", async (req, res) => {
+  const { senha } = req.query;
+
+  if (!process.env.ADMIN_PASSWORD) {
+    return res.status(500).send("ADMIN_PASSWORD não configurada");
+  }
+
+  if (!senha || senha !== process.env.ADMIN_PASSWORD) {
+    return res.status(403).send("Acesso negado");
+  }
+
+  try {
+    const result = await pool.query(
+      "SELECT medico, paciente, tel, data FROM logs_atendimentos ORDER BY id DESC"
+    );
+    const lista = result.rows;
+
+    if (lista.length === 0) {
+      return res.send(
+        '<h2 style="font-family:sans-serif;padding:20px">Nenhum atendimento registrado ainda.</h2>'
+      );
+    }
+
+    const porData = {};
+    lista.forEach((a) => {
+      const dia = String(a.data).split(",")[0];
+      if (!porData[dia]) porData[dia] = [];
+      porData[dia].push(a);
+    });
+
+    const porMedico = {};
+    lista.forEach((a) => {
+      porMedico[a.medico] = (porMedico[a.medico] || 0) + 1;
+    });
+
+    let html = `
+    <html><head><meta charset="utf-8">
+    <style>
+      body{font-family:'Segoe UI',sans-serif;background:#060d0b;color:#fff;padding:32px;max-width:800px;margin:0 auto}
+      h1{color:#b4e05a;margin-bottom:4px}
+      h2{color:#5ee0a0;margin:28px 0 12px;font-size:1rem;text-transform:uppercase;letter-spacing:.1em}
+      table{width:100%;border-collapse:collapse;margin-bottom:24px}
+      th{text-align:left;padding:10px 12px;background:rgba(180,224,90,.1);color:#b4e05a;font-size:.8rem;letter-spacing:.08em;text-transform:uppercase}
+      td{padding:10px 12px;border-bottom:1px solid rgba(255,255,255,.06);font-size:.88rem}
+      .badge{display:inline-block;padding:3px 10px;border-radius:999px;background:rgba(94,224,160,.1);color:#5ee0a0;font-size:.75rem}
+      .total{background:rgba(255,255,255,.04);border-radius:12px;padding:16px 20px;margin-bottom:28px;display:flex;gap:32px;flex-wrap:wrap}
+      .total-item span{display:block;font-size:.72rem;color:rgba(255,255,255,.4);text-transform:uppercase;letter-spacing:.1em;margin-bottom:4px}
+      .total-item strong{font-size:1.6rem;color:#b4e05a}
+      a{color:#5ee0a0}
+    </style>
+    </head><body>
+    <h1>📊 Relatório de Atendimentos</h1>
+    <p style="color:rgba(255,255,255,.4);font-size:.85rem;margin-bottom:24px">ConsultaJá24h · PostgreSQL</p>
+    <div class="total">
+      <div class="total-item"><span>Total</span><strong>${lista.length}</strong></div>
+      ${Object.entries(porMedico)
+        .map(
+          ([m, n]) =>
+            `<div class="total-item"><span>${m}</span><strong>${n}</strong></div>`
+        )
+        .join("")}
+    </div>`;
+
+    Object.entries(porData)
+      .reverse()
+      .forEach(([dia, ats]) => {
+        html += `<h2>${dia} — ${ats.length} atendimento${ats.length > 1 ? "s" : ""}</h2>
+        <table><tr><th>Horário</th><th>Médico</th><th>Paciente</th><th>WhatsApp</th></tr>`;
+
+        ats.forEach((a) => {
+          const hora = String(a.data).split(",")[1] || "";
+          html += `<tr>
+            <td>${hora.trim()}</td>
+            <td><span class="badge">${a.medico}</span></td>
+            <td>${a.paciente}</td>
+            <td><a href="https://wa.me/55${String(a.tel || "").replace(/\D/g, "")}">📱 ${a.tel}</a></td>
+          </tr>`;
+        });
+
+        html += "</table>";
+      });
+
+    html += "</body></html>";
+    return res.send(html);
+  } catch (e) {
+    console.error("Erro em /admin-relatorio:", e);
+    return res.status(500).send("Erro ao carregar relatório");
+  }
+});
+
+app.get("/admin-identificacoes", async (req, res) => {
+  const { senha } = req.query;
+
+  if (!process.env.ADMIN_PASSWORD) {
+    return res.status(500).send("ADMIN_PASSWORD não configurada");
+  }
+
+  if (!senha || senha !== process.env.ADMIN_PASSWORD) {
+    return res.status(403).send("Acesso negado");
+  }
+
+  try {
+    const result = await pool.query(
+      "SELECT nome, tel, data, ip FROM identificacoes ORDER BY id DESC"
+    );
+    const lista = result.rows;
+
+    if (lista.length === 0) {
+      return res.send(
+        '<h2 style="font-family:sans-serif;padding:20px">Nenhuma identificação registrada ainda.</h2>'
+      );
+    }
+
+    const html = `
+    <html><head><meta charset="utf-8">
+    <style>
+      body{font-family:'Segoe UI',sans-serif;background:#060d0b;color:#fff;padding:32px;max-width:800px;margin:0 auto}
+      h1{color:#b4e05a;margin-bottom:4px}
+      p{color:rgba(255,255,255,.4);font-size:.85rem;margin-bottom:24px}
+      table{width:100%;border-collapse:collapse}
+      th{text-align:left;padding:10px 12px;background:rgba(180,224,90,.1);color:#b4e05a;font-size:.8rem;letter-spacing:.08em;text-transform:uppercase}
+      td{padding:10px 12px;border-bottom:1px solid rgba(255,255,255,.06);font-size:.88rem}
+      a{color:#5ee0a0}
+    </style>
+    </head><body>
+    <h1>📋 Identificações registradas</h1>
+    <p>${lista.length} registro${lista.length > 1 ? "s" : ""} · antes do aceite dos termos</p>
+    <table>
+      <tr><th>Data</th><th>Nome</th><th>WhatsApp</th><th>IP</th></tr>
+      ${lista
+        .map(
+          (i) => `<tr>
+        <td>${i.data}</td>
+        <td>${i.nome}</td>
+        <td><a href="https://wa.me/55${String(i.tel || "").replace(/\D/g, "")}">📱 ${i.tel}</a></td>
+        <td style="color:rgba(255,255,255,.3);font-size:.75rem">${i.ip}</td>
+      </tr>`
+        )
+        .join("")}
+    </table>
+    </body></html>`;
+
+    return res.send(html);
+  } catch (e) {
+    console.error("Erro em /admin-identificacoes:", e);
+    return res.status(500).send("Erro ao carregar identificações");
+  }
+});
+
+app.get("/admin-consentimentos", async (req, res) => {
+  const { senha } = req.query;
+
+  if (!process.env.ADMIN_PASSWORD) {
+    return res.status(500).send("ADMIN_PASSWORD não configurada");
+  }
+
+  if (!senha || senha !== process.env.ADMIN_PASSWORD) {
+    return res.status(403).send("Acesso negado");
+  }
+
+  try {
+    const result = await pool.query(
+      "SELECT nome, tel, versao, data, ip FROM consentimentos ORDER BY id DESC"
+    );
+    const lista = result.rows;
+
+    if (lista.length === 0) {
+      return res.send(
+        '<h2 style="font-family:sans-serif;padding:20px">Nenhum consentimento registrado ainda.</h2>'
+      );
+    }
+
+    const html = `
+    <html><head><meta charset="utf-8">
+    <style>
+      body{font-family:'Segoe UI',sans-serif;background:#060d0b;color:#fff;padding:32px;max-width:800px;margin:0 auto}
+      h1{color:#b4e05a;margin-bottom:4px}
+      p{color:rgba(255,255,255,.4);font-size:.85rem;margin-bottom:24px}
+      table{width:100%;border-collapse:collapse}
+      th{text-align:left;padding:10px 12px;background:rgba(180,224,90,.1);color:#b4e05a;font-size:.8rem;letter-spacing:.08em;text-transform:uppercase}
+      td{padding:10px 12px;border-bottom:1px solid rgba(255,255,255,.06);font-size:.88rem}
+      .badge{display:inline-block;padding:3px 10px;border-radius:999px;background:rgba(94,224,160,.1);color:#5ee0a0;font-size:.75rem}
+      a{color:#5ee0a0}
+    </style>
+    </head><body>
+    <h1>✅ Consentimentos LGPD</h1>
+    <p>${lista.length} aceite${lista.length > 1 ? "s" : ""} registrados com identidade vinculada</p>
+    <table>
+      <tr><th>Data</th><th>Nome</th><th>WhatsApp</th><th>Versão</th><th>IP</th></tr>
+      ${lista
+        .map(
+          (i) => `<tr>
+        <td>${i.data}</td>
+        <td>${i.nome}</td>
+        <td><a href="https://wa.me/55${String(i.tel || "").replace(/\D/g, "")}">📱 ${i.tel}</a></td>
+        <td><span class="badge">${i.versao}</span></td>
+        <td style="color:rgba(255,255,255,.3);font-size:.75rem">${i.ip}</td>
+      </tr>`
+        )
+        .join("")}
+    </table>
+    </body></html>`;
+
+    return res.send(html);
+  } catch (e) {
+    console.error("Erro em /admin-consentimentos:", e);
+    return res.status(500).send("Erro ao carregar consentimentos");
+  }
+});
+
 // ── HEALTH ───────────────────────────────────────────────
 app.get("/", (req, res) => res.send("API rodando"));
 app.get("/health", (req, res) => res.json({ ok: true }));
