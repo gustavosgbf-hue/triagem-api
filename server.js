@@ -903,6 +903,65 @@ app.get("/admin-consentimentos", async (req, res) => {
   }
 });
 
+app.post("/api/medico/login", async (req, res) => {
+  try {
+    const { email, senha } = req.body || {};
+
+    if (!email || !senha) {
+      return res.status(400).json({
+        ok: false,
+        error: "E-mail e senha são obrigatórios",
+      });
+    }
+
+    const result = await pool.query(
+      "SELECT id, nome, email, crm, senha_hash, ativo FROM medicos WHERE email = $1 LIMIT 1",
+      [email.trim().toLowerCase()]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(401).json({
+        ok: false,
+        error: "Credenciais inválidas",
+      });
+    }
+
+    const medico = result.rows[0];
+
+    if (!medico.ativo) {
+      return res.status(403).json({
+        ok: false,
+        error: "Médico inativo",
+      });
+    }
+
+    const senhaOk = await bcrypt.compare(senha, medico.senha_hash);
+
+    if (!senhaOk) {
+      return res.status(401).json({
+        ok: false,
+        error: "Credenciais inválidas",
+      });
+    }
+
+    return res.json({
+      ok: true,
+      medico: {
+        id: medico.id,
+        nome: medico.nome,
+        email: medico.email,
+        crm: medico.crm,
+      },
+    });
+  } catch (err) {
+    console.error("Erro em /api/medico/login:", err);
+    return res.status(500).json({
+      ok: false,
+      error: "Erro interno no login",
+    });
+  }
+});
+
 // ── HEALTH ───────────────────────────────────────────────
 app.get("/", (req, res) => res.send("API rodando"));
 app.get("/health", (req, res) => res.json({ ok: true }));
