@@ -115,6 +115,13 @@ async function handleChat(req, res) {
     return res.status(500).json({ text: "Erro interno temporário." });
   }
 }
+function checkAdmin(req, res, next) {
+  const senha = req.headers["x-admin-password"];
+  if (senha !== process.env.ADMIN_PASSWORD) {
+    return res.status(403).send("Acesso negado");
+  }
+  next();
+}
 
 app.post("/api/triage", handleChat);
 app.post("/api/doctor", handleChat);
@@ -419,7 +426,7 @@ app.get("/atender", async (req, res) => {
 });
 
 // ── RELATÓRIOS ───────────────────────────────────────────
-app.get("/relatorio", (req, res) => {
+app.get("/relatorio", checkAdmin, (req, res) => {
   const lista = carregarAtendimentos();
 
   if (lista.length === 0) {
@@ -491,7 +498,7 @@ app.get("/relatorio", (req, res) => {
   res.send(html);
 });
 
-app.get("/identificacoes", (req, res) => {
+app.get("/identificacoes", checkAdmin, (req, res) => {
   const lista = lerJSON("./identificacoes.json");
 
   if (lista.length === 0) {
@@ -534,7 +541,7 @@ app.get("/identificacoes", (req, res) => {
   res.send(html);
 });
 
-app.get("/consentimentos", (req, res) => {
+app.get("/consentimentos", checkAdmin, (req, res) => {
   const lista = lerJSON("./consentimentos.json");
 
   if (lista.length === 0) {
