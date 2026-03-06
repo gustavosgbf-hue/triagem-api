@@ -299,7 +299,7 @@ app.post("/api/atendimento/atualizar-triagem", async (req, res) => {
   }
 });
 
-/ ── NOTIFICAR MÉDICOS ────────────────────────────────────
+// ── NOTIFICAR MÉDICOS ────────────────────────────────────
 app.post("/api/notify", async (req, res) => {
   try {
     const { nome, tel, tel_documentos, cpf, triagem, tipo } = req.body || {};
