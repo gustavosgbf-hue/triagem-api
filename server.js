@@ -272,9 +272,10 @@ app.post("/api/atendimento/atualizar-triagem", async (req, res) => {
     const result = await pool.query(
       `UPDATE fila_atendimentos
        SET triagem = $2, queixa = $3, idade = $4, sexo = $5,
-           alergias = $6, cronicas = $7, medicacoes = $8
-       WHERE id = $1
-       RETURNING id, nome, tel, cpf, tipo, triagem, medico_nome`,
+           alergias = $6, cronicas = $7, medicacoes = $8,
+           status = 'aguardando'
+       WHERE id = $1 AND status = 'triagem'
+       RETURNING id, nome, tel, cpf, tipo, triagem, tel_documentos, medico_nome`,
       [
         atendimentoId, triagem,
         campos.queixa || triagem,
@@ -285,13 +286,81 @@ app.post("/api/atendimento/atualizar-triagem", async (req, res) => {
         campos.medicacoes || "",
       ]
     );
-    if (result.rowCount === 0) return res.status(404).json({ ok: false, error: "Atendimento não encontrado" });
+    if (result.rowCount === 0) return res.status(404).json({ ok: false, error: "Atendimento não encontrado ou já em andamento" });
     const at = result.rows[0];
     const agora = new Date().toLocaleString("pt-BR", { timeZone: "America/Fortaleza" });
+
+    // Registra no Sheets
     appendToSheet("Atendimentos", [
       agora, at.nome || "", at.tel || "", at.cpf || "",
-      "Triagem Completa", at.medico_nome || "", triagem, at.tipo || "", "", String(at.id),
+      "Aguardando", "", triagem, at.tipo || "", "", String(at.id),
     ]).catch(e => console.error("[Sheets] Erro ao salvar triagem completa:", e));
+
+    // Notifica médicos por email (em background)
+    const RESEND_KEY = process.env.RESEND_API_KEY;
+    const BASE_URL = process.env.RENDER_EXTERNAL_URL || "https://triagem-api.onrender.com";
+    const SITE_URL = process.env.SITE_URL || "https://consultaja24h.com.br";
+    const tipoLabel = at.tipo === "video" ? "🎥 Vídeo" : "💬 Chat";
+    const linkRetorno = `${SITE_URL}/triagem.html?consulta=${at.id}`;
+    const telLimpo = String(at.tel || "").replace(/\D/g, "");
+    const destinatarios = ["gustavosgbf@gmail.com", process.env.EMAIL_MEDICO_2 || ""].filter(Boolean);
+
+    function linkMedico(nomeMedico) {
+      return `${BASE_URL}/atender?medico=${encodeURIComponent(nomeMedico)}&paciente=${encodeURIComponent(at.nome || "")}&tel=${encodeURIComponent(telLimpo)}`;
+    }
+    function montarTabelaTriagem(texto) {
+      if (!texto) return '<tr><td colspan="2" style="padding:8px 12px;color:rgba(255,255,255,.5)">—</td></tr>';
+      return texto.split(/[;\n]/).map((item) => {
+        const colonIdx = item.indexOf(":");
+        if (colonIdx > 0) {
+          const key = item.slice(0, colonIdx).trim();
+          const val = item.slice(colonIdx + 1).trim();
+          return `<tr><td style="padding:9px 14px;color:rgba(255,255,255,.45);font-size:12px;white-space:nowrap;border-bottom:1px solid rgba(255,255,255,.06);vertical-align:top;width:160px">${key}</td><td style="padding:9px 14px;color:#fff;font-weight:500;font-size:13px;border-bottom:1px solid rgba(255,255,255,.06)">${val}</td></tr>`;
+        }
+        return `<tr><td colspan="2" style="padding:9px 14px;color:rgba(255,255,255,.7);font-size:13px;border-bottom:1px solid rgba(255,255,255,.06)">${item.trim()}</td></tr>`;
+      }).join("");
+    }
+
+    const html = `
+      <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#060d0b;color:#fff;border-radius:12px;overflow:hidden">
+        <div style="background:linear-gradient(135deg,#b4e05a,#5ee0a0);padding:20px 28px">
+          <h2 style="margin:0;color:#051208;font-size:18px">🏥 Nova triagem — ConsultaJá24h</h2>
+        </div>
+        <div style="padding:28px">
+          <table style="width:100%;border-collapse:collapse;margin-bottom:24px">
+            <tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px;width:140px">Paciente</td><td style="padding:8px 0;font-weight:600">${at.nome || "—"}</td></tr>
+            <tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">CPF</td><td style="padding:8px 0;font-weight:600">${at.cpf || "—"}</td></tr>
+            <tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">WhatsApp</td><td style="padding:8px 0;font-weight:600">${telLimpo}</td></tr>
+            <tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">Tel. Documentos</td><td style="padding:8px 0;font-weight:600">${at.tel_documentos || telLimpo}</td></tr>
+            <tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">Modalidade</td><td style="padding:8px 0;font-weight:600">${tipoLabel}</td></tr>
+            <tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">Atender</td>
+              <td style="padding:8px 0"><a href="${linkMedico("Dr. Gustavo")}" style="background:#25D366;color:#fff;padding:6px 16px;border-radius:999px;text-decoration:none;font-size:13px;font-weight:600">📱 Chamar no WhatsApp</a></td></tr>
+            <tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">Link consulta</td>
+              <td style="padding:8px 0;font-size:12px"><a href="${linkRetorno}" style="color:#5ee0a0;word-break:break-all">${linkRetorno}</a></td></tr>
+          </table>
+          <div style="background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:10px;overflow:hidden">
+            <div style="padding:12px 14px;background:rgba(180,224,90,.08);border-bottom:1px solid rgba(255,255,255,.08)">
+              <p style="margin:0;font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:rgba(255,255,255,.4)">Triagem completa</p>
+            </div>
+            <table style="width:100%;border-collapse:collapse">${montarTabelaTriagem(triagem)}</table>
+          </div>
+          <p style="margin:20px 0 0;font-size:12px;color:rgba(255,255,255,.3)">Enviado automaticamente pelo sistema ConsultaJá24h</p>
+        </div>
+      </div>`;
+
+    if (RESEND_KEY) {
+      fetch("https://api.resend.com/emails", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${RESEND_KEY}` },
+        body: JSON.stringify({
+          from: "ConsultaJá24h <onboarding@resend.dev>",
+          to: destinatarios,
+          subject: `🏥 Nova triagem — ${at.nome || "Paciente"} (${tipoLabel})`,
+          html,
+        }),
+      }).then(r => r.json()).then(d => { if (!d.id) console.error("Resend error:", d); }).catch(e => console.error("Resend:", e));
+    }
+
     return res.json({ ok: true, atendimentoId: at.id });
   } catch (e) {
     console.error("Erro em /api/atendimento/atualizar-triagem:", e);
@@ -316,7 +385,7 @@ app.post("/api/notify", async (req, res) => {
     // ── 1. CRIAR ATENDIMENTO NO BANCO PRIMEIRO (para ter o ID) ──
     const insertResult = await pool.query(
       `INSERT INTO fila_atendimentos (nome, tel, tel_documentos, cpf, tipo, triagem, status, queixa, idade, sexo, alergias, cronicas, medicacoes)
-       VALUES ($1, $2, $3, $4, $5, $6, 'aguardando', $7, $8, $9, $10, $11, $12)
+       VALUES ($1, $2, $3, $4, $5, $6, 'triagem', $7, $8, $9, $10, $11, $12)
        RETURNING id`,
       [
         nome || "—",
@@ -337,84 +406,9 @@ app.post("/api/notify", async (req, res) => {
     const atendimentoId = insertResult.rows[0]?.id;
     const linkRetorno = `${SITE_URL}/triagem.html?consulta=${atendimentoId}`;
 
-    // Responde imediatamente ao frontend para não bloquear o paciente
-    res.json({ ok: true, atendimentoId, linkRetorno });
-
-    // ── 2. EMAIL + SHEETS (em background, não bloqueia a resposta) ──
-    function linkMedico(nomeMedico) {
-      return `${BASE_URL}/atender?medico=${encodeURIComponent(nomeMedico)}&paciente=${encodeURIComponent(nome || "")}&tel=${encodeURIComponent(telLimpo)}`;
-    }
-
-    function montarTabelaTriagem(texto) {
-      if (!texto) return '<tr><td colspan="2" style="padding:8px 12px;color:rgba(255,255,255,.5)">—</td></tr>';
-      return texto.split(/[,;]\s*(?=[A-ZÀÁÂÃÉÊÍÓÔÕÚÇ])/i).map((item) => {
-        const colonIdx = item.indexOf(":");
-        if (colonIdx > 0) {
-          const key = item.slice(0, colonIdx).trim();
-          const val = item.slice(colonIdx + 1).trim();
-          return `<tr>
-            <td style="padding:9px 14px;color:rgba(255,255,255,.45);font-size:12px;white-space:nowrap;border-bottom:1px solid rgba(255,255,255,.06);vertical-align:top;width:160px">${key}</td>
-            <td style="padding:9px 14px;color:#fff;font-weight:500;font-size:13px;border-bottom:1px solid rgba(255,255,255,.06)">${val}</td>
-          </tr>`;
-        }
-        return `<tr><td colspan="2" style="padding:9px 14px;color:rgba(255,255,255,.7);font-size:13px;border-bottom:1px solid rgba(255,255,255,.06)">${item.trim()}</td></tr>`;
-      }).join("");
-    }
-
-    const destinatarios = ["gustavosgbf@gmail.com", process.env.EMAIL_MEDICO_2 || ""].filter(Boolean);
-
-    const html = `
-      <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#060d0b;color:#fff;border-radius:12px;overflow:hidden">
-        <div style="background:linear-gradient(135deg,#b4e05a,#5ee0a0);padding:20px 28px">
-          <h2 style="margin:0;color:#051208;font-size:18px">🏥 Nova triagem — ConsultaJá24h</h2>
-        </div>
-        <div style="padding:28px">
-          <table style="width:100%;border-collapse:collapse;margin-bottom:24px">
-            <tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px;width:140px">Paciente</td><td style="padding:8px 0;font-weight:600">${nome || "—"}</td></tr>
-            <tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">CPF</td><td style="padding:8px 0;font-weight:600">${cpf || "—"}</td></tr>
-            <tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">WhatsApp</td><td style="padding:8px 0;font-weight:600">${telLimpo}</td></tr>
-            <tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">Tel. Documentos</td><td style="padding:8px 0;font-weight:600">${tel_documentos || telLimpo}</td></tr>
-            <tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">Modalidade</td><td style="padding:8px 0;font-weight:600">${tipoLabel}</td></tr>
-            <tr>
-              <td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">Atender</td>
-              <td style="padding:8px 0">
-                <a href="${linkMedico("Dr. Gustavo")}" style="background:#25D366;color:#fff;padding:6px 16px;border-radius:999px;text-decoration:none;font-size:13px;font-weight:600">📱 Chamar no WhatsApp</a>
-              </td>
-            </tr>
-            <tr>
-              <td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">Link consulta</td>
-              <td style="padding:8px 0;font-size:12px"><a href="${linkRetorno}" style="color:#5ee0a0;word-break:break-all">${linkRetorno}</a></td>
-            </tr>
-          </table>
-
-          <div style="background:rgba(255,255,255,.05);border:1px solid rgba(255,255,255,.1);border-radius:10px;overflow:hidden">
-            <div style="padding:12px 14px;background:rgba(180,224,90,.08);border-bottom:1px solid rgba(255,255,255,.08)">
-              <p style="margin:0;font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:rgba(255,255,255,.4)">Triagem completa</p>
-            </div>
-            <table style="width:100%;border-collapse:collapse">${montarTabelaTriagem(triagem)}</table>
-          </div>
-
-          <p style="margin:20px 0 0;font-size:12px;color:rgba(255,255,255,.3)">Enviado automaticamente pelo sistema ConsultaJá24h</p>
-        </div>
-      </div>`;
-
-    // Envios em paralelo, sem await bloqueante
-    Promise.all([
-      RESEND_KEY ? fetch("https://api.resend.com/emails", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${RESEND_KEY}` },
-        body: JSON.stringify({
-          from: "ConsultaJá24h <onboarding@resend.dev>",
-          to: destinatarios,
-          subject: `🏥 Nova triagem — ${nome || "Paciente"} (${tipoLabel})`,
-          html,
-        }),
-      }).then(r => r.json()).then(d => { if (!d.id) console.error("Resend error:", d); }).catch(e => console.error("Resend:", e)) : Promise.resolve(),
-      appendToSheet("Atendimentos", [
-        new Date().toLocaleString("pt-BR", { timeZone: "America/Fortaleza" }),
-        nome || "", tel || "", cpf || "", "Aguardando", "", triagem || "", tipoConsulta,
-      ]).catch(e => console.error("Sheets:", e)),
-    ]);
+    // Responde imediatamente — email e Sheets são disparados pelo atualizar-triagem
+    // quando o paciente terminar a triagem IA e o status mudar para 'aguardando'
+    return res.json({ ok: true, atendimentoId, linkRetorno });
 
   } catch (e) {
     console.error("Notify error:", e);
