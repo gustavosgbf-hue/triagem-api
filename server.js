@@ -330,6 +330,12 @@ app.post("/api/notify", async (req, res) => {
       triagem || "",
     ]);
 
+    await pool.query(
+      `INSERT INTO fila_atendimentos (nome, tel, cpf, tipo, triagem, status)
+       VALUES ($1, $2, $3, $4, $5, 'aguardando')`,
+      [nome || "—", tel || "—", cpf || "—", "whatsapp", triagem || ""]
+    );
+
     return res.json({ ok: true });
   } catch (e) {
     console.error("Notify error:", e);
@@ -449,7 +455,7 @@ app.post("/api/admin/medico/criar", checkAdmin, async (req, res) => {
       `INSERT INTO medicos (nome, email, senha_hash, crm, status_online, ativo)
        VALUES ($1, $2, $3, $4, false, true)
        RETURNING id, nome, email, crm, status_online, ativo, created_at`,
-      [nome, email, senha_hash, crm]
+      [nome, email.trim().toLowerCase(), senha_hash, crm]
     );
 
     return res.json({ ok: true, medico: result.rows[0] });
@@ -958,6 +964,99 @@ app.post("/api/medico/login", async (req, res) => {
     return res.status(500).json({
       ok: false,
       error: "Erro interno no login",
+    });
+  }
+});
+
+app.get("/api/fila", async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, nome, tel, cpf, tipo, triagem, status, medico_id, medico_nome, criado_em
+       FROM fila_atendimentos
+       WHERE status = 'aguardando'
+       ORDER BY criado_em ASC`
+    );
+
+    return res.json({ ok: true, fila: result.rows });
+  } catch (err) {
+    console.error("Erro em /api/fila:", err);
+    return res.status(500).json({ ok: false, error: "Erro ao carregar fila" });
+  }
+});
+
+app.post("/api/atendimento/assumir", async (req, res) => {
+  try {
+    const { filaId, medicoId, medicoNome } = req.body || {};
+
+    if (!filaId || !medicoId || !medicoNome) {
+      return res.status(400).json({
+        ok: false,
+        error: "Dados obrigatórios faltando",
+      });
+    }
+
+    const result = await pool.query(
+      `UPDATE fila_atendimentos
+       SET status = 'assumido',
+           medico_id = $1,
+           medico_nome = $2,
+           assumido_em = NOW()
+       WHERE id = $3
+         AND status = 'aguardando'
+       RETURNING *`,
+      [medicoId, medicoNome, filaId]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(409).json({
+        ok: false,
+        error: "Paciente já foi assumido",
+      });
+    }
+
+    return res.json({ ok: true, atendimento: result.rows[0] });
+  } catch (err) {
+    console.error("Erro em /api/atendimento/assumir:", err);
+    return res.status(500).json({
+      ok: false,
+      error: "Erro ao assumir atendimento",
+    });
+  }
+});
+
+app.post("/api/atendimento/encerrar", async (req, res) => {
+  try {
+    const { filaId } = req.body || {};
+
+    if (!filaId) {
+      return res.status(400).json({
+        ok: false,
+        error: "filaId é obrigatório",
+      });
+    }
+
+    const result = await pool.query(
+      `UPDATE fila_atendimentos
+       SET status = 'encerrado',
+           encerrado_em = NOW()
+       WHERE id = $1
+       RETURNING *`,
+      [filaId]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({
+        ok: false,
+        error: "Atendimento não encontrado",
+      });
+    }
+
+    return res.json({ ok: true, atendimento: result.rows[0] });
+  } catch (err) {
+    console.error("Erro em /api/atendimento/encerrar:", err);
+    return res.status(500).json({
+      ok: false,
+      error: "Erro ao encerrar atendimento",
     });
   }
 });
