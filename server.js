@@ -64,7 +64,7 @@ setInterval(async () => {
   } catch(e) {
     console.error("[HISTORICO] Erro:", e.message);
   }
-}, 6 * 60 * 60 * 1000); // roda a cada 6h
+}, 6 * 60 * 60 * 1000);
 
 async function initDB() {
   try {
@@ -291,11 +291,27 @@ app.post("/api/atendimento/atualizar-triagem", async (req, res) => {
 
     const html = `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#060d0b;color:#fff;border-radius:12px;overflow:hidden"><div style="background:linear-gradient(135deg,#b4e05a,#5ee0a0);padding:20px 28px"><h2 style="margin:0;color:#051208;font-size:18px">Nova triagem - ConsultaJa24h</h2></div><div style="padding:28px"><table style="width:100%;border-collapse:collapse;margin-bottom:24px"><tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px;width:140px">Paciente</td><td style="padding:8px 0;font-weight:600">${at.nome||"-"}</td></tr><tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">WhatsApp</td><td style="padding:8px 0;font-weight:600">${telLimpo}</td></tr><tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">Modalidade</td><td style="padding:8px 0;font-weight:600">${tipoLabel}</td></tr><tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">WhatsApp</td><td style="padding:8px 0"><a href="https://wa.me/55${telLimpo}" style="background:#25D366;color:#fff;padding:6px 16px;border-radius:999px;text-decoration:none;font-size:13px;font-weight:600">Chamar no WhatsApp</a></td></tr><tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">Link consulta</td><td style="padding:8px 0;font-size:12px"><a href="${linkRetorno}" style="color:#5ee0a0">${linkRetorno}</a></td></tr></table><table style="width:100%;border-collapse:collapse;border:1px solid rgba(255,255,255,.1);border-radius:10px">${montarTabelaTriagem(triagem)}</table><p style="margin:20px 0 0;font-size:12px;color:rgba(255,255,255,.3)">Enviado automaticamente pelo sistema ConsultaJa24h</p></div></div>`;
 
+    // CORRECAO: await com log explicito para diagnosticar falhas
     if (RESEND_KEY) {
-      fetch("https://api.resend.com/emails",{method:"POST",headers:{"Content-Type":"application/json",Authorization:`Bearer ${RESEND_KEY}`},
-        body:JSON.stringify({from:"ConsultaJa24h <onboarding@resend.dev>",to:destinatarios,subject:`Nova triagem - ${at.nome||"Paciente"} (${tipoLabel})`,html})
-      }).then(r=>r.json()).then(d=>{if(!d.id)console.error("Resend error:",d);}).catch(e=>console.error("Resend:",e));
+      try {
+        const resendRes = await fetch("https://api.resend.com/emails", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${RESEND_KEY}` },
+          body: JSON.stringify({ from: "ConsultaJa24h <onboarding@resend.dev>", to: destinatarios, subject: `Nova triagem - ${at.nome||"Paciente"} (${tipoLabel})`, html })
+        });
+        const resendData = await resendRes.json();
+        if (resendData.id) {
+          console.log("[EMAIL] Enviado com sucesso para:", destinatarios.join(", "), "| ID:", resendData.id);
+        } else {
+          console.error("[EMAIL] Resend recusou:", JSON.stringify(resendData));
+        }
+      } catch(e) {
+        console.error("[EMAIL] Erro ao chamar Resend:", e.message);
+      }
+    } else {
+      console.warn("[EMAIL] RESEND_API_KEY nao definida, email nao enviado.");
     }
+
     return res.json({ ok: true, atendimentoId: at.id });
   } catch (e) {
     console.error("Erro em /api/atendimento/atualizar-triagem:", e);
@@ -713,7 +729,21 @@ app.post("/api/agendamento/confirmar", async (req, res) => {
     const tipoLabel=ag.modalidade==="video"?"Video":"Chat";
     const htmlAg=`<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#060d0b;color:#fff;border-radius:12px;overflow:hidden"><div style="background:linear-gradient(135deg,#4285f4,#34a853);padding:20px 28px"><h2 style="margin:0;color:#fff;font-size:18px">Novo AGENDAMENTO - ${horarioFormatado}</h2></div><div style="padding:28px"><p style="color:rgba(255,200,100,.9);font-size:14px;margin-bottom:20px;background:rgba(255,200,0,.06);border:1px solid rgba(255,200,0,.2);padding:12px 16px;border-radius:8px">Agendamento confirmado - paciente aguarda no horario marcado.</p><table style="width:100%;border-collapse:collapse"><tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px;width:140px">Paciente</td><td style="padding:8px 0;font-weight:600">${ag.nome}</td></tr><tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">WhatsApp</td><td style="padding:8px 0;font-weight:600">${ag.tel}</td></tr><tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">Modalidade</td><td style="padding:8px 0;font-weight:600">${tipoLabel}</td></tr><tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">Horario</td><td style="padding:8px 0;font-weight:700;font-size:16px;color:#b4e05a">${horarioFormatado}</td></tr></table></div></div>`;
     if (RESEND_KEY) {
-      await fetch("https://api.resend.com/emails",{method:"POST",headers:{"Content-Type":"application/json",Authorization:`Bearer ${RESEND_KEY}`},body:JSON.stringify({from:"ConsultaJa24h <onboarding@resend.dev>",to:destinatarios,subject:`Novo AGENDAMENTO - ${horarioFormatado} (${tipoLabel})`,html:htmlAg})}).catch(e=>console.error("Resend agendamento error:",e));
+      try {
+        const resendRes = await fetch("https://api.resend.com/emails", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${RESEND_KEY}` },
+          body: JSON.stringify({ from: "ConsultaJa24h <onboarding@resend.dev>", to: destinatarios, subject: `Novo AGENDAMENTO - ${horarioFormatado} (${tipoLabel})`, html: htmlAg })
+        });
+        const resendData = await resendRes.json();
+        if (resendData.id) {
+          console.log("[EMAIL-AGENDAMENTO] Enviado para:", destinatarios.join(", "), "| ID:", resendData.id);
+        } else {
+          console.error("[EMAIL-AGENDAMENTO] Resend recusou:", JSON.stringify(resendData));
+        }
+      } catch(e) {
+        console.error("[EMAIL-AGENDAMENTO] Erro ao chamar Resend:", e.message);
+      }
     }
     return res.json({ok:true,agendamento:ag,horarioFormatado});
   } catch(e) { console.error("Erro em /api/agendamento/confirmar:", e); return res.status(500).json({ok:false,error:"Erro ao confirmar agendamento"}); }
