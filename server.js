@@ -67,6 +67,7 @@ async function initDB() {
     await pool.query(`ALTER TABLE medicos ADD COLUMN IF NOT EXISTS uf TEXT`);
     await pool.query(`ALTER TABLE medicos ADD COLUMN IF NOT EXISTS telefone TEXT`);
     await pool.query(`ALTER TABLE medicos ADD COLUMN IF NOT EXISTS especialidade TEXT`);
+    await pool.query(`ALTER TABLE medicos ADD COLUMN IF NOT EXISTS nome_exibicao TEXT`);
 
     const cols = [
       ['status_atendimento', 'TEXT'],
@@ -569,17 +570,17 @@ app.get("/atender", async (req, res) => {
 // ── CADASTRO PÚBLICO DE MÉDICOS ──────────────────────────────────────
 app.post("/api/medico/cadastro", async (req, res) => {
   try {
-    const { nome, email, senha, crm, uf, telefone, especialidade } = req.body || {};
+    const { nome, nome_exibicao, email, senha, crm, uf, telefone, especialidade } = req.body || {};
     if (!nome || !email || !senha || !crm || !uf || !telefone) {
       return res.status(400).json({ ok: false, error: "Todos os campos obrigatórios devem ser preenchidos" });
     }
     if (senha.length < 6) return res.status(400).json({ ok: false, error: "Senha deve ter ao menos 6 caracteres" });
     const senha_hash = await bcrypt.hash(senha, 10);
     const result = await pool.query(
-      `INSERT INTO medicos (nome, email, senha_hash, crm, uf, telefone, especialidade, status_online, ativo, role, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, false, false, 'medico', 'pendente')
-       RETURNING id, nome, email`,
-      [nome.trim(), email.trim().toLowerCase(), senha_hash, crm.trim().toUpperCase(), uf.trim().toUpperCase(), telefone || "", especialidade || ""]
+      `INSERT INTO medicos (nome, nome_exibicao, email, senha_hash, crm, uf, telefone, especialidade, status_online, ativo, role, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, false, false, 'medico', 'pendente')
+       RETURNING id, nome, nome_exibicao, email`,
+      [nome.trim(), (nome_exibicao || nome).trim(), email.trim().toLowerCase(), senha_hash, crm.trim().toUpperCase(), uf.trim().toUpperCase(), telefone || "", especialidade || ""]
     );
     return res.json({ ok: true, medico: result.rows[0] });
   } catch (err) {
@@ -671,7 +672,7 @@ app.post("/api/medico/login", async (req, res) => {
   try {
     const { email, senha } = req.body || {};
     if (!email || !senha) return res.status(400).json({ ok: false, error: "E-mail e senha são obrigatórios" });
-    const result = await pool.query("SELECT id, nome, email, crm, senha_hash, ativo FROM medicos WHERE email = $1 LIMIT 1", [email.trim().toLowerCase()]);
+    const result = await pool.query("SELECT id, nome, nome_exibicao, email, crm, senha_hash, ativo FROM medicos WHERE email = $1 LIMIT 1", [email.trim().toLowerCase()]);
     if (result.rowCount === 0) return res.status(401).json({ ok: false, error: "Credenciais inválidas" });
     const med = result.rows[0];
     if (!med.ativo) return res.status(403).json({ ok: false, error: "Seu cadastro ainda está em análise pela equipe da plataforma." });
@@ -682,7 +683,7 @@ app.post("/api/medico/login", async (req, res) => {
       process.env.JWT_SECRET || "fallback_secret",
       { expiresIn: "8h" }
     );
-    return res.json({ ok: true, token, medico: { id: med.id, nome: med.nome, email: med.email, crm: med.crm } });
+    return res.json({ ok: true, token, medico: { id: med.id, nome: med.nome_exibicao || med.nome, email: med.email, crm: med.crm } });
   } catch (err) {
     return res.status(500).json({ ok: false, error: "Erro interno no login" });
   }
