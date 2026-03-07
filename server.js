@@ -48,6 +48,24 @@ setInterval(async () => {
   }
 }, 60 * 60 * 1000);
 
+// LIMPEZA AUTOMATICA -- historico: encerrados/expirados com mais de 7 dias viram 'arquivado'
+setInterval(async () => {
+  try {
+    const result = await pool.query(
+      `UPDATE fila_atendimentos
+       SET status = 'arquivado'
+       WHERE status IN ('encerrado', 'expirado')
+         AND encerrado_em < NOW() - INTERVAL '7 days'
+       RETURNING id`
+    );
+    if (result.rowCount > 0) {
+      console.log("[HISTORICO] " + result.rowCount + " atendimento(s) arquivado(s).");
+    }
+  } catch(e) {
+    console.error("[HISTORICO] Erro:", e.message);
+  }
+}, 6 * 60 * 60 * 1000); // roda a cada 6h
+
 async function initDB() {
   try {
     await pool.query(`CREATE TABLE IF NOT EXISTS mensagens (
@@ -81,6 +99,7 @@ async function initDB() {
       ['tel_documentos','TEXT'],['idade','TEXT'],['sexo','TEXT'],['alergias','TEXT'],
       ['cronicas','TEXT'],['medicacoes','TEXT'],['queixa','TEXT'],
       ['assumido_em','TIMESTAMP'],['encerrado_em','TIMESTAMP'],
+      ['data_nascimento','TEXT'],
     ];
     for (const [col, tipo] of cols) {
       await pool.query(`ALTER TABLE fila_atendimentos ADD COLUMN IF NOT EXISTS ${col} ${tipo}`);
@@ -286,15 +305,15 @@ app.post("/api/atendimento/atualizar-triagem", async (req, res) => {
 
 app.post("/api/notify", async (req, res) => {
   try {
-    const { nome, tel, tel_documentos, cpf, triagem, tipo } = req.body || {};
+    const { nome, tel, tel_documentos, cpf, triagem, tipo, data_nascimento } = req.body || {};
     const tipoConsulta = tipo === "video" ? "video" : "chat";
     const SITE_URL = process.env.SITE_URL || "https://consultaja24h.com.br";
     const campos = parsearTriagem(triagem);
     const insertResult = await pool.query(
-      `INSERT INTO fila_atendimentos (nome,tel,tel_documentos,cpf,tipo,triagem,status,queixa,idade,sexo,alergias,cronicas,medicacoes)
-       VALUES ($1,$2,$3,$4,$5,$6,'triagem',$7,$8,$9,$10,$11,$12) RETURNING id`,
+      `INSERT INTO fila_atendimentos (nome,tel,tel_documentos,cpf,tipo,triagem,status,queixa,idade,sexo,alergias,cronicas,medicacoes,data_nascimento)
+       VALUES ($1,$2,$3,$4,$5,$6,'triagem',$7,$8,$9,$10,$11,$12,$13) RETURNING id`,
       [nome||"-",tel||"-",tel_documentos||tel||"-",cpf||"-",tipoConsulta,triagem||"",
-       campos.queixa||triagem||"",campos.idade||"",campos.sexo||"",campos.alergias||"",campos.cronicas||"",campos.medicacoes||""]
+       campos.queixa||triagem||"",campos.idade||"",campos.sexo||"",campos.alergias||"",campos.cronicas||"",campos.medicacoes||"",data_nascimento||""]
     );
     const atendimentoId = insertResult.rows[0]?.id;
     return res.json({ ok: true, atendimentoId, linkRetorno: `${SITE_URL}/triagem.html?consulta=${atendimentoId}` });
@@ -333,7 +352,7 @@ app.get("/api/chat/:atendimentoId", async (req, res) => {
 
 app.get("/api/atendimento/status/:id", async (req, res) => {
   try {
-    const result = await pool.query(`SELECT id,status,tipo,medico_nome,meet_link,criado_em,assumido_em,encerrado_em FROM fila_atendimentos WHERE id=$1`,[req.params.id]);
+    const result = await pool.query(`SELECT id,status,tipo,medico_nome,meet_link,criado_em,assumido_em,encerrado_em,nome,tel,cpf,data_nascimento,idade,sexo,alergias,cronicas,medicacoes,queixa FROM fila_atendimentos WHERE id=$1`,[req.params.id]);
     if (result.rowCount===0) return res.status(404).json({ ok: false, error: "Atendimento nao encontrado" });
     return res.json({ ok: true, atendimento: result.rows[0] });
   } catch (e) { return res.status(500).json({ ok: false, error: "Erro ao buscar status" }); }
@@ -463,9 +482,31 @@ app.post("/api/medico/login", async (req, res) => {
 
 app.get("/api/fila", checkMedico, async (req, res) => {
   try {
-    const result = await pool.query(`SELECT id,nome,tel,cpf,tipo,triagem,status,medico_id,medico_nome,meet_link,criado_em FROM fila_atendimentos WHERE status IN ('aguardando','assumido') ORDER BY criado_em ASC`);
+    const result = await pool.query(`SELECT id,nome,tel,cpf,tipo,triagem,status,medico_id,medico_nome,meet_link,criado_em,data_nascimento,idade,sexo,alergias,cronicas,medicacoes,queixa,solicita FROM fila_atendimentos WHERE status IN ('aguardando','assumido') ORDER BY criado_em ASC`);
     return res.json({ ok: true, fila: result.rows });
   } catch (err) { return res.status(500).json({ ok: false, error: "Erro ao carregar fila" }); }
+});
+
+// HISTORICO -- ultimos 7 dias, apenas atendimentos do medico logado
+app.get("/api/historico", checkMedico, async (req, res) => {
+  try {
+    const medicoId = req.medico.id;
+    const result = await pool.query(
+      `SELECT id,nome,tel,cpf,tipo,triagem,status,status_atendimento,documentos_emitidos,
+              medico_nome,criado_em,assumido_em,encerrado_em,
+              data_nascimento,idade,sexo,alergias,cronicas,medicacoes,queixa,solicita
+       FROM fila_atendimentos
+       WHERE medico_id = $1
+         AND status IN ('encerrado','expirado')
+         AND encerrado_em >= NOW() - INTERVAL '7 days'
+       ORDER BY encerrado_em DESC`,
+      [medicoId]
+    );
+    return res.json({ ok: true, historico: result.rows });
+  } catch (err) {
+    console.error("Erro em /api/historico:", err);
+    return res.status(500).json({ ok: false, error: "Erro ao carregar historico" });
+  }
 });
 
 app.post("/api/atendimento/assumir", async (req, res) => {
