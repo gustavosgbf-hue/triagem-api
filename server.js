@@ -53,6 +53,13 @@ async function initDB() {
     `);
 
     // Colunas extras em fila_atendimentos
+    // Adiciona coluna role em medicos se não existir
+    await pool.query(`ALTER TABLE medicos ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'medico'`);
+    await pool.query(`ALTER TABLE medicos ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pendente'`);
+    await pool.query(`ALTER TABLE medicos ADD COLUMN IF NOT EXISTS uf TEXT`);
+    await pool.query(`ALTER TABLE medicos ADD COLUMN IF NOT EXISTS telefone TEXT`);
+    await pool.query(`ALTER TABLE medicos ADD COLUMN IF NOT EXISTS especialidade TEXT`);
+
     const cols = [
       ['status_atendimento', 'TEXT'],
       ['documentos_emitidos', 'TEXT'],
@@ -520,6 +527,67 @@ app.get("/atender", async (req, res) => {
 });
 
 // ── ADMIN — MÉDICOS ───────────────────────────────────────
+// ── CADASTRO PÚBLICO DE MÉDICOS ──────────────────────────────────────
+app.post("/api/medico/cadastro", async (req, res) => {
+  try {
+    const { nome, email, senha, crm, uf, telefone, especialidade } = req.body || {};
+    if (!nome || !email || !senha || !crm || !uf || !telefone) {
+      return res.status(400).json({ ok: false, error: "Todos os campos obrigatórios devem ser preenchidos" });
+    }
+    if (senha.length < 6) return res.status(400).json({ ok: false, error: "Senha deve ter ao menos 6 caracteres" });
+    const senha_hash = await bcrypt.hash(senha, 10);
+    const result = await pool.query(
+      `INSERT INTO medicos (nome, email, senha_hash, crm, uf, telefone, especialidade, status_online, ativo, role, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, false, false, 'medico', 'pendente')
+       RETURNING id, nome, email`,
+      [nome.trim(), email.trim().toLowerCase(), senha_hash, crm.trim().toUpperCase(), uf.trim().toUpperCase(), telefone || "", especialidade || ""]
+    );
+    return res.json({ ok: true, medico: result.rows[0] });
+  } catch (err) {
+    if (err.code === "23505") return res.status(400).json({ ok: false, error: "E-mail já cadastrado" });
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ── APROVAÇÃO / REJEIÇÃO DE MÉDICOS (admin) ──────────────────────────
+app.patch("/api/admin/medico/:id/aprovar", checkAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `UPDATE medicos SET ativo = true, status = 'aprovado' WHERE id = $1 RETURNING id, nome, email, status, ativo`,
+      [req.params.id]
+    );
+    if (result.rowCount === 0) return res.status(404).json({ ok: false, error: "Médico não encontrado" });
+    return res.json({ ok: true, medico: result.rows[0] });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.patch("/api/admin/medico/:id/rejeitar", checkAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `UPDATE medicos SET ativo = false, status = 'rejeitado' WHERE id = $1 RETURNING id, nome, status`,
+      [req.params.id]
+    );
+    if (result.rowCount === 0) return res.status(404).json({ ok: false, error: "Médico não encontrado" });
+    return res.json({ ok: true, medico: result.rows[0] });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ── LISTAR MÉDICOS PENDENTES (admin) ─────────────────────────────────
+app.get("/api/admin/medicos/pendentes", checkAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, nome, email, crm, uf, telefone, especialidade, status, ativo, created_at FROM medicos WHERE status = 'pendente' ORDER BY created_at DESC`
+    );
+    return res.json({ ok: true, medicos: result.rows });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 app.post("/api/admin/medico/criar", checkAdmin, async (req, res) => {
   try {
     const { nome, email, crm, senha } = req.body || {};
@@ -567,7 +635,7 @@ app.post("/api/medico/login", async (req, res) => {
     const result = await pool.query("SELECT id, nome, email, crm, senha_hash, ativo FROM medicos WHERE email = $1 LIMIT 1", [email.trim().toLowerCase()]);
     if (result.rowCount === 0) return res.status(401).json({ ok: false, error: "Credenciais inválidas" });
     const med = result.rows[0];
-    if (!med.ativo) return res.status(403).json({ ok: false, error: "Médico inativo" });
+    if (!med.ativo) return res.status(403).json({ ok: false, error: "Cadastro pendente de aprovação ou inativo" });
     const senhaOk = await bcrypt.compare(senha, med.senha_hash);
     if (!senhaOk) return res.status(401).json({ ok: false, error: "Credenciais inválidas" });
     const token = jwt.sign(
@@ -1053,6 +1121,42 @@ app.post("/api/agendamento/confirmar", async (req, res) => {
   } catch(e) {
     console.error("Erro em /api/agendamento/confirmar:", e);
     return res.status(500).json({ ok: false, error: "Erro ao confirmar agendamento" });
+  }
+});
+
+// ── AGENDAMENTO — INICIAR (antecipar consulta) ───────────────────────
+app.post("/api/agendamento/:id/iniciar", async (req, res) => {
+  try {
+    const auth = req.headers["authorization"] || "";
+    const token = auth.replace("Bearer ", "");
+    let medicoId, medicoNome;
+    try {
+      const decoded = jwt.verify(token, process.env.JWT_SECRET || "fallback_secret");
+      medicoId = decoded.id; medicoNome = decoded.nome;
+    } catch(e) { return res.status(401).json({ ok: false, error: "Token inválido" }); }
+
+    const ag = await pool.query(`SELECT * FROM agendamentos WHERE id = $1 AND status = 'confirmado'`, [req.params.id]);
+    if (ag.rowCount === 0) return res.status(404).json({ ok: false, error: "Agendamento não encontrado" });
+    const a = ag.rows[0];
+
+    // Cria entrada na fila como assumido direto
+    const insert = await pool.query(
+      `INSERT INTO fila_atendimentos (nome, tel, tel_documentos, cpf, tipo, triagem, status, medico_id, medico_nome, assumido_em)
+       VALUES ($1, $2, $3, $4, $5, $6, 'assumido', $7, $8, NOW())
+       RETURNING id`,
+      [a.nome, a.tel, a.tel_documentos || a.tel, a.cpf || "", a.modalidade || "chat",
+       "(Agendamento antecipado)", medicoId, medicoNome]
+    );
+    const atendimentoId = insert.rows[0].id;
+
+    // Marca agendamento como iniciado
+    await pool.query(`UPDATE agendamentos SET status = 'iniciado' WHERE id = $1`, [req.params.id]);
+
+    const SITE_URL = process.env.SITE_URL || "https://consultaja24h.com.br";
+    return res.json({ ok: true, atendimentoId, linkRetorno: `${SITE_URL}/triagem.html?consulta=${atendimentoId}` });
+  } catch(e) {
+    console.error("Erro em /api/agendamento/:id/iniciar:", e);
+    return res.status(500).json({ ok: false, error: "Erro ao iniciar consulta" });
   }
 });
 
