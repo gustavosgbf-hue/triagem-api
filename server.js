@@ -12,7 +12,15 @@ const pool = new Pool({
 });
 
 const app = express();
-app.use(cors());
+app.use(cors({
+  origin: [
+    'https://consultaja24h.com.br',
+    'https://www.consultaja24h.com.br',
+    'https://painel.consultaja24h.com.br',
+    'https://triagem-api.onrender.com',
+  ],
+  credentials: true,
+}));
 app.use(express.json({ limit: "1mb" }));
 
 const OPENAI_KEY = process.env.OPENAI_API_KEY;
@@ -199,11 +207,25 @@ async function handleChat(req, res) {
 
 // ── ADMIN — PROTEÇÃO ──────────────────────────────
 function checkAdmin(req, res, next) {
-  const senha = req.headers["x-admin-password"] || req.query.senha;
+  const senha = req.headers["x-admin-password"];
   const senhaAdmin = process.env.ADMIN_PASSWORD;
   if (!senhaAdmin) return res.status(500).send("ADMIN_PASSWORD não configurada");
   if (!senha || senha !== senhaAdmin) return res.status(403).send("Acesso negado");
   next();
+}
+
+// Middleware de autenticação JWT para rotas de médico
+function checkMedico(req, res, next) {
+  const auth = req.headers["authorization"] || "";
+  const token = auth.replace("Bearer ", "").trim();
+  if (!token) return res.status(401).json({ ok: false, error: "Token não fornecido" });
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || "fallback_secret");
+    req.medico = decoded;
+    next();
+  } catch(e) {
+    return res.status(401).json({ ok: false, error: "Token inválido ou expirado" });
+  }
 }
 
 // ── ROTAS ABERTAS ────────────────────────────────────────
@@ -310,7 +332,13 @@ app.post("/api/atendimento/atualizar-triagem", async (req, res) => {
     const tipoLabel = at.tipo === "video" ? "🎥 Vídeo" : "💬 Chat";
     const linkRetorno = `${SITE_URL}/triagem.html?consulta=${at.id}`;
     const telLimpo = String(at.tel || "").replace(/\D/g, "");
-    const destinatarios = ["gustavosgbf@gmail.com", process.env.EMAIL_MEDICO_2 || ""].filter(Boolean);
+    // Busca emails de todos os médicos aprovados e ativos (em plantão ou não)
+    const medicosResult = await pool.query(
+      `SELECT email, nome FROM medicos WHERE ativo = true AND status = 'aprovado' ORDER BY status_online DESC`
+    );
+    const destinatarios = medicosResult.rows.map(m => m.email).filter(Boolean);
+    // Garante que o admin sempre recebe também
+    if (!destinatarios.includes("gustavosgbf@gmail.com")) destinatarios.push("gustavosgbf@gmail.com");
 
     function linkMedico(nomeMedico) {
       return `${BASE_URL}/atender?medico=${encodeURIComponent(nomeMedico)}&paciente=${encodeURIComponent(at.nome || "")}&tel=${encodeURIComponent(telLimpo)}`;
@@ -341,7 +369,7 @@ app.post("/api/atendimento/atualizar-triagem", async (req, res) => {
             <tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">Tel. Documentos</td><td style="padding:8px 0;font-weight:600">${at.tel_documentos || telLimpo}</td></tr>
             <tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">Modalidade</td><td style="padding:8px 0;font-weight:600">${tipoLabel}</td></tr>
             <tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">Atender</td>
-              <td style="padding:8px 0"><a href="${linkMedico("Dr. Gustavo")}" style="background:#25D366;color:#fff;padding:6px 16px;border-radius:999px;text-decoration:none;font-size:13px;font-weight:600">📱 Chamar no WhatsApp</a></td></tr>
+              <td style="padding:8px 0"><a href="https://wa.me/55${telLimpo}" style="background:#25D366;color:#fff;padding:6px 16px;border-radius:999px;text-decoration:none;font-size:13px;font-weight:600">📱 Chamar paciente no WhatsApp</a></td></tr>
             <tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">Link consulta</td>
               <td style="padding:8px 0;font-size:12px"><a href="${linkRetorno}" style="color:#5ee0a0;word-break:break-all">${linkRetorno}</a></td></tr>
           </table>
@@ -451,6 +479,19 @@ app.post("/api/chat/enviar", async (req, res) => {
 app.get("/api/chat/:atendimentoId", async (req, res) => {
   try {
     const { atendimentoId } = req.params;
+    // Permite acesso: médico autenticado OU paciente com o próprio atendimentoId
+    const auth = req.headers["authorization"] || "";
+    const token = auth.replace("Bearer ", "").trim();
+    let autorizado = false;
+    if (token) {
+      try { jwt.verify(token, process.env.JWT_SECRET || "fallback_secret"); autorizado = true; } catch(e) {}
+    }
+    // Paciente acessa pelo próprio ID — verifica se atendimento existe
+    if (!autorizado) {
+      const check = await pool.query(`SELECT id FROM fila_atendimentos WHERE id = $1`, [atendimentoId]);
+      autorizado = check.rowCount > 0;
+    }
+    if (!autorizado) return res.status(403).json({ ok: false, error: "Acesso negado" });
     const result = await pool.query(
       `SELECT id, atendimento_id, autor, texto, criado_em
        FROM mensagens
@@ -469,9 +510,7 @@ app.get("/api/chat/:atendimentoId", async (req, res) => {
 app.get("/api/atendimento/status/:id", async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT id, status, tipo, nome, tel, cpf, tel_documentos, medico_nome, meet_link,
-              queixa, idade, sexo, alergias, cronicas, medicacoes, triagem,
-              criado_em, assumido_em, encerrado_em
+      `SELECT id, status, tipo, medico_nome, meet_link, criado_em, assumido_em, encerrado_em
        FROM fila_atendimentos
        WHERE id = $1`,
       [req.params.id]
@@ -518,7 +557,7 @@ app.get("/atender", async (req, res) => {
     if (!tel) return res.status(400).send("Parâmetros inválidos");
     const agora = new Date().toLocaleString("pt-BR", { timeZone: "America/Fortaleza" });
     await pool.query("INSERT INTO logs_atendimentos (medico, paciente, tel, data) VALUES ($1,$2,$3,$4)", [medico || "desconhecido", paciente || "—", tel, agora]);
-    await appendToSheet("Atendimentos", [agora, paciente || "", tel || "", "", "Assumido", medico || "", ""]);
+    await appendToSheet("Atendimentos", [agora, paciente || "", tel || "", "", "Assumido", medico || "", "", "", "", ""]);
     const telLimpo = String(tel).replace(/\D/g, "");
     return res.redirect(`https://wa.me/55${telLimpo}`);
   } catch (e) {
@@ -635,7 +674,7 @@ app.post("/api/medico/login", async (req, res) => {
     const result = await pool.query("SELECT id, nome, email, crm, senha_hash, ativo FROM medicos WHERE email = $1 LIMIT 1", [email.trim().toLowerCase()]);
     if (result.rowCount === 0) return res.status(401).json({ ok: false, error: "Credenciais inválidas" });
     const med = result.rows[0];
-    if (!med.ativo) return res.status(403).json({ ok: false, error: "Cadastro pendente de aprovação ou inativo" });
+    if (!med.ativo) return res.status(403).json({ ok: false, error: "Seu cadastro ainda está em análise pela equipe da plataforma." });
     const senhaOk = await bcrypt.compare(senha, med.senha_hash);
     if (!senhaOk) return res.status(401).json({ ok: false, error: "Credenciais inválidas" });
     const token = jwt.sign(
@@ -650,7 +689,7 @@ app.post("/api/medico/login", async (req, res) => {
 });
 
 // ── FILA ──────────────────────────────────────────────────
-app.get("/api/fila", async (req, res) => {
+app.get("/api/fila", checkMedico, async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT id, nome, tel, cpf, tipo, triagem, status, medico_id, medico_nome, meet_link, criado_em
@@ -1077,7 +1116,13 @@ app.post("/api/agendamento/confirmar", async (req, res) => {
 
     // Envia email de confirmação de agendamento
     const RESEND_KEY = process.env.RESEND_API_KEY;
-    const destinatarios = ["gustavosgbf@gmail.com", process.env.EMAIL_MEDICO_2 || ""].filter(Boolean);
+    // Busca emails de todos os médicos aprovados e ativos (em plantão ou não)
+    const medicosResult = await pool.query(
+      `SELECT email, nome FROM medicos WHERE ativo = true AND status = 'aprovado' ORDER BY status_online DESC`
+    );
+    const destinatarios = medicosResult.rows.map(m => m.email).filter(Boolean);
+    // Garante que o admin sempre recebe também
+    if (!destinatarios.includes("gustavosgbf@gmail.com")) destinatarios.push("gustavosgbf@gmail.com");
     const horarioFormatado = new Date(ag.horario_agendado).toLocaleString("pt-BR", {
       timeZone: "America/Fortaleza", day: "2-digit", month: "2-digit", year: "numeric",
       hour: "2-digit", minute: "2-digit"
@@ -1161,7 +1206,7 @@ app.post("/api/agendamento/:id/iniciar", async (req, res) => {
 });
 
 // ── AGENDAMENTOS — LISTAR (admin/médico) ──────────────────
-app.get("/api/agendamentos", async (req, res) => {
+app.get("/api/agendamentos", checkMedico, async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT id, nome, tel, tel_documentos, cpf, modalidade, horario_agendado, status, criado_em
