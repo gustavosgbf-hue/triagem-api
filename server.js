@@ -235,7 +235,7 @@ app.post("/api/payment", async (req, res) => {
         "access_token": ASAAS_TOKEN
       },
       body: JSON.stringify({
-        customer: await getOrCreateAsaasCustomer(nome),
+        customer: await getOrCreateAsaasCustomer(),
         billingType: "PIX",
         value: 49.90,
         dueDate: new Date(Date.now() + 30 * 60 * 1000).toISOString().split("T")[0],
@@ -261,17 +261,28 @@ app.post("/api/payment", async (req, res) => {
   } catch (e) { console.error("Erro em /api/payment:", e); return res.status(500).json({ ok: false, error: "Erro interno" }); }
 });
 
-async function getOrCreateAsaasCustomer(nome) {
+async function getOrCreateAsaasCustomer() {
   try {
-    const nome_limpo = (nome || "Paciente").trim();
-    // Criar cliente temporário
     const res = await fetch("https://api.asaas.com/v3/customers", {
       method: "POST",
       headers: { "Content-Type": "application/json", "access_token": ASAAS_TOKEN },
-      body: JSON.stringify({ name: nome_limpo })
+      body: JSON.stringify({
+        name: "JG Fonseca Servicos Medicos LTDA",
+        cpfCnpj: "55789896000121"
+      })
     });
     const data = await res.json();
-    return data.id;
+    // Se CNPJ já existe, Asaas retorna o customer existente no erro
+    if (data.id) return data.id;
+    if (data.errors) {
+      // Buscar customer existente pelo CNPJ
+      const busca = await fetch("https://api.asaas.com/v3/customers?cpfCnpj=55789896000121", {
+        headers: { "access_token": ASAAS_TOKEN }
+      });
+      const buscaData = await busca.json();
+      if (buscaData.data?.[0]?.id) return buscaData.data[0].id;
+    }
+    throw new Error("Nao foi possivel obter customer Asaas");
   } catch(e) {
     console.error("[Asaas] Erro ao criar customer:", e.message);
     throw e;
