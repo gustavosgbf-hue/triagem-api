@@ -100,6 +100,7 @@ async function initDB() {
       ['cronicas','TEXT'],['medicacoes','TEXT'],['queixa','TEXT'],
       ['assumido_em','TIMESTAMP'],['encerrado_em','TIMESTAMP'],
       ['data_nascimento','TEXT'],
+      ['prontuario','TEXT'],  // ── PATCH 1: coluna para autosave do prontuário
     ];
     for (const [col, tipo] of cols) {
       await pool.query(`ALTER TABLE fila_atendimentos ADD COLUMN IF NOT EXISTS ${col} ${tipo}`);
@@ -218,6 +219,9 @@ function checkMedico(req, res, next) {
   }
 }
 
+// alias para checkMedico usado na rota de prontuário
+const autenticarMedico = checkMedico;
+
 app.post("/api/triage", handleChat);
 app.post("/api/doctor", handleChat);
 
@@ -291,7 +295,6 @@ app.post("/api/atendimento/atualizar-triagem", async (req, res) => {
 
     const html = `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#060d0b;color:#fff;border-radius:12px;overflow:hidden"><div style="background:linear-gradient(135deg,#b4e05a,#5ee0a0);padding:20px 28px"><h2 style="margin:0;color:#051208;font-size:18px">Nova triagem - ConsultaJa24h</h2></div><div style="padding:28px"><table style="width:100%;border-collapse:collapse;margin-bottom:24px"><tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px;width:140px">Paciente</td><td style="padding:8px 0;font-weight:600">${at.nome||"-"}</td></tr><tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">WhatsApp</td><td style="padding:8px 0;font-weight:600">${telLimpo}</td></tr><tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">Modalidade</td><td style="padding:8px 0;font-weight:600">${tipoLabel}</td></tr><tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">WhatsApp</td><td style="padding:8px 0"><a href="https://wa.me/55${telLimpo}" style="background:#25D366;color:#fff;padding:6px 16px;border-radius:999px;text-decoration:none;font-size:13px;font-weight:600">Chamar no WhatsApp</a></td></tr><tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">Link consulta</td><td style="padding:8px 0;font-size:12px"><a href="${linkRetorno}" style="color:#5ee0a0">${linkRetorno}</a></td></tr></table><table style="width:100%;border-collapse:collapse;border:1px solid rgba(255,255,255,.1);border-radius:10px">${montarTabelaTriagem(triagem)}</table><p style="margin:20px 0 0;font-size:12px;color:rgba(255,255,255,.3)">Enviado automaticamente pelo sistema ConsultaJa24h</p></div></div>`;
 
-    // CORRECAO: await com log explicito para diagnosticar falhas
     if (RESEND_KEY) {
       try {
         const resendRes = await fetch("https://api.resend.com/emails", {
@@ -503,17 +506,19 @@ app.get("/api/fila", checkMedico, async (req, res) => {
   } catch (err) { return res.status(500).json({ ok: false, error: "Erro ao carregar fila" }); }
 });
 
-// HISTORICO -- ultimos 7 dias, apenas atendimentos do medico logado
+// ── PATCH 2: GET /api/historico — inclui prontuario_salvo e status 'arquivado' ──
 app.get("/api/historico", checkMedico, async (req, res) => {
   try {
     const medicoId = req.medico.id;
     const result = await pool.query(
-      `SELECT id,nome,tel,cpf,tipo,triagem,status,status_atendimento,documentos_emitidos,
-              medico_nome,criado_em,assumido_em,encerrado_em,
-              data_nascimento,idade,sexo,alergias,cronicas,medicacoes,queixa,solicita
+      `SELECT id, nome, tel, tel_documentos, cpf, tipo, triagem, status,
+              status_atendimento, documentos_emitidos, medico_nome,
+              criado_em, assumido_em, encerrado_em,
+              data_nascimento, idade, sexo, alergias, cronicas, medicacoes, queixa, solicita,
+              prontuario AS prontuario_salvo
        FROM fila_atendimentos
        WHERE medico_id = $1
-         AND status IN ('encerrado','expirado')
+         AND status IN ('encerrado', 'expirado', 'arquivado')
          AND encerrado_em >= NOW() - INTERVAL '7 days'
        ORDER BY encerrado_em DESC`,
       [medicoId]
@@ -567,6 +572,28 @@ app.post("/api/atendimento/encerrar", async (req, res) => {
   } catch (err) { console.error("Erro em /api/atendimento/encerrar:", err); return res.status(500).json({ ok: false, error: "Erro ao encerrar atendimento" }); }
 });
 
+// ── PATCH 3: POST /api/atendimento/prontuario (NOVA ROTA) ───────────────────
+// Salva prontuário com validação de autoria — autosave + gerar manual
+app.post("/api/atendimento/prontuario", autenticarMedico, async (req, res) => {
+  const { filaId, prontuario } = req.body;
+  if (!filaId || prontuario === undefined) {
+    return res.status(400).json({ ok: false, error: "filaId e prontuario sao obrigatorios" });
+  }
+  try {
+    const r = await pool.query(
+      "UPDATE fila_atendimentos SET prontuario = $1 WHERE id = $2 AND medico_id = $3",
+      [prontuario, filaId, req.medico.id]
+    );
+    if (r.rowCount === 0) {
+      return res.status(403).json({ ok: false, error: "Atendimento nao encontrado ou sem permissao." });
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("[prontuario] Erro ao salvar:", err.message);
+    res.status(500).json({ ok: false, error: "Erro ao salvar prontuario" });
+  }
+});
+
 app.post("/api/plantao/entrar", async (req, res) => {
   try {
     const auth = req.headers["authorization"]||"";
@@ -616,7 +643,7 @@ app.get("/relatorio", checkAdmin, async (req, res) => {
     ${ident.map(i=>`<tr><td class="dim">${i.data||'--'}</td><td>${i.nome||'--'}</td><td><a href="https://wa.me/55${String(i.tel||'').replace(/\D/g,'')}">${i.tel||'--'}</a></td><td class="dim" style="font-size:.73rem">${i.ip||'--'}</td></tr>`).join('')}
     </table>
     <h2>Consentimentos LGPD (${cons.length})</h2><table><tr><th>Data/Hora</th><th>Nome</th><th>WhatsApp</th><th>Versao</th><th>IP</th></tr>
-    ${cons.map(i=>`<tr><td class="dim">${i.data||'--'}</td><td>${i.nome||'--'}</td><td><a href="https://wa.me/55${String(i.tel||'').replace(/\D/g,'')}">${i.tel||'--'}</a></td><td><span class="badge lgpd">${i.versao||'v1.0'}</span></td><td class="dim" style="font-size:.73rem">${i.ip||'--'}</td></tr>`).join('')}
+    ${cons.map(i=>`<tr><td class="dim">${i.data||'--'}</td><td>${i.nome||'--'}</td><td><a href="https://wa.me/55${String(i.tel||'').replace(/\D/g,'')}">📱 ${i.tel||'--'}</a></td><td><span class="badge lgpd">${i.versao||'v1.0'}</span></td><td class="dim" style="font-size:.73rem">${i.ip||'--'}</td></tr>`).join('')}
     </table>
     <p class="dim" style="margin-top:32px">Gerado em ${new Date().toLocaleString('pt-BR',{timeZone:'America/Fortaleza'})}</p></body></html>`;
     return res.send(html);
