@@ -24,10 +24,10 @@ app.use(cors({
 app.use(express.json({ limit: "1mb" }));
 
 const OPENAI_KEY = process.env.OPENAI_API_KEY;
-const MP_TOKEN = process.env.MP_ACCESS_TOKEN;
+const ASAAS_TOKEN = process.env.ASAAS_TOKEN;
 
 if (!OPENAI_KEY) { console.error("OPENAI_API_KEY nao definida"); process.exit(1); }
-if (!MP_TOKEN) { console.error("MP_ACCESS_TOKEN nao definida"); process.exit(1); }
+if (!ASAAS_TOKEN) { console.error("ASAAS_TOKEN nao definida"); process.exit(1); }
 
 // LIMPEZA AUTOMATICA -- atendimentos travados em 'assumido' por mais de 48h
 setInterval(async () => {
@@ -227,36 +227,68 @@ app.post("/api/doctor", handleChat);
 
 app.post("/api/payment", async (req, res) => {
   try {
-    const { email, nome } = req.body || {};
-    const idempotency = `consult-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    const mpRes = await fetch("https://api.mercadopago.com/v1/payments", {
+    const { nome } = req.body || {};
+    const asaasRes = await fetch("https://api.asaas.com/v3/payments", {
       method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${MP_TOKEN}`, "X-Idempotency-Key": idempotency },
+      headers: {
+        "Content-Type": "application/json",
+        "access_token": ASAAS_TOKEN
+      },
       body: JSON.stringify({
-        transaction_amount: 49.9,
-        description: "Consulta Medica Online - Pronto Atendimento Online",
-        payment_method_id: "pix",
-        payer: {
-          email: email || "paciente@prontoatendimento.com",
-          first_name: (nome || "Paciente").split(" ")[0],
-          last_name: (nome || "Paciente").split(" ").slice(1).join(" ") || "Online",
-        },
+        customer: await getOrCreateAsaasCustomer(nome),
+        billingType: "PIX",
+        value: 49.90,
+        dueDate: new Date(Date.now() + 30 * 60 * 1000).toISOString().split("T")[0],
+        description: "Consulta Medica Online - ConsultaJa24h",
       }),
     });
-    const data = await mpRes.json();
-    if (!mpRes.ok) { console.error("MP error:", data); return res.status(500).json({ ok: false, error: data.message || "Erro ao gerar pagamento" }); }
-    return res.json({ ok: true, payment_id: data.id, status: data.status,
-      qr_code: data.point_of_interaction?.transaction_data?.qr_code,
-      qr_code_base64: data.point_of_interaction?.transaction_data?.qr_code_base64 });
+    const data = await asaasRes.json();
+    if (!asaasRes.ok) { console.error("Asaas error:", data); return res.status(500).json({ ok: false, error: data.errors?.[0]?.description || "Erro ao gerar pagamento" }); }
+
+    // Buscar QR code PIX
+    const pixRes = await fetch(`https://api.asaas.com/v3/payments/${data.id}/pixQrCode`, {
+      headers: { "access_token": ASAAS_TOKEN }
+    });
+    const pixData = await pixRes.json();
+
+    return res.json({
+      ok: true,
+      payment_id: data.id,
+      status: data.status,
+      qr_code: pixData.payload,
+      qr_code_base64: pixData.encodedImage
+    });
   } catch (e) { console.error("Erro em /api/payment:", e); return res.status(500).json({ ok: false, error: "Erro interno" }); }
 });
 
+async function getOrCreateAsaasCustomer(nome) {
+  try {
+    const nome_limpo = (nome || "Paciente").trim();
+    // Criar cliente temporário
+    const res = await fetch("https://api.asaas.com/v3/customers", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "access_token": ASAAS_TOKEN },
+      body: JSON.stringify({ name: nome_limpo })
+    });
+    const data = await res.json();
+    return data.id;
+  } catch(e) {
+    console.error("[Asaas] Erro ao criar customer:", e.message);
+    throw e;
+  }
+}
+
 app.get("/api/payment/:id", async (req, res) => {
   try {
-    const mpRes = await fetch(`https://api.mercadopago.com/v1/payments/${req.params.id}`, { headers: { Authorization: `Bearer ${MP_TOKEN}` } });
-    const data = await mpRes.json();
-    if (!mpRes.ok) return res.status(500).json({ ok: false, error: data.message || "Erro ao consultar pagamento" });
-    return res.json({ ok: true, status: data.status });
+    const asaasRes = await fetch(`https://api.asaas.com/v3/payments/${req.params.id}`, {
+      headers: { "access_token": ASAAS_TOKEN }
+    });
+    const data = await asaasRes.json();
+    if (!asaasRes.ok) return res.status(500).json({ ok: false, error: data.errors?.[0]?.description || "Erro ao consultar pagamento" });
+    // Mapear status Asaas -> padrão interno
+    // CONFIRMED/RECEIVED = aprovado, PENDING = pendente
+    const statusMap = { CONFIRMED: "approved", RECEIVED: "approved", PENDING: "pending", OVERDUE: "cancelled", REFUNDED: "refunded" };
+    return res.json({ ok: true, status: statusMap[data.status] || data.status.toLowerCase() });
   } catch (e) { return res.status(500).json({ ok: false, error: "Erro ao consultar pagamento" }); }
 });
 
