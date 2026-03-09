@@ -200,7 +200,7 @@ async function handleChat(req, res) {
 }
 
 function checkAdmin(req, res, next) {
-  const senha = req.headers["x-admin-password"];
+  const senha = req.headers["x-admin-password"] || req.query.senha;
   const senhaAdmin = process.env.ADMIN_PASSWORD;
   if (!senhaAdmin) return res.status(500).send("ADMIN_PASSWORD nao configurada");
   if (!senha || senha !== senhaAdmin) return res.status(403).send("Acesso negado");
