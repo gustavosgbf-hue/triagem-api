@@ -101,6 +101,7 @@ async function initDB() {
       ['assumido_em','TIMESTAMP'],['encerrado_em','TIMESTAMP'],
       ['data_nascimento','TEXT'],
       ['prontuario','TEXT'],
+      ['solicita','TEXT'],
     ];
     for (const [col, tipo] of cols) {
       await pool.query(`ALTER TABLE fila_atendimentos ADD COLUMN IF NOT EXISTS ${col} ${tipo}`);
@@ -298,7 +299,7 @@ async function enviarEmailMedicos({ nome, tel, tipo, triagem, linkRetorno, subje
     const resendRes = await fetch("https://api.resend.com/emails", {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${RESEND_KEY}` },
-      body: JSON.stringify({ from: "ConsultaJa24h <onboarding@resend.dev>", to: destinatarios, subject, html })
+      body: JSON.stringify({ from: "ConsultaJa24h <contato@consultaja24h.com.br>", to: destinatarios, subject, html })
     });
     const resendData = await resendRes.json();
     if (resendData.id) {
@@ -810,7 +811,7 @@ app.post("/api/agendamento/confirmar", async (req, res) => {
         const resendRes = await fetch("https://api.resend.com/emails", {
           method: "POST",
           headers: { "Content-Type": "application/json", Authorization: `Bearer ${RESEND_KEY}` },
-          body: JSON.stringify({ from: "ConsultaJa24h <onboarding@resend.dev>", to: destinatarios, subject: `Novo AGENDAMENTO - ${horarioFormatado} (${tipoLabel})`, html: htmlAg })
+          body: JSON.stringify({ from: "ConsultaJa24h <contato@consultaja24h.com.br>", to: destinatarios, subject: `Novo AGENDAMENTO - ${horarioFormatado} (${tipoLabel})`, html: htmlAg })
         });
         const resendData = await resendRes.json();
         if (resendData.id) console.log("[EMAIL-AGENDAMENTO] Enviado | ID:", resendData.id);
