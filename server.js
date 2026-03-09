@@ -680,9 +680,10 @@ app.get("/consentimentos", checkAdmin, async (req, res) => {
 
 app.get("/api/disponibilidade", async (req, res) => {
   try {
-    const agora = new Date(new Date().toLocaleString("en-US",{timeZone:"America/Fortaleza"}));
-    const hora = agora.getHours();
+    const agora = new Date(); // Date.now() real — nunca usar toLocaleString para cálculos de tempo
     const HORA_INICIO=8, HORA_FIM=23;
+    // Hora atual em Fortaleza (UTC-3)
+    const hora = parseInt(new Intl.DateTimeFormat("en-US",{timeZone:"America/Fortaleza",hour:"2-digit",hour12:false}).formatToParts(agora).find(p=>p.type==="hour").value);
     const dentroDoHorario = hora>=HORA_INICIO && hora<HORA_FIM;
     const [medRes,filaRes] = await Promise.all([
       pool.query("SELECT COUNT(*) FROM medicos WHERE status_online=true AND ativo=true"),
@@ -699,43 +700,29 @@ app.get("/api/disponibilidade", async (req, res) => {
     else if (tempoEstimado>12||medicosOnline===0) status='amarelo';
     let horarioRetorno=null;
     let mensagem=disponivel?(medicosOnline>0?`${medicosOnline} medico(s) disponivel(is)`:'Atendimento disponivel'):'Atendimento indisponivel no momento';
+    // diaBase em UTC para geração de slots: Fortaleza = UTC-3
+    const agoraFtz = new Date(agora.getTime() - 3*60*60*1000);
     if (!disponivel) {
-      const agoraFtz = new Date(agora.getTime() - 3*60*60*1000);
-      const retorno = new Date(Date.UTC(
+      const diaRetorno = new Date(Date.UTC(
         agoraFtz.getUTCFullYear(), agoraFtz.getUTCMonth(),
         hora>=HORA_FIM ? agoraFtz.getUTCDate()+1 : agoraFtz.getUTCDate(),
         HORA_INICIO+3, 0, 0, 0
       ));
-      horarioRetorno=retorno.toLocaleString("pt-BR",{timeZone:"America/Fortaleza",hour:"2-digit",minute:"2-digit",day:"2-digit",month:"2-digit"});
+      horarioRetorno=diaRetorno.toLocaleString("pt-BR",{timeZone:"America/Fortaleza",hour:"2-digit",minute:"2-digit",day:"2-digit",month:"2-digit"});
       mensagem=`Atendimento disponivel das ${HORA_INICIO}h as ${HORA_FIM}h`;
     }
     const horariosAgendamento=[];
     if (!disponivel) {
-      // Calcular data/hora atual em Fortaleza (UTC-3)
-      const agoraFortaleza = new Date(agora.getTime() - 3*60*60*1000);
-      const hojeFortaleza = new Date(agoraFortaleza);
-      // Determinar o dia base e hora de início dos slots
-      let diaBase, horaInicioSlots;
-      if (hora >= HORA_FIM) {
-        // Depois das 23h: slots começam amanhã às 08h
-        diaBase = new Date(agoraFortaleza);
-        diaBase.setUTCDate(diaBase.getUTCDate() + 1);
-        horaInicioSlots = HORA_INICIO;
-      } else {
-        // Antes das 08h ou fora do horário: slots começam hoje às 08h
-        diaBase = new Date(agoraFortaleza);
-        horaInicioSlots = HORA_INICIO;
-      }
+      const diaBase = new Date(agoraFtz);
+      if (hora >= HORA_FIM) diaBase.setUTCDate(diaBase.getUTCDate() + 1);
       let count = 0;
-      for (let h = horaInicioSlots; h < HORA_FIM && count < 16; h++) {
+      for (let h = HORA_INICIO; h < HORA_FIM && count < 16; h++) {
         for (const m of [0, 20, 40]) {
           if (count >= 16) break;
-          // Criar slot em UTC considerando Fortaleza = UTC-3
           const slot = new Date(Date.UTC(
             diaBase.getUTCFullYear(), diaBase.getUTCMonth(), diaBase.getUTCDate(),
-            h + 3, m, 0, 0  // h+3 converte Fortaleza para UTC
+            h + 3, m, 0, 0
           ));
-          // Só incluir slots pelo menos 10 min no futuro
           if (slot.getTime() < agora.getTime() + 10*60*1000) continue;
           horariosAgendamento.push({
             label: slot.toLocaleTimeString("pt-BR", {hour:"2-digit", minute:"2-digit", timeZone:"America/Fortaleza"}),
