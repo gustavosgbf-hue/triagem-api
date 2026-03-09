@@ -849,6 +849,17 @@ app.post("/api/agendamento/:id/iniciar", async (req, res) => {
   } catch(e) { console.error("Erro em /api/agendamento/:id/iniciar:", e); return res.status(500).json({ok:false,error:"Erro ao iniciar consulta"}); }
 });
 
+app.post("/api/agendamento/:id/cancelar", checkMedico, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `UPDATE agendamentos SET status='cancelado' WHERE id=$1 AND status='confirmado' RETURNING id`,
+      [req.params.id]
+    );
+    if (result.rowCount===0) return res.status(404).json({ok:false,error:"Agendamento não encontrado ou já cancelado"});
+    return res.json({ok:true});
+  } catch(e) { return res.status(500).json({ok:false,error:"Erro ao cancelar agendamento"}); }
+});
+
 app.get("/api/agendamentos", checkMedico, async (req, res) => {
   try {
     const result=await pool.query(`SELECT id,nome,tel,tel_documentos,cpf,modalidade,horario_agendado,status,criado_em FROM agendamentos WHERE status='confirmado' ORDER BY horario_agendado ASC`);
