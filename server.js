@@ -700,9 +700,12 @@ app.get("/api/disponibilidade", async (req, res) => {
     let horarioRetorno=null;
     let mensagem=disponivel?(medicosOnline>0?`${medicosOnline} medico(s) disponivel(is)`:'Atendimento disponivel'):'Atendimento indisponivel no momento';
     if (!disponivel) {
-      const retorno=new Date(agora);
-      if (hora>=HORA_FIM) { retorno.setDate(retorno.getDate()+1); retorno.setHours(HORA_INICIO,0,0,0); }
-      else retorno.setHours(HORA_INICIO,0,0,0);
+      const agoraFtz = new Date(agora.getTime() - 3*60*60*1000);
+      const retorno = new Date(Date.UTC(
+        agoraFtz.getUTCFullYear(), agoraFtz.getUTCMonth(),
+        hora>=HORA_FIM ? agoraFtz.getUTCDate()+1 : agoraFtz.getUTCDate(),
+        HORA_INICIO+3, 0, 0, 0
+      ));
       horarioRetorno=retorno.toLocaleString("pt-BR",{timeZone:"America/Fortaleza",hour:"2-digit",minute:"2-digit",day:"2-digit",month:"2-digit"});
       mensagem=`Atendimento disponivel das ${HORA_INICIO}h as ${HORA_FIM}h`;
     }
