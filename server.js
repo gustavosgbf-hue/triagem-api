@@ -330,12 +330,57 @@ app.post("/api/notify", async (req, res) => {
     const campos = parsearTriagem(triagem);
     const insertResult = await pool.query(
       `INSERT INTO fila_atendimentos (nome,tel,tel_documentos,cpf,tipo,triagem,status,queixa,idade,sexo,alergias,cronicas,medicacoes,data_nascimento)
-       VALUES ($1,$2,$3,$4,$5,$6,'triagem',$7,$8,$9,$10,$11,$12,$13) RETURNING id`,
+       VALUES ($1,$2,$3,$4,$5,$6,'aguardando',$7,$8,$9,$10,$11,$12,$13) RETURNING id`,
       [nome||"-",tel||"-",tel_documentos||tel||"-",cpf||"-",tipoConsulta,triagem||"",
        campos.queixa||triagem||"",campos.idade||"",campos.sexo||"",campos.alergias||"",campos.cronicas||"",campos.medicacoes||"",data_nascimento||""]
     );
     const atendimentoId = insertResult.rows[0]?.id;
-    return res.json({ ok: true, atendimentoId, linkRetorno: `${SITE_URL}/triagem.html?consulta=${atendimentoId}` });
+    const linkRetorno = `${SITE_URL}/triagem.html?consulta=${atendimentoId}`;
+
+    // Google Sheets
+    const agora = new Date().toLocaleString("pt-BR",{timeZone:"America/Fortaleza"});
+    const tipoLabel = tipoConsulta === "video" ? "Video" : "Chat";
+    appendToSheet("Atendimentos",[agora,nome||"",tel||"",cpf||"","Aguardando","",triagem||"",tipoConsulta||"","",String(atendimentoId)]).catch(e=>console.error("[Sheets]",e));
+
+    // Email para médicos aprovados
+    const RESEND_KEY = process.env.RESEND_API_KEY;
+    if (RESEND_KEY) {
+      try {
+        const telLimpo = String(tel||"").replace(/\D/g,"");
+        const medicosResult = await pool.query(`SELECT email FROM medicos WHERE ativo=true AND status='aprovado' ORDER BY status_online DESC`);
+        const destinatarios = medicosResult.rows.map(m=>m.email).filter(Boolean);
+        if (!destinatarios.includes("gustavosgbf@gmail.com")) destinatarios.push("gustavosgbf@gmail.com");
+
+        function montarTabelaTriagem(texto) {
+          if (!texto) return '<tr><td colspan="2">Triagem em andamento</td></tr>';
+          return texto.split(/[;\n]/).map(item => {
+            const ci = item.indexOf(":");
+            if (ci>0) { const k=item.slice(0,ci).trim(); const v=item.slice(ci+1).trim(); return `<tr><td style="padding:8px 12px;color:rgba(255,255,255,.45);font-size:12px;width:150px">${k}</td><td style="padding:8px 12px;color:#fff;font-size:13px">${v}</td></tr>`; }
+            return `<tr><td colspan="2" style="padding:8px 12px;color:rgba(255,255,255,.7);font-size:13px">${item.trim()}</td></tr>`;
+          }).join("");
+        }
+
+        const html = `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#060d0b;color:#fff;border-radius:12px;overflow:hidden"><div style="background:linear-gradient(135deg,#b4e05a,#5ee0a0);padding:20px 28px"><h2 style="margin:0;color:#051208;font-size:18px">Nova triagem - ConsultaJa24h</h2></div><div style="padding:28px"><table style="width:100%;border-collapse:collapse;margin-bottom:24px"><tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px;width:140px">Paciente</td><td style="padding:8px 0;font-weight:600">${nome||"-"}</td></tr><tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">WhatsApp</td><td style="padding:8px 0;font-weight:600">${telLimpo}</td></tr><tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">Modalidade</td><td style="padding:8px 0;font-weight:600">${tipoLabel}</td></tr><tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">WhatsApp</td><td style="padding:8px 0"><a href="https://wa.me/55${telLimpo}" style="background:#25D366;color:#fff;padding:6px 16px;border-radius:999px;text-decoration:none;font-size:13px;font-weight:600">Chamar no WhatsApp</a></td></tr><tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">Link consulta</td><td style="padding:8px 0;font-size:12px"><a href="${linkRetorno}" style="color:#5ee0a0">${linkRetorno}</a></td></tr></table><table style="width:100%;border-collapse:collapse;border:1px solid rgba(255,255,255,.1);border-radius:10px">${montarTabelaTriagem(triagem)}</table><p style="margin:20px 0 0;font-size:12px;color:rgba(255,255,255,.3)">Enviado automaticamente pelo sistema ConsultaJa24h</p></div></div>`;
+
+        const resendRes = await fetch("https://api.resend.com/emails", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${RESEND_KEY}` },
+          body: JSON.stringify({ from: "ConsultaJa24h <onboarding@resend.dev>", to: destinatarios, subject: `Nova triagem - ${nome||"Paciente"} (${tipoLabel})`, html })
+        });
+        const resendData = await resendRes.json();
+        if (resendData.id) {
+          console.log("[EMAIL-NOTIFY] Enviado para:", destinatarios.join(", "), "| ID:", resendData.id);
+        } else {
+          console.error("[EMAIL-NOTIFY] Resend recusou:", JSON.stringify(resendData));
+        }
+      } catch(e) {
+        console.error("[EMAIL-NOTIFY] Erro:", e.message);
+      }
+    } else {
+      console.warn("[EMAIL-NOTIFY] RESEND_API_KEY nao definida.");
+    }
+
+    return res.json({ ok: true, atendimentoId, linkRetorno });
   } catch (e) {
     console.error("Notify error:", e);
     if (!res.headersSent) return res.status(500).json({ ok: false });
