@@ -24,10 +24,10 @@ app.use(cors({
 app.use(express.json({ limit: "1mb" }));
 
 const OPENAI_KEY = process.env.OPENAI_API_KEY;
-const PAGSEGURO_TOKEN = process.env.PAGSEGURO_TOKEN;
+const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
 
 if (!OPENAI_KEY) { console.error("OPENAI_API_KEY nao definida"); process.exit(1); }
-if (!PAGSEGURO_TOKEN) { console.error("PAGSEGURO_TOKEN nao definida"); process.exit(1); }
+if (!STRIPE_SECRET_KEY) { console.error("STRIPE_SECRET_KEY nao definida"); process.exit(1); }
 
 // LIMPEZA AUTOMATICA -- atendimentos travados em 'assumido' por mais de 48h
 setInterval(async () => {
@@ -227,76 +227,81 @@ app.post("/api/doctor", handleChat);
 
 app.post("/api/payment", async (req, res) => {
   try {
-    const { email, nome, cpf } = req.body || {};
-    const cpfLimpo = (cpf || "00000000000").replace(/\D/g, "").padEnd(11, "0");
-    const nomePartes = (nome || "Paciente").split(" ");
-    const senderName = `${nomePartes[0]} ${nomePartes.slice(1).join(" ") || "Online"}`.trim();
+    const { email, nome } = req.body || {};
 
-    // Criar cobrança Pix via API legada PagSeguro
-    const xmlBody = `<?xml version="1.0" encoding="ISO-8859-1" standalone="yes"?>
-<payment>
-  <mode>default</mode>
-  <method>pix</method>
-  <sender>
-    <name>${senderName}</name>
-    <email>${email || "paciente@consultaja24h.com.br"}</email>
-    <documents>
-      <document>
-        <type>CPF</type>
-        <value>${cpfLimpo}</value>
-      </document>
-    </documents>
-  </sender>
-  <currency>BRL</currency>
-  <items>
-    <item>
-      <id>consulta001</id>
-      <description>Consulta Medica Online</description>
-      <amount>49.90</amount>
-      <quantity>1</quantity>
-    </item>
-  </items>
-  <reference>${Date.now()}</reference>
-</payment>`;
-
-    const psRes = await fetch(`https://ws.pagseguro.uol.com.br/v2/transactions?email=gustavosgbf@gmail.com&token=${PAGSEGURO_TOKEN}`, {
+    // Criar PaymentIntent com Pix via Stripe
+    const stripeRes = await fetch("https://api.stripe.com/v1/payment_intents", {
       method: "POST",
-      headers: { "Content-Type": "application/xml; charset=ISO-8859-1" },
-      body: xmlBody
+      headers: {
+        "Authorization": `Bearer ${STRIPE_SECRET_KEY}`,
+        "Content-Type": "application/x-www-form-urlencoded"
+      },
+      body: new URLSearchParams({
+        "amount": "4990",
+        "currency": "brl",
+        "payment_method_types[]": "pix",
+        "description": "Consulta Medica Online - ConsultaJa24h",
+        "receipt_email": email || "paciente@consultaja24h.com.br",
+        "metadata[nome]": nome || "Paciente",
+        "payment_method_data[type]": "pix"
+      }).toString()
     });
 
-    const text = await psRes.text();
-    console.log("[PAGSEGURO] Resposta:", text.slice(0, 300));
+    const intent = await stripeRes.json();
+    console.log("[STRIPE] PaymentIntent:", intent.id, intent.status);
 
-    if (!psRes.ok) return res.status(500).json({ ok: false, error: "Erro ao gerar pagamento PagSeguro" });
+    if (intent.error) return res.status(500).json({ ok: false, error: intent.error.message });
 
-    // Extrair dados do XML de resposta
-    const codeMatch = text.match(/<code>([^<]+)<\/code>/);
-    const pixMatch = text.match(/<pixCopiaECola>([^<]+)<\/pixCopiaECola>/);
-    const qrBase64Match = text.match(/<qrCode>([^<]+)<\/qrCode>/);
+    // Confirmar para gerar QR code Pix
+    const confirmRes = await fetch(`https://api.stripe.com/v1/payment_intents/${intent.id}/confirm`, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${STRIPE_SECRET_KEY}`,
+        "Content-Type": "application/x-www-form-urlencoded"
+      },
+      body: new URLSearchParams({
+        "payment_method_data[type]": "pix"
+      }).toString()
+    });
 
-    if (!codeMatch) return res.status(500).json({ ok: false, error: "Codigo de transacao nao retornado" });
+    const confirmed = await confirmRes.json();
+    console.log("[STRIPE] Confirmed status:", confirmed.status);
+
+    if (confirmed.error) return res.status(500).json({ ok: false, error: confirmed.error.message });
+
+    const pixData = confirmed.next_action?.pix_display_qr_code;
+    if (!pixData) return res.status(500).json({ ok: false, error: "QR Code Pix nao gerado" });
 
     return res.json({
       ok: true,
-      payment_id: codeMatch[1],
+      payment_id: confirmed.id,
       status: "pending",
-      qr_code: pixMatch?.[1] || null,
-      qr_code_base64: qrBase64Match?.[1] || null
+      qr_code: pixData.data,
+      qr_code_base64: pixData.image_url_png || null
     });
   } catch (e) { console.error("Erro em /api/payment:", e); return res.status(500).json({ ok: false, error: "Erro interno" }); }
 });
 
 app.get("/api/payment/:id", async (req, res) => {
   try {
-    const psRes = await fetch(`https://ws.pagseguro.uol.com.br/v3/transactions/${req.params.id}?email=gustavosgbf@gmail.com&token=${PAGSEGURO_TOKEN}`);
-    const text = await psRes.text();
-    // Status 3 = pago, 4 = disponível, 6 = devolvido
-    const statusMatch = text.match(/<status>(\d+)<\/status>/);
-    const status = statusMatch ? parseInt(statusMatch[1]) : 0;
-    const pago = status >= 3 && status <= 4;
+    const stripeRes = await fetch(`https://api.stripe.com/v1/payment_intents/${req.params.id}`, {
+      headers: { "Authorization": `Bearer ${STRIPE_SECRET_KEY}` }
+    });
+    const intent = await stripeRes.json();
+    if (intent.error) return res.status(500).json({ ok: false, error: intent.error.message });
+    const pago = intent.status === "succeeded";
     return res.json({ ok: true, status: pago ? "approved" : "pending" });
   } catch (e) { return res.status(500).json({ ok: false, error: "Erro ao consultar pagamento" }); }
+});
+
+// Webhook Stripe
+app.post("/api/payment/webhook", express.raw({ type: "application/json" }), async (req, res) => {
+  try {
+    const payload = req.body.toString();
+    const data = JSON.parse(payload);
+    console.log("[WEBHOOK-STRIPE] Evento:", data.type);
+    res.status(200).json({ ok: true });
+  } catch(e) { res.status(200).json({ ok: true }); }
 });
 
 // Helper para montar HTML do email
