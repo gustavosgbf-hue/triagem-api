@@ -24,10 +24,8 @@ app.use(cors({
 app.use(express.json({ limit: "1mb" }));
 
 const OPENAI_KEY = process.env.OPENAI_API_KEY;
-const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
 
 if (!OPENAI_KEY) { console.error("OPENAI_API_KEY nao definida"); process.exit(1); }
-if (!STRIPE_SECRET_KEY) { console.error("STRIPE_SECRET_KEY nao definida"); process.exit(1); }
 
 // LIMPEZA AUTOMATICA -- atendimentos travados em 'assumido' por mais de 48h
 setInterval(async () => {
@@ -225,83 +223,57 @@ const autenticarMedico = checkMedico;
 app.post("/api/triage", handleChat);
 app.post("/api/doctor", handleChat);
 
+// PAGAMENTO MANUAL VIA PIX INTER
+// O paciente vê o QR fixo do Inter, paga e clica "Já paguei"
+// O sistema registra o pré-cadastro e libera a triagem
+// Verificação manual pelo admin no app Inter
+
+const PIX_CHAVE = process.env.PIX_CHAVE_INTER || ""; // Chave Pix do Inter (CNPJ ou email)
+
 app.post("/api/payment", async (req, res) => {
   try {
-    const { email, nome } = req.body || {};
-
-    // Criar PaymentIntent com Pix via Stripe
-    const stripeRes = await fetch("https://api.stripe.com/v1/payment_intents", {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${STRIPE_SECRET_KEY}`,
-        "Content-Type": "application/x-www-form-urlencoded"
-      },
-      body: new URLSearchParams({
-        "amount": "4990",
-        "currency": "brl",
-        "payment_method_types[]": "pix",
-        "description": "Consulta Medica Online - ConsultaJa24h",
-        "receipt_email": email || "paciente@consultaja24h.com.br",
-        "metadata[nome]": nome || "Paciente",
-        "payment_method_data[type]": "pix"
-      }).toString()
-    });
-
-    const intent = await stripeRes.json();
-    console.log("[STRIPE] PaymentIntent:", intent.id, intent.status);
-
-    if (intent.error) return res.status(500).json({ ok: false, error: intent.error.message });
-
-    // Confirmar para gerar QR code Pix
-    const confirmRes = await fetch(`https://api.stripe.com/v1/payment_intents/${intent.id}/confirm`, {
-      method: "POST",
-      headers: {
-        "Authorization": `Bearer ${STRIPE_SECRET_KEY}`,
-        "Content-Type": "application/x-www-form-urlencoded"
-      },
-      body: new URLSearchParams({
-        "payment_method_data[type]": "pix"
-      }).toString()
-    });
-
-    const confirmed = await confirmRes.json();
-    console.log("[STRIPE] Confirmed status:", confirmed.status);
-
-    if (confirmed.error) return res.status(500).json({ ok: false, error: confirmed.error.message });
-
-    const pixData = confirmed.next_action?.pix_display_qr_code;
-    if (!pixData) return res.status(500).json({ ok: false, error: "QR Code Pix nao gerado" });
-
+    const { nome } = req.body || {};
+    // Gera um ID único para rastrear este pagamento
+    const paymentId = "PIX-" + Date.now() + "-" + Math.random().toString(36).slice(2,8).toUpperCase();
+    console.log("[PAYMENT-MANUAL] Novo pagamento gerado:", paymentId, "| Paciente:", nome || "-");
     return res.json({
       ok: true,
-      payment_id: confirmed.id,
+      payment_id: paymentId,
       status: "pending",
-      qr_code: pixData.data,
-      qr_code_base64: pixData.image_url_png || null
+      manual: true,  // sinaliza para o frontend que é pagamento manual
+      pix_chave: PIX_CHAVE
     });
-  } catch (e) { console.error("Erro em /api/payment:", e); return res.status(500).json({ ok: false, error: "Erro interno" }); }
+  } catch (e) {
+    console.error("Erro em /api/payment:", e);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
 });
 
+// Confirmar pagamento manual (paciente clicou em "Já paguei")
+app.post("/api/payment/confirmar-manual", async (req, res) => {
+  try {
+    const { paymentId, atendimentoId } = req.body || {};
+    if (!paymentId) return res.status(400).json({ ok: false, error: "paymentId obrigatorio" });
+    console.log("[PAYMENT-MANUAL] Confirmação manual:", paymentId, "| atendimentoId:", atendimentoId || "sem pre-registro");
+    // Se já tem atendimentoId (pré-registro), atualiza o payment_id no registro
+    if (atendimentoId) {
+      await pool.query(
+        `UPDATE fila_atendimentos SET triagem='(Pagamento confirmado — aguardando triagem)' WHERE id=$1 AND status='triagem'`,
+        [atendimentoId]
+      ).catch(e => console.warn("[PAYMENT-MANUAL] Update opcional falhou:", e.message));
+    }
+    return res.json({ ok: true, status: "approved" });
+  } catch (e) {
+    console.error("Erro em /api/payment/confirmar-manual:", e);
+    return res.status(500).json({ ok: false, error: "Erro interno" });
+  }
+});
+
+// Status do pagamento (polling do frontend)
 app.get("/api/payment/:id", async (req, res) => {
-  try {
-    const stripeRes = await fetch(`https://api.stripe.com/v1/payment_intents/${req.params.id}`, {
-      headers: { "Authorization": `Bearer ${STRIPE_SECRET_KEY}` }
-    });
-    const intent = await stripeRes.json();
-    if (intent.error) return res.status(500).json({ ok: false, error: intent.error.message });
-    const pago = intent.status === "succeeded";
-    return res.json({ ok: true, status: pago ? "approved" : "pending" });
-  } catch (e) { return res.status(500).json({ ok: false, error: "Erro ao consultar pagamento" }); }
-});
-
-// Webhook Stripe
-app.post("/api/payment/webhook", express.raw({ type: "application/json" }), async (req, res) => {
-  try {
-    const payload = req.body.toString();
-    const data = JSON.parse(payload);
-    console.log("[WEBHOOK-STRIPE] Evento:", data.type);
-    res.status(200).json({ ok: true });
-  } catch(e) { res.status(200).json({ ok: true }); }
+  // Pagamento manual: sempre retorna pending até o front confirmar via botão
+  // Esta rota não é mais usada no fluxo manual, mas mantida para compatibilidade
+  return res.json({ ok: true, status: "pending" });
 });
 
 // Helper para montar HTML do email
