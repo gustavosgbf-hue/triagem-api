@@ -24,10 +24,10 @@ app.use(cors({
 app.use(express.json({ limit: "1mb" }));
 
 const OPENAI_KEY = process.env.OPENAI_API_KEY;
-const MP_TOKEN = process.env.MP_ACCESS_TOKEN;
+const PAGBANK_TOKEN = process.env.PAGBANK_TOKEN;
 
 if (!OPENAI_KEY) { console.error("OPENAI_API_KEY nao definida"); process.exit(1); }
-if (!MP_TOKEN) { console.error("MP_ACCESS_TOKEN nao definida"); process.exit(1); }
+if (!PAGBANK_TOKEN) { console.error("PAGBANK_TOKEN nao definida"); process.exit(1); }
 
 // LIMPEZA AUTOMATICA -- atendimentos travados em 'assumido' por mais de 48h
 setInterval(async () => {
@@ -227,37 +227,96 @@ app.post("/api/doctor", handleChat);
 
 app.post("/api/payment", async (req, res) => {
   try {
-    const { email, nome } = req.body || {};
+    const { email, nome, tel, cpf } = req.body || {};
     const idempotency = `consult-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-    const mpRes = await fetch("https://api.mercadopago.com/v1/payments", {
+    const nomePartes = (nome || "Paciente").split(" ");
+    const firstName = nomePartes[0];
+    const lastName = nomePartes.slice(1).join(" ") || "Online";
+    const telLimpo = (tel || "11999999999").replace(/\D/g, "").padEnd(11, "0");
+    const area = telLimpo.slice(0, 2);
+    const number = telLimpo.slice(2);
+    const cpfLimpo = (cpf || "00000000000").replace(/\D/g, "").padEnd(11, "0");
+    const expiracao = new Date(Date.now() + 30 * 60 * 1000).toISOString().replace("Z", "-03:00").slice(0, 19) + "-03:00";
+
+    const payload = {
+      reference_id: idempotency,
+      customer: {
+        name: `${firstName} ${lastName}`.trim(),
+        email: email || "paciente@consultaja24h.com.br",
+        tax_id: cpfLimpo,
+        phones: [{ country: "55", area, number: number.slice(0, 9), type: "MOBILE" }]
+      },
+      items: [{
+        reference_id: "consulta-online",
+        name: "Consulta Medica Online",
+        quantity: "1",
+        unit_amount: 4990
+      }],
+      qr_codes: [{
+        amount: { value: 4990 },
+        expiration_date: expiracao
+      }],
+      notification_urls: [
+        `${process.env.RENDER_EXTERNAL_URL || "https://triagem-api.onrender.com"}/api/payment/webhook`
+      ]
+    };
+
+    const pbRes = await fetch("https://api.pagseguro.com/orders", {
       method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${MP_TOKEN}`, "X-Idempotency-Key": idempotency },
-      body: JSON.stringify({
-        transaction_amount: 49.9,
-        description: "Consulta Medica Online - Pronto Atendimento Online",
-        payment_method_id: "pix",
-        payer: {
-          email: email || "paciente@prontoatendimento.com",
-          first_name: (nome || "Paciente").split(" ")[0],
-          last_name: (nome || "Paciente").split(" ").slice(1).join(" ") || "Online",
-        },
-      }),
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${PAGBANK_TOKEN}`,
+        "x-idempotency-key": idempotency
+      },
+      body: JSON.stringify(payload)
     });
-    const data = await mpRes.json();
-    if (!mpRes.ok) { console.error("MP error:", data); return res.status(500).json({ ok: false, error: data.message || "Erro ao gerar pagamento" }); }
-    return res.json({ ok: true, payment_id: data.id, status: data.status,
-      qr_code: data.point_of_interaction?.transaction_data?.qr_code,
-      qr_code_base64: data.point_of_interaction?.transaction_data?.qr_code_base64 });
+    const data = await pbRes.json();
+    if (!pbRes.ok) { console.error("PagBank error:", data); return res.status(500).json({ ok: false, error: data.error_messages?.[0]?.description || "Erro ao gerar pagamento" }); }
+
+    const qrCode = data.qr_codes?.[0];
+    if (!qrCode) return res.status(500).json({ ok: false, error: "QR Code nao gerado" });
+
+    // Buscar base64 do QR Code
+    let qr_code_base64 = null;
+    try {
+      const base64Link = qrCode.links?.find(l => l.rel === "QRCODE.BASE64");
+      if (base64Link) {
+        const b64Res = await fetch(base64Link.href, { headers: { "Authorization": `Bearer ${PAGBANK_TOKEN}` } });
+        if (b64Res.ok) qr_code_base64 = await b64Res.text();
+      }
+    } catch(e) { console.warn("Erro ao buscar base64:", e.message); }
+
+    return res.json({
+      ok: true,
+      payment_id: data.id,
+      status: "pending",
+      qr_code: qrCode.text,
+      qr_code_base64
+    });
   } catch (e) { console.error("Erro em /api/payment:", e); return res.status(500).json({ ok: false, error: "Erro interno" }); }
 });
 
 app.get("/api/payment/:id", async (req, res) => {
   try {
-    const mpRes = await fetch(`https://api.mercadopago.com/v1/payments/${req.params.id}`, { headers: { Authorization: `Bearer ${MP_TOKEN}` } });
-    const data = await mpRes.json();
-    if (!mpRes.ok) return res.status(500).json({ ok: false, error: data.message || "Erro ao consultar pagamento" });
-    return res.json({ ok: true, status: data.status });
+    const pbRes = await fetch(`https://api.pagseguro.com/orders/${req.params.id}`, {
+      headers: { "Authorization": `Bearer ${PAGBANK_TOKEN}` }
+    });
+    const data = await pbRes.json();
+    if (!pbRes.ok) return res.status(500).json({ ok: false, error: "Erro ao consultar pagamento" });
+    // PagBank retorna charges com status PAID quando aprovado
+    const charge = data.charges?.[0];
+    const pago = charge?.status === "PAID" || data.qr_codes?.[0]?.status === "PAID";
+    return res.json({ ok: true, status: pago ? "approved" : "pending" });
   } catch (e) { return res.status(500).json({ ok: false, error: "Erro ao consultar pagamento" }); }
+});
+
+// Webhook PagBank
+app.post("/api/payment/webhook", async (req, res) => {
+  try {
+    const { reference_id, charges } = req.body || {};
+    console.log("[WEBHOOK-PAGBANK] Notificação recebida:", reference_id, charges?.[0]?.status);
+    res.status(200).json({ ok: true });
+  } catch(e) { res.status(200).json({ ok: true }); }
 });
 
 // Helper para montar HTML do email
