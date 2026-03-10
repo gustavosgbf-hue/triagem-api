@@ -141,30 +141,57 @@ async function appendToSheet(sheetName, values) {
 function parsearTriagem(summary) {
   if (!summary) return {};
   const campos = {};
+
+  // Mapa expandido de padrões por campo
   const mapa = [
-    { chave: 'queixa', padroes: ['queixa','queixa principal','problema'] },
-    { chave: 'idade', padroes: ['idade','anos'] },
-    { chave: 'sexo', padroes: ['sexo','genero'] },
-    { chave: 'alergias', padroes: ['alergia','alergias'] },
-    { chave: 'cronicas', padroes: ['comorbidade','comorbidades','historico'] },
-    { chave: 'medicacoes', padroes: ['medicacao','medicacoes','medicamentos'] },
+    { chave: 'queixa',    padroes: ['queixa principal','queixa','motivo','problema principal','problema','chief complaint'] },
+    { chave: 'idade',     padroes: ['idade'] },
+    { chave: 'sexo',      padroes: ['sexo','gênero','genero'] },
+    { chave: 'alergias',  padroes: ['alergia','alergias','hipersensibilidade'] },
+    { chave: 'cronicas',  padroes: ['comorbidade','comorbidades','antecedente','antecedentes','doença crônica','doenças crônicas','historico','histórico'] },
+    { chave: 'medicacoes',padroes: ['medicação','medicações','medicacao','medicacoes','medicamento','medicamentos','uso contínuo','uso continuo','faz uso'] },
+    { chave: 'solicita',  padroes: ['solicita','solicitação','necessita','precisa','documentos','atestado','receita','pedido'] },
   ];
-  const linhas = summary.split(/[;\n]/);
+
+  // Tenta extrair por linha "Chave: Valor"
+  const linhas = summary.split(/[\n;]/);
   for (const linha of linhas) {
     const colonIdx = linha.indexOf(':');
     if (colonIdx < 1) continue;
-    const chaveRaw = linha.slice(0, colonIdx).trim().toLowerCase();
-    const valor = linha.slice(colonIdx + 1).trim();
-    if (!valor || valor === '-') continue;
+    const chaveRaw = linha.slice(0, colonIdx).trim().toLowerCase().replace(/[*•\-]/g, '').trim();
+    const valor = linha.slice(colonIdx + 1).trim().replace(/^[-–—]\s*/, '');
+    if (!valor || /^(nega|não|nao|nenhum|sem)$/i.test(valor)) {
+      // Guarda negativas também
+      for (const { chave, padroes } of mapa) {
+        if (padroes.some(p => chaveRaw.includes(p))) { campos[chave] = campos[chave] || valor || 'Nega'; break; }
+      }
+      continue;
+    }
     for (const { chave, padroes } of mapa) {
       if (padroes.some(p => chaveRaw.includes(p))) { campos[chave] = campos[chave] || valor; break; }
     }
   }
-  if (!campos.idade) { const m = summary.match(/(\d{1,3})\s*anos/i); if (m) campos.idade = m[1] + ' anos'; }
-  if (!campos.sexo) {
-    if (/feminino|mulher/i.test(summary)) campos.sexo = 'Feminino';
-    else if (/masculino|homem/i.test(summary)) campos.sexo = 'Masculino';
+
+  // Fallbacks por regex no texto livre
+  if (!campos.idade) {
+    const m = summary.match(/(\d{1,3})\s*anos/i);
+    if (m) campos.idade = m[1] + ' anos';
   }
+  if (!campos.sexo) {
+    if (/\bfeminino\b|\bmulher\b|\bfeminina\b/i.test(summary)) campos.sexo = 'Feminino';
+    else if (/\bmasculino\b|\bhomem\b|\bmasculina\b/i.test(summary)) campos.sexo = 'Masculino';
+  }
+  if (!campos.solicita) {
+    if (/atestado/i.test(summary) && /receita/i.test(summary)) campos.solicita = 'Atestado + Receita';
+    else if (/atestado/i.test(summary)) campos.solicita = 'Atestado';
+    else if (/receita/i.test(summary)) campos.solicita = 'Receita';
+    else if (/pedido.*exame|exame/i.test(summary)) campos.solicita = 'Pedido de exame';
+    else campos.solicita = 'Não informado';
+  }
+  if (!campos.alergias) campos.alergias = 'Nega';
+  if (!campos.cronicas) campos.cronicas = 'Nega';
+  if (!campos.medicacoes) campos.medicacoes = 'Nega';
+
   return campos;
 }
 
@@ -424,9 +451,9 @@ app.post("/api/atendimento/atualizar-triagem", async (req, res) => {
     const campos = parsearTriagem(triagem);
     // Aceita status 'triagem' ou 'aguardando' para compatibilidade
     const result = await pool.query(
-      `UPDATE fila_atendimentos SET triagem=$2,queixa=$3,idade=$4,sexo=$5,alergias=$6,cronicas=$7,medicacoes=$8,status='aguardando'
+      `UPDATE fila_atendimentos SET triagem=$2,queixa=$3,idade=$4,sexo=$5,alergias=$6,cronicas=$7,medicacoes=$8,solicita=$9,status='aguardando'
        WHERE id=$1 AND status IN ('triagem','aguardando') RETURNING id,nome,tel,cpf,tipo,triagem,tel_documentos,medico_nome`,
-      [atendimentoId,triagem,campos.queixa||triagem,campos.idade||"",campos.sexo||"",campos.alergias||"",campos.cronicas||"",campos.medicacoes||""]
+      [atendimentoId,triagem,campos.queixa||triagem,campos.idade||"",campos.sexo||"",campos.alergias||"",campos.cronicas||"",campos.medicacoes||"",campos.solicita||""]
     );
     if (result.rowCount === 0) return res.status(404).json({ ok: false, error: "Atendimento nao encontrado ou ja em andamento" });
     const at = result.rows[0];
