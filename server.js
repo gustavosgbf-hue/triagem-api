@@ -819,23 +819,6 @@ app.post("/api/agendamento/confirmar", async (req, res) => {
     const ag=result.rows[0];
     const horarioFormatado=new Date(ag.horario_agendado).toLocaleString("pt-BR",{timeZone:"America/Fortaleza",day:"2-digit",month:"2-digit",year:"numeric",hour:"2-digit",minute:"2-digit"});
     const tipoLabel=ag.modalidade==="video"?"Video":"Chat";
-    const RESEND_KEY=process.env.RESEND_API_KEY;
-    if (RESEND_KEY) {
-      try {
-        const medicosResult=await pool.query(`SELECT email FROM medicos WHERE ativo=true AND status='aprovado' ORDER BY status_online DESC`);
-        const destinatarios=medicosResult.rows.map(m=>m.email).filter(Boolean);
-        if (!destinatarios.includes("gustavosgbf@gmail.com")) destinatarios.push("gustavosgbf@gmail.com");
-        const htmlAg=`<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#060d0b;color:#fff;border-radius:12px;overflow:hidden"><div style="background:linear-gradient(135deg,#4285f4,#34a853);padding:20px 28px"><h2 style="margin:0;color:#fff;font-size:18px">Novo AGENDAMENTO - ${horarioFormatado}</h2></div><div style="padding:28px"><p style="color:rgba(255,200,100,.9);font-size:14px;margin-bottom:20px;background:rgba(255,200,0,.06);border:1px solid rgba(255,200,0,.2);padding:12px 16px;border-radius:8px">Agendamento confirmado - paciente aguarda no horario marcado.</p><table style="width:100%;border-collapse:collapse"><tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px;width:140px">Paciente</td><td style="padding:8px 0;font-weight:600">${ag.nome}</td></tr><tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">WhatsApp</td><td style="padding:8px 0;font-weight:600">${ag.tel}</td></tr><tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">Modalidade</td><td style="padding:8px 0;font-weight:600">${tipoLabel}</td></tr><tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">Horario</td><td style="padding:8px 0;font-weight:700;font-size:16px;color:#b4e05a">${horarioFormatado}</td></tr></table></div></div>`;
-        const resendRes = await fetch("https://api.resend.com/emails", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: `Bearer ${RESEND_KEY}` },
-          body: JSON.stringify({ from: "ConsultaJa24h <contato@consultaja24h.com.br>", to: destinatarios, subject: `Novo AGENDAMENTO - ${horarioFormatado} (${tipoLabel})`, html: htmlAg })
-        });
-        const resendData = await resendRes.json();
-        if (resendData.id) console.log("[EMAIL-AGENDAMENTO] Enviado | ID:", resendData.id);
-        else console.error("[EMAIL-AGENDAMENTO] Resend recusou:", JSON.stringify(resendData));
-      } catch(e) { console.error("[EMAIL-AGENDAMENTO] Erro:", e.message); }
-    }
     return res.json({ok:true,agendamento:ag,horarioFormatado});
   } catch(e) { console.error("Erro em /api/agendamento/confirmar:", e); return res.status(500).json({ok:false,error:"Erro ao confirmar agendamento"}); }
 });
