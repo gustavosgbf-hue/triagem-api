@@ -305,7 +305,7 @@ app.get("/api/payment/:id", async (req, res) => {
 });
 
 // Helper para montar HTML do email
-function montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno }) {
+function montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno, linkAsumir, medicoNome }) {
   const tipoLabel = tipo === "video" ? "Video" : "Chat";
   const telLimpo = String(tel||"").replace(/\D/g,"");
   function montarTabelaTriagem(texto) {
@@ -327,29 +327,48 @@ function montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno }) {
         <tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">Link consulta</td><td style="padding:8px 0;font-size:12px"><a href="${linkRetorno}" style="color:#5ee0a0">${linkRetorno}</a></td></tr>
       </table>
       <table style="width:100%;border-collapse:collapse;border:1px solid rgba(255,255,255,.1);border-radius:10px">${montarTabelaTriagem(triagem)}</table>
+      ${linkAsumir ? `
+      <div style="margin-top:24px;text-align:center">
+        <a href="${linkAsumir}" style="display:inline-block;padding:14px 32px;border-radius:12px;background:linear-gradient(135deg,#b4e05a,#5ee0a0);color:#051208;font-family:Arial,sans-serif;font-size:15px;font-weight:700;text-decoration:none">
+          ▶ Assumir atendimento
+        </a>
+        <p style="margin:10px 0 0;font-size:11px;color:rgba(255,255,255,.3)">Primeiro a clicar assume. Link válido por 2h.</p>
+      </div>` : ''}
       <p style="margin:20px 0 0;font-size:12px;color:rgba(255,255,255,.3)">Enviado automaticamente pelo sistema ConsultaJa24h</p>
     </div>
   </div>`;
 }
 
-async function enviarEmailMedicos({ nome, tel, tipo, triagem, linkRetorno, subject }) {
+async function enviarEmailMedicos({ nome, tel, tipo, triagem, linkRetorno, subject, atendimentoId }) {
   const RESEND_KEY = process.env.RESEND_API_KEY;
   if (!RESEND_KEY) { console.warn("[EMAIL] RESEND_API_KEY nao definida."); return; }
   try {
-    const medicosResult = await pool.query(`SELECT email FROM medicos WHERE ativo=true AND status='aprovado' ORDER BY status_online DESC`);
-    const destinatarios = medicosResult.rows.map(m=>m.email).filter(Boolean);
-    if (!destinatarios.includes("gustavosgbf@gmail.com")) destinatarios.push("gustavosgbf@gmail.com");
-    const html = montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno });
-    const resendRes = await fetch("https://api.resend.com/emails", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${RESEND_KEY}` },
-      body: JSON.stringify({ from: "ConsultaJa24h <contato@consultaja24h.com.br>", to: destinatarios, subject, html })
-    });
-    const resendData = await resendRes.json();
-    if (resendData.id) {
-      console.log("[EMAIL] Enviado para:", destinatarios.join(", "), "| ID:", resendData.id);
-    } else {
-      console.error("[EMAIL] Resend recusou:", JSON.stringify(resendData));
+    const medicosResult = await pool.query(`SELECT id,nome,email FROM medicos WHERE ativo=true AND status='aprovado' ORDER BY status_online DESC`);
+    const medicos = medicosResult.rows.filter(m=>m.email);
+    // Garante que o admin sempre recebe
+    if (!medicos.find(m=>m.email==="gustavosgbf@gmail.com")) {
+      medicos.push({ id: 0, nome: "Gustavo", email: "gustavosgbf@gmail.com" });
+    }
+    const PAINEL_URL = "https://painel.consultaja24h.com.br";
+    const API_URL = process.env.API_URL || "https://triagem-api.onrender.com";
+    // Envia e-mail individual para cada médico com token único
+    for (const med of medicos) {
+      // Token JWT com médico + atendimento, expira em 2h
+      const token = jwt.sign(
+        { medicoId: med.id, medicoNome: med.nome, atendimentoId, tipo: "assumir" },
+        process.env.JWT_SECRET || "fallback_secret",
+        { expiresIn: "2h" }
+      );
+      const linkAsumir = `${API_URL}/api/atendimento/assumir-email?token=${token}`;
+      const html = montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno, linkAsumir, medicoNome: med.nome });
+      const resendRes = await fetch("https://api.resend.com/emails", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${RESEND_KEY}` },
+        body: JSON.stringify({ from: "ConsultaJa24h <contato@consultaja24h.com.br>", to: [med.email], subject, html })
+      });
+      const resendData = await resendRes.json();
+      if (resendData.id) console.log("[EMAIL] Enviado para:", med.email, "| ID:", resendData.id);
+      else console.error("[EMAIL] Resend recusou para", med.email, ":", JSON.stringify(resendData));
     }
   } catch(e) {
     console.error("[EMAIL] Erro:", e.message);
@@ -465,6 +484,7 @@ app.post("/api/atendimento/atualizar-triagem", async (req, res) => {
     // Email disparado AQUI — após triagem real concluída
     await enviarEmailMedicos({
       nome: at.nome, tel: at.tel, tipo: at.tipo, triagem, linkRetorno,
+      atendimentoId: at.id,
       subject: `Nova triagem - ${at.nome||"Paciente"} (${tipoLabel})`
     });
     return res.json({ ok: true, atendimentoId: at.id });
@@ -499,6 +519,7 @@ app.post("/api/notify", async (req, res) => {
       const tipoLabel = tipoConsulta === "video" ? "Video" : "Chat";
       await enviarEmailMedicos({
         nome, tel, tipo: tipoConsulta, triagem, linkRetorno,
+        atendimentoId,
         subject: `Nova triagem - ${nome||"Paciente"} (${tipoLabel})`
       });
     } else {
@@ -567,6 +588,38 @@ app.post("/api/consent", async (req, res) => {
     await appendToSheet("Consentimentos",[agora,nome||"",tel||"",versao||"v1.0",ip]);
     return res.json({ ok: true });
   } catch (e) { return res.status(500).json({ ok: false }); }
+});
+
+app.get("/api/atendimento/assumir-email", async (req, res) => {
+  const PAINEL_URL = "https://painel.consultaja24h.com.br";
+  try {
+    const { token } = req.query;
+    if (!token) return res.status(400).send("<h2>Link inválido.</h2>");
+    let payload;
+    try { payload = jwt.verify(token, process.env.JWT_SECRET || "fallback_secret"); }
+    catch(e) { return res.send(`<html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#060d0b;color:#fff"><h2 style="color:#ff8080">⏰ Link expirado</h2><p>Este link de assumir atendimento expirou (válido por 2h).</p><a href="${PAINEL_URL}" style="color:#b4e05a">Ir para o painel</a></body></html>`); }
+    if (payload.tipo !== "assumir") return res.status(400).send("<h2>Token inválido.</h2>");
+    const { medicoId, medicoNome, atendimentoId } = payload;
+    // Tenta assumir com trava — só um médico consegue
+    const result = await pool.query(
+      `UPDATE fila_atendimentos SET status='assumido', medico_id=$1, medico_nome=$2, assumido_em=NOW()
+       WHERE id=$3 AND status='aguardando' RETURNING id,nome`,
+      [medicoId, medicoNome, atendimentoId]
+    );
+    if (result.rowCount === 0) {
+      // Verifica quem assumiu
+      const ja = await pool.query(`SELECT medico_nome FROM fila_atendimentos WHERE id=$1`,[atendimentoId]);
+      const quem = ja.rows[0]?.medico_nome || "outro médico";
+      return res.send(`<html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#060d0b;color:#fff"><h2 style="color:#ffbd2e">⚠️ Atendimento já assumido</h2><p>Este atendimento já foi assumido por <strong>${quem}</strong>.</p><a href="${PAINEL_URL}" style="color:#b4e05a">Ir para o painel</a></body></html>`);
+    }
+    const paciente = result.rows[0];
+    console.log(`[ASSUMIR-EMAIL] ${medicoNome} assumiu atendimento #${atendimentoId} (${paciente.nome}) via e-mail`);
+    // Redireciona para o painel com o atendimento já marcado
+    return res.redirect(`${PAINEL_URL}?assumiu=${atendimentoId}`);
+  } catch(e) {
+    console.error("[ASSUMIR-EMAIL] Erro:", e.message);
+    return res.status(500).send("<h2>Erro interno.</h2>");
+  }
 });
 
 app.get("/atender", async (req, res) => {
