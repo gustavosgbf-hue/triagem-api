@@ -90,6 +90,13 @@ setInterval(async () => {
       }
       // Marca como lembrete enviado para não reenviar
       await pool.query(`UPDATE agendamentos SET lembrete_enviado=true WHERE id=$1`,[ag.id]);
+      // Lembrete para o paciente também
+      if (ag.email && !ag.lembrete_paciente_enviado) {
+        const SITE_URL = process.env.SITE_URL || "https://consultaja24h.com.br";
+        const linkConsulta = ag.fila_id ? `${SITE_URL}/triagem.html?consulta=${ag.fila_id}` : `${SITE_URL}/triagem.html`;
+        await enviarEmailLembretePaciente({ nome: ag.nome, email: ag.email, horarioFormatado, modalidade: ag.modalidade, linkConsulta }).catch(()=>{});
+        await pool.query(`UPDATE agendamentos SET lembrete_paciente_enviado=true WHERE id=$1`,[ag.id]);
+      }
     }
   } catch(e) { console.error("[LEMBRETE] Erro:", e.message); }
 }, 10 * 60 * 1000); // Roda a cada 10 minutos
@@ -152,6 +159,8 @@ async function initDB() {
     ];
     // Coluna para controle de lembrete de agendamento
     await pool.query(`ALTER TABLE agendamentos ADD COLUMN IF NOT EXISTS lembrete_enviado BOOLEAN DEFAULT false`).catch(()=>{});
+    await pool.query(`ALTER TABLE agendamentos ADD COLUMN IF NOT EXISTS email TEXT`).catch(()=>{});
+    await pool.query(`ALTER TABLE agendamentos ADD COLUMN IF NOT EXISTS lembrete_paciente_enviado BOOLEAN DEFAULT false`).catch(()=>{});
     for (const [col, tipo] of cols) {
       await pool.query(`ALTER TABLE fila_atendimentos ADD COLUMN IF NOT EXISTS ${col} ${tipo}`);
     }
@@ -514,7 +523,83 @@ async function enviarEmailAprovacaoMedico({ nome, email }) {
   } catch(e) { console.error("[EMAIL-APROVACAO] Erro:", e.message); }
 }
 
-// Placeholders que indicam pré-registro (não deve disparar email)
+// ── E-MAIL: confirmação de agendamento para o PACIENTE ─────────────────────────
+async function enviarEmailConfirmacaoPaciente({ nome, email, horarioFormatado, modalidade, linkConsulta }) {
+  const RESEND_KEY = process.env.RESEND_API_KEY;
+  if (!RESEND_KEY || !email) return;
+  try {
+    const tipoLabel = modalidade === "video" ? "Vídeo" : "Chat";
+    const html = `
+    <div style="background:#060d0b;padding:32px 20px;font-family:'Outfit',sans-serif">
+      <div style="max-width:520px;margin:0 auto;background:#0d1a14;border:1px solid rgba(255,255,255,.08);border-radius:16px;overflow:hidden">
+        <div style="padding:24px;border-bottom:1px solid rgba(255,255,255,.08)">
+          <span style="font-size:1.1rem;font-weight:700;color:#b4e05a">ConsultaJá24h</span>
+          <span style="font-size:.8rem;color:rgba(255,255,255,.4);margin-left:8px">Agendamento confirmado</span>
+        </div>
+        <div style="padding:24px">
+          <p style="color:rgba(255,255,255,.9);font-size:.95rem;margin-bottom:20px">Olá, <strong>${nome}</strong>! Seu agendamento foi confirmado.</p>
+          <div style="background:rgba(180,224,90,.07);border:1px solid rgba(180,224,90,.2);border-radius:12px;padding:16px 20px;margin-bottom:20px">
+            <div style="font-size:.72rem;color:rgba(255,255,255,.4);text-transform:uppercase;letter-spacing:.1em;margin-bottom:6px">Data e horário</div>
+            <div style="font-size:1.2rem;font-weight:700;color:#b4e05a">${horarioFormatado}</div>
+            <div style="font-size:.82rem;color:rgba(255,255,255,.5);margin-top:4px">Modalidade: ${tipoLabel}</div>
+          </div>
+          <p style="color:rgba(255,255,255,.65);font-size:.85rem;line-height:1.6;margin-bottom:20px">
+            Na hora marcada, acesse o link abaixo para entrar na sala de espera. O médico já estará preparado com sua triagem.
+          </p>
+          <a href="${linkConsulta}" style="display:inline-block;padding:12px 28px;border-radius:12px;background:linear-gradient(135deg,#b4e05a,#5ee0a0);color:#051208;font-weight:700;font-size:.9rem;text-decoration:none">
+            Entrar na consulta →
+          </a>
+          <p style="margin:20px 0 0;font-size:.72rem;color:rgba(255,255,255,.25)">Você receberá um lembrete 1h antes do horário.</p>
+        </div>
+      </div>
+    </div>`;
+    const r = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${RESEND_KEY}` },
+      body: JSON.stringify({ from: "ConsultaJá24h <contato@consultaja24h.com.br>", to: [email], subject: `✅ Agendamento confirmado — ${horarioFormatado}`, html })
+    });
+    const d = await r.json();
+    if (d.id) console.log("[EMAIL-PACIENTE] Confirmação enviada para:", email);
+    else console.error("[EMAIL-PACIENTE] Erro:", JSON.stringify(d));
+  } catch(e) { console.error("[EMAIL-PACIENTE] Erro:", e.message); }
+}
+
+// ── E-MAIL: lembrete 1h antes para o PACIENTE ──────────────────────────────────
+async function enviarEmailLembretePaciente({ nome, email, horarioFormatado, modalidade, linkConsulta }) {
+  const RESEND_KEY = process.env.RESEND_API_KEY;
+  if (!RESEND_KEY || !email) return;
+  try {
+    const tipoLabel = modalidade === "video" ? "Vídeo" : "Chat";
+    const html = `
+    <div style="background:#060d0b;padding:32px 20px;font-family:'Outfit',sans-serif">
+      <div style="max-width:520px;margin:0 auto;background:#0d1a14;border:1px solid rgba(255,255,255,.08);border-radius:16px;overflow:hidden">
+        <div style="padding:24px;border-bottom:1px solid rgba(255,255,255,.08)">
+          <span style="font-size:1.1rem;font-weight:700;color:#b4e05a">ConsultaJá24h</span>
+          <span style="font-size:.8rem;color:rgba(255,189,46,.7);margin-left:8px">🔔 Lembrete — consulta em 1h</span>
+        </div>
+        <div style="padding:24px">
+          <p style="color:rgba(255,255,255,.9);font-size:.95rem;margin-bottom:16px">Olá, <strong>${nome}</strong>! Sua consulta começa em aproximadamente <strong style="color:#b4e05a">1 hora</strong>.</p>
+          <div style="background:rgba(255,189,46,.06);border:1px solid rgba(255,189,46,.2);border-radius:12px;padding:14px 18px;margin-bottom:20px">
+            <div style="font-size:1.1rem;font-weight:700;color:#ffbd2e">${horarioFormatado}</div>
+            <div style="font-size:.8rem;color:rgba(255,255,255,.45);margin-top:4px">${tipoLabel}</div>
+          </div>
+          <a href="${linkConsulta}" style="display:inline-block;padding:12px 28px;border-radius:12px;background:linear-gradient(135deg,#b4e05a,#5ee0a0);color:#051208;font-weight:700;font-size:.9rem;text-decoration:none">
+            Entrar na sala de espera →
+          </a>
+        </div>
+      </div>
+    </div>`;
+    const r = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${RESEND_KEY}` },
+      body: JSON.stringify({ from: "ConsultaJá24h <contato@consultaja24h.com.br>", to: [email], subject: `🔔 Lembrete: sua consulta é em 1h — ${horarioFormatado}`, html })
+    });
+    const d = await r.json();
+    if (d.id) console.log("[EMAIL-LEMBRETE-PACIENTE] Enviado para:", email);
+    else console.error("[EMAIL-LEMBRETE-PACIENTE] Erro:", JSON.stringify(d));
+  } catch(e) { console.error("[EMAIL-LEMBRETE-PACIENTE] Erro:", e.message); }
+}
+
 function ehPlaceholder(triagem) {
   if (!triagem) return true;
   const t = triagem.trim().toLowerCase();
@@ -1035,13 +1120,13 @@ app.get("/api/disponibilidade", async (req, res) => {
 
 app.post("/api/agendamento/criar", async (req, res) => {
   try {
-    const { nome,tel,tel_documentos,cpf,modalidade,horario_agendado } = req.body||{};
+    const { nome,tel,tel_documentos,cpf,modalidade,horario_agendado,email } = req.body||{};
     if (!nome||!tel||!horario_agendado) return res.status(400).json({ok:false,error:"nome, tel e horario_agendado sao obrigatorios"});
     const slotStart=new Date(horario_agendado);
     const slotEnd=new Date(slotStart.getTime()+20*60*1000);
     const existentes=await pool.query(`SELECT COUNT(*) FROM agendamentos WHERE horario_agendado>=$1 AND horario_agendado<$2 AND status IN ('pendente','confirmado')`,[slotStart.toISOString(),slotEnd.toISOString()]);
     if (parseInt(existentes.rows[0].count)>=3) return res.status(409).json({ok:false,error:"Horario indisponivel. Escolha outro horario."});
-    const result=await pool.query(`INSERT INTO agendamentos (nome,tel,tel_documentos,cpf,modalidade,horario_agendado,status) VALUES ($1,$2,$3,$4,$5,$6,'pendente') RETURNING id`,[nome,tel,tel_documentos||tel,cpf||"",modalidade||"chat",horario_agendado]);
+    const result=await pool.query(`INSERT INTO agendamentos (nome,tel,tel_documentos,cpf,modalidade,horario_agendado,status,email) VALUES ($1,$2,$3,$4,$5,$6,'pendente',$7) RETURNING id`,[nome,tel,tel_documentos||tel,cpf||"",modalidade||"chat",horario_agendado,email||null]);
     return res.json({ok:true,agendamentoId:result.rows[0].id});
   } catch(e) { console.error("Erro em /api/agendamento/criar:", e); return res.status(500).json({ok:false,error:"Erro ao criar agendamento"}); }
 });
@@ -1055,6 +1140,14 @@ app.post("/api/agendamento/confirmar", async (req, res) => {
     const ag=result.rows[0];
     const horarioFormatado=new Date(ag.horario_agendado).toLocaleString("pt-BR",{timeZone:"America/Fortaleza",day:"2-digit",month:"2-digit",year:"numeric",hour:"2-digit",minute:"2-digit"});
     const tipoLabel=ag.modalidade==="video"?"Video":"Chat";
+    // E-mail de confirmação para o paciente
+    if (ag.email) {
+      const SITE_URL = process.env.SITE_URL || "https://consultaja24h.com.br";
+      enviarEmailConfirmacaoPaciente({
+        nome: ag.nome, email: ag.email, horarioFormatado, modalidade: ag.modalidade,
+        linkConsulta: `${SITE_URL}/triagem.html`
+      }).catch(()=>{});
+    }
     return res.json({ok:true,agendamento:ag,horarioFormatado});
   } catch(e) { console.error("Erro em /api/agendamento/confirmar:", e); return res.status(500).json({ok:false,error:"Erro ao confirmar agendamento"}); }
 });
