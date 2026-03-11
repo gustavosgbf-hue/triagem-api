@@ -46,6 +46,54 @@ setInterval(async () => {
   }
 }, 60 * 60 * 1000);
 
+// JOB: Reenviar e-mail de agendamento 1h antes do horário marcado
+setInterval(async () => {
+  try {
+    const RESEND_KEY = process.env.RESEND_API_KEY;
+    if (!RESEND_KEY) return;
+    // Agendamentos confirmados com horário entre 55min e 65min a partir de agora
+    const result = await pool.query(
+      `SELECT ag.*, fa.id AS fila_id, fa.triagem, fa.status AS fila_status
+       FROM agendamentos ag
+       LEFT JOIN fila_atendimentos fa ON fa.tel=ag.tel AND fa.status IN ('aguardando','triagem')
+       WHERE ag.status='confirmado'
+         AND ag.horario_agendado BETWEEN NOW() + INTERVAL '55 minutes' AND NOW() + INTERVAL '65 minutes'
+         AND ag.lembrete_enviado IS NOT DISTINCT FROM false`
+    );
+    for (const ag of result.rows) {
+      if (!ag.fila_id) { console.log(`[LEMBRETE] Agendamento #${ag.id} sem fila ainda, pulando`); continue; }
+      const API_URL = process.env.API_URL || "https://triagem-api.onrender.com";
+      const PAINEL_URL = "https://painel.consultaja24h.com.br";
+      const SITE_URL = process.env.SITE_URL || "https://consultaja24h.com.br";
+      const horarioFormatado = new Date(ag.horario_agendado).toLocaleString("pt-BR",{timeZone:"America/Fortaleza",day:"2-digit",month:"2-digit",year:"numeric",hour:"2-digit",minute:"2-digit"});
+      const tipoLabel = ag.modalidade === "video" ? "Video" : "Chat";
+      const linkRetorno = `${SITE_URL}/triagem.html?consulta=${ag.fila_id}`;
+      // Busca médicos e envia e-mail com novo token válido por 3h
+      const medicosResult = await pool.query(`SELECT id,nome,email FROM medicos WHERE ativo=true AND status='aprovado'`);
+      const medicos = medicosResult.rows.filter(m=>m.email);
+      if (!medicos.find(m=>m.email==="gustavosgbf@gmail.com")) medicos.push({id:0,nome:"Gustavo",email:"gustavosgbf@gmail.com"});
+      for (const med of medicos) {
+        const token = jwt.sign(
+          { medicoId: med.id, medicoNome: med.nome, atendimentoId: ag.fila_id, tipo: "assumir" },
+          process.env.JWT_SECRET || "fallback_secret",
+          { expiresIn: "3h" }
+        );
+        const linkAsumir = `${API_URL}/api/atendimento/assumir-email?token=${token}`;
+        const html = montarHtmlEmail({ nome: ag.nome, tel: ag.tel, tipo: ag.modalidade, triagem: ag.triagem, linkRetorno, linkAsumir, medicoNome: med.nome, horarioAgendado: horarioFormatado, isLembrete: true });
+        const resendRes = await fetch("https://api.resend.com/emails", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${RESEND_KEY}` },
+          body: JSON.stringify({ from: "ConsultaJa24h <contato@consultaja24h.com.br>", to: [med.email], subject: `🔔 Lembrete: Agendamento em 1h - ${ag.nome} (${tipoLabel}) - ${horarioFormatado}`, html })
+        });
+        const resendData = await resendRes.json();
+        if (resendData.id) console.log(`[LEMBRETE] Enviado para ${med.email} | Agendamento #${ag.id}`);
+      }
+      // Marca como lembrete enviado para não reenviar
+      await pool.query(`UPDATE agendamentos SET lembrete_enviado=true WHERE id=$1`,[ag.id]);
+    }
+  } catch(e) { console.error("[LEMBRETE] Erro:", e.message); }
+}, 10 * 60 * 1000); // Roda a cada 10 minutos
+
 // LIMPEZA AUTOMATICA -- historico: encerrados/expirados com mais de 7 dias viram 'arquivado'
 setInterval(async () => {
   try {
@@ -102,6 +150,8 @@ async function initDB() {
       ['solicita','TEXT'],
       ['agendamento_id','INTEGER'],
     ];
+    // Coluna para controle de lembrete de agendamento
+    await pool.query(`ALTER TABLE agendamentos ADD COLUMN IF NOT EXISTS lembrete_enviado BOOLEAN DEFAULT false`).catch(()=>{});
     for (const [col, tipo] of cols) {
       await pool.query(`ALTER TABLE fila_atendimentos ADD COLUMN IF NOT EXISTS ${col} ${tipo}`);
     }
@@ -305,7 +355,7 @@ app.get("/api/payment/:id", async (req, res) => {
 });
 
 // Helper para montar HTML do email
-function montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno, linkAsumir, medicoNome, horarioAgendado }) {
+function montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno, linkAsumir, medicoNome, horarioAgendado, isLembrete }) {
   const tipoLabel = tipo === "video" ? "Video" : "Chat";
   const telLimpo = String(tel||"").replace(/\D/g,"");
   function montarTabelaTriagem(texto) {
@@ -328,6 +378,7 @@ function montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno, linkAsumir, me
         <tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">Link consulta</td><td style="padding:8px 0;font-size:12px"><a href="${linkRetorno}" style="color:#5ee0a0">${linkRetorno}</a></td></tr>
       </table>
       <table style="width:100%;border-collapse:collapse;border:1px solid rgba(255,255,255,.1);border-radius:10px">${montarTabelaTriagem(triagem)}</table>
+      ${isLembrete ? `<div style="margin:16px 0;padding:12px 16px;background:rgba(255,189,46,.08);border:1px solid rgba(255,189,46,.25);border-radius:10px;font-size:12px;color:rgba(255,189,46,.9)">⚠️ Esta triagem foi feita no momento do agendamento e pode estar desatualizada. Confirme os dados com o paciente no início da consulta.</div>` : ""}
       ${linkAsumir ? `
       <div style="margin-top:24px;text-align:center">
         <a href="${linkAsumir}" style="display:inline-block;padding:14px 32px;border-radius:12px;background:linear-gradient(135deg,#b4e05a,#5ee0a0);color:#051208;font-family:Arial,sans-serif;font-size:15px;font-weight:700;text-decoration:none">
@@ -340,7 +391,7 @@ function montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno, linkAsumir, me
   </div>`;
 }
 
-async function enviarEmailMedicos({ nome, tel, tipo, triagem, linkRetorno, subject, atendimentoId, horarioAgendado }) {
+async function enviarEmailMedicos({ nome, tel, tipo, triagem, linkRetorno, subject, atendimentoId, horarioAgendado, horarioAgendadoRaw }) {
   const RESEND_KEY = process.env.RESEND_API_KEY;
   if (!RESEND_KEY) { console.warn("[EMAIL] RESEND_API_KEY nao definida."); return; }
   try {
@@ -353,13 +404,18 @@ async function enviarEmailMedicos({ nome, tel, tipo, triagem, linkRetorno, subje
     const PAINEL_URL = "https://painel.consultaja24h.com.br";
     const API_URL = process.env.API_URL || "https://triagem-api.onrender.com";
     // Envia e-mail individual para cada médico com token único
+    // Token expira 4h após o horário do agendamento (ou 2h para imediatos)
+    let tokenExpiresAt;
+    if (horarioAgendado && horarioAgendadoRaw) {
+      const horarioDate = new Date(horarioAgendadoRaw);
+      tokenExpiresAt = Math.floor(horarioDate.getTime() / 1000) + 4 * 60 * 60; // +4h após horário
+    }
     for (const med of medicos) {
-      // Token JWT com médico + atendimento, expira em 2h
-      const token = jwt.sign(
-        { medicoId: med.id, medicoNome: med.nome, atendimentoId, tipo: "assumir" },
-        process.env.JWT_SECRET || "fallback_secret",
-        { expiresIn: "2h" }
-      );
+      const tokenPayload = { medicoId: med.id, medicoNome: med.nome, atendimentoId, tipo: "assumir" };
+      const tokenOpts = tokenExpiresAt
+        ? { expiresIn: Math.max(tokenExpiresAt - Math.floor(Date.now()/1000), 3600) } // mínimo 1h
+        : { expiresIn: "2h" };
+      const token = jwt.sign(tokenPayload, process.env.JWT_SECRET || "fallback_secret", tokenOpts);
       const linkAsumir = `${API_URL}/api/atendimento/assumir-email?token=${token}`;
       const html = montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno, linkAsumir, medicoNome: med.nome, horarioAgendado });
       const resendRes = await fetch("https://api.resend.com/emails", {
@@ -482,18 +538,19 @@ app.post("/api/atendimento/atualizar-triagem", async (req, res) => {
     const tipoLabel = at.tipo === "video" ? "Video" : "Chat";
     const agora = new Date().toLocaleString("pt-BR", { timeZone: "America/Fortaleza" });
     // Buscar horário agendado se for agendamento
-    let horarioAgendado = null;
+    let horarioAgendado = null, horarioAgendadoRaw = null;
     if (agendamentoId) {
       const agRow = await pool.query(`SELECT horario_agendado FROM agendamentos WHERE id=$1`,[agendamentoId]);
       if (agRow.rows[0]) {
-        horarioAgendado = new Date(agRow.rows[0].horario_agendado).toLocaleString("pt-BR",{timeZone:"America/Fortaleza",day:"2-digit",month:"2-digit",year:"numeric",hour:"2-digit",minute:"2-digit"});
+        horarioAgendadoRaw = agRow.rows[0].horario_agendado;
+        horarioAgendado = new Date(horarioAgendadoRaw).toLocaleString("pt-BR",{timeZone:"America/Fortaleza",day:"2-digit",month:"2-digit",year:"numeric",hour:"2-digit",minute:"2-digit"});
       }
     }
     appendToSheet("Atendimentos",[agora,at.nome||"",at.tel||"",at.cpf||"","Aguardando","",triagem,at.tipo||"","",String(at.id)]).catch(e=>console.error("[Sheets]",e));
     // Email disparado AQUI — após triagem real concluída
     await enviarEmailMedicos({
       nome: at.nome, tel: at.tel, tipo: at.tipo, triagem, linkRetorno,
-      atendimentoId: at.id, horarioAgendado,
+      atendimentoId: at.id, horarioAgendado, horarioAgendadoRaw: agendamentoId ? horarioAgendadoRaw : null,
       subject: horarioAgendado
         ? `Agendamento - ${at.nome||"Paciente"} (${tipoLabel}) - ${horarioAgendado}`
         : `Nova triagem - ${at.nome||"Paciente"} (${tipoLabel})`
