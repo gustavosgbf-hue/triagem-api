@@ -305,7 +305,7 @@ app.get("/api/payment/:id", async (req, res) => {
 });
 
 // Helper para montar HTML do email
-function montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno, linkAsumir, medicoNome }) {
+function montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno, linkAsumir, medicoNome, horarioAgendado }) {
   const tipoLabel = tipo === "video" ? "Video" : "Chat";
   const telLimpo = String(tel||"").replace(/\D/g,"");
   function montarTabelaTriagem(texto) {
@@ -323,6 +323,7 @@ function montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno, linkAsumir, me
         <tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px;width:140px">Paciente</td><td style="padding:8px 0;font-weight:600">${nome||"-"}</td></tr>
         <tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">WhatsApp</td><td style="padding:8px 0;font-weight:600">${telLimpo}</td></tr>
         <tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">Modalidade</td><td style="padding:8px 0;font-weight:600">${tipoLabel}</td></tr>
+        ${horarioAgendado ? `<tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">📅 Horário</td><td style="padding:8px 0;font-weight:700;color:#b4e05a;font-size:15px">${horarioAgendado}</td></tr>` : ''}
         <tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">WhatsApp</td><td style="padding:8px 0"><a href="https://wa.me/55${telLimpo}" style="background:#25D366;color:#fff;padding:6px 16px;border-radius:999px;text-decoration:none;font-size:13px;font-weight:600">Chamar no WhatsApp</a></td></tr>
         <tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">Link consulta</td><td style="padding:8px 0;font-size:12px"><a href="${linkRetorno}" style="color:#5ee0a0">${linkRetorno}</a></td></tr>
       </table>
@@ -339,7 +340,7 @@ function montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno, linkAsumir, me
   </div>`;
 }
 
-async function enviarEmailMedicos({ nome, tel, tipo, triagem, linkRetorno, subject, atendimentoId }) {
+async function enviarEmailMedicos({ nome, tel, tipo, triagem, linkRetorno, subject, atendimentoId, horarioAgendado }) {
   const RESEND_KEY = process.env.RESEND_API_KEY;
   if (!RESEND_KEY) { console.warn("[EMAIL] RESEND_API_KEY nao definida."); return; }
   try {
@@ -360,7 +361,7 @@ async function enviarEmailMedicos({ nome, tel, tipo, triagem, linkRetorno, subje
         { expiresIn: "2h" }
       );
       const linkAsumir = `${API_URL}/api/atendimento/assumir-email?token=${token}`;
-      const html = montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno, linkAsumir, medicoNome: med.nome });
+      const html = montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno, linkAsumir, medicoNome: med.nome, horarioAgendado });
       const resendRes = await fetch("https://api.resend.com/emails", {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${RESEND_KEY}` },
@@ -480,12 +481,22 @@ app.post("/api/atendimento/atualizar-triagem", async (req, res) => {
     const linkRetorno = `${SITE_URL}/triagem.html?consulta=${at.id}`;
     const tipoLabel = at.tipo === "video" ? "Video" : "Chat";
     const agora = new Date().toLocaleString("pt-BR", { timeZone: "America/Fortaleza" });
+    // Buscar horário agendado se for agendamento
+    let horarioAgendado = null;
+    if (agendamentoId) {
+      const agRow = await pool.query(`SELECT horario_agendado FROM agendamentos WHERE id=$1`,[agendamentoId]);
+      if (agRow.rows[0]) {
+        horarioAgendado = new Date(agRow.rows[0].horario_agendado).toLocaleString("pt-BR",{timeZone:"America/Fortaleza",day:"2-digit",month:"2-digit",year:"numeric",hour:"2-digit",minute:"2-digit"});
+      }
+    }
     appendToSheet("Atendimentos",[agora,at.nome||"",at.tel||"",at.cpf||"","Aguardando","",triagem,at.tipo||"","",String(at.id)]).catch(e=>console.error("[Sheets]",e));
     // Email disparado AQUI — após triagem real concluída
     await enviarEmailMedicos({
       nome: at.nome, tel: at.tel, tipo: at.tipo, triagem, linkRetorno,
-      atendimentoId: at.id,
-      subject: `Nova triagem - ${at.nome||"Paciente"} (${tipoLabel})`
+      atendimentoId: at.id, horarioAgendado,
+      subject: horarioAgendado
+        ? `Agendamento - ${at.nome||"Paciente"} (${tipoLabel}) - ${horarioAgendado}`
+        : `Nova triagem - ${at.nome||"Paciente"} (${tipoLabel})`
     });
     return res.json({ ok: true, atendimentoId: at.id });
   } catch (e) {
