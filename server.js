@@ -100,6 +100,7 @@ async function initDB() {
       ['data_nascimento','TEXT'],
       ['prontuario','TEXT'],
       ['solicita','TEXT'],
+      ['agendamento_id','INTEGER'],
     ];
     for (const [col, tipo] of cols) {
       await pool.query(`ALTER TABLE fila_atendimentos ADD COLUMN IF NOT EXISTS ${col} ${tipo}`);
@@ -450,9 +451,9 @@ app.post("/api/atendimento/atualizar-triagem", async (req, res) => {
     if (!atendimentoId || !triagem) return res.status(400).json({ ok: false, error: "atendimentoId e triagem sao obrigatorios" });
     const campos = parsearTriagem(triagem);
     const result = await pool.query(
-      `UPDATE fila_atendimentos SET triagem=$2,queixa=$3,idade=$4,sexo=$5,alergias=$6,cronicas=$7,medicacoes=$8,solicita=$9,agendamento_id=COALESCE($10,agendamento_id),status='aguardando'
+      `UPDATE fila_atendimentos SET triagem=$2,queixa=$3,idade=$4,sexo=$5,alergias=$6,cronicas=$7,medicacoes=$8,solicita=$9,status='aguardando'
        WHERE id=$1 AND status IN ('triagem','aguardando') RETURNING id,nome,tel,cpf,tipo,triagem,tel_documentos,medico_nome`,
-      [atendimentoId,triagem,campos.queixa||triagem,campos.idade||"",campos.sexo||"",campos.alergias||"",campos.cronicas||"",campos.medicacoes||"",campos.solicita||"",agendamentoId||null]
+      [atendimentoId,triagem,campos.queixa||triagem,campos.idade||"",campos.sexo||"",campos.alergias||"",campos.cronicas||"",campos.medicacoes||"",campos.solicita||""]
     );
     if (result.rowCount === 0) return res.status(404).json({ ok: false, error: "Atendimento nao encontrado ou ja em andamento" });
     const at = result.rows[0];
