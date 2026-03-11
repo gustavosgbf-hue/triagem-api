@@ -446,14 +446,13 @@ function ehPlaceholder(triagem) {
 
 app.post("/api/atendimento/atualizar-triagem", async (req, res) => {
   try {
-    const { atendimentoId, triagem } = req.body || {};
+    const { atendimentoId, triagem, agendamentoId } = req.body || {};
     if (!atendimentoId || !triagem) return res.status(400).json({ ok: false, error: "atendimentoId e triagem sao obrigatorios" });
     const campos = parsearTriagem(triagem);
-    // Aceita status 'triagem' ou 'aguardando' para compatibilidade
     const result = await pool.query(
-      `UPDATE fila_atendimentos SET triagem=$2,queixa=$3,idade=$4,sexo=$5,alergias=$6,cronicas=$7,medicacoes=$8,solicita=$9,status='aguardando'
+      `UPDATE fila_atendimentos SET triagem=$2,queixa=$3,idade=$4,sexo=$5,alergias=$6,cronicas=$7,medicacoes=$8,solicita=$9,agendamento_id=COALESCE($10,agendamento_id),status='aguardando'
        WHERE id=$1 AND status IN ('triagem','aguardando') RETURNING id,nome,tel,cpf,tipo,triagem,tel_documentos,medico_nome`,
-      [atendimentoId,triagem,campos.queixa||triagem,campos.idade||"",campos.sexo||"",campos.alergias||"",campos.cronicas||"",campos.medicacoes||"",campos.solicita||""]
+      [atendimentoId,triagem,campos.queixa||triagem,campos.idade||"",campos.sexo||"",campos.alergias||"",campos.cronicas||"",campos.medicacoes||"",campos.solicita||"",agendamentoId||null]
     );
     if (result.rowCount === 0) return res.status(404).json({ ok: false, error: "Atendimento nao encontrado ou ja em andamento" });
     const at = result.rows[0];
@@ -945,13 +944,16 @@ app.post("/api/agendamento/:id/iniciar", async (req, res) => {
     let medicoId, medicoNome;
     try { const d=jwt.verify(auth.replace("Bearer ",""),process.env.JWT_SECRET||"fallback_secret"); medicoId=d.id; medicoNome=d.nome; }
     catch(e) { return res.status(401).json({ok:false,error:"Token invalido"}); }
-    const ag=await pool.query(`SELECT * FROM agendamentos WHERE id=$1 AND status='confirmado'`,[req.params.id]);
+    const ag=await pool.query(`SELECT * FROM agendamentos WHERE id=$1 AND status IN ('confirmado','pendente')`,[req.params.id]);
     if (ag.rowCount===0) return res.status(404).json({ok:false,error:"Agendamento nao encontrado"});
     const a=ag.rows[0];
+    // Tenta pegar triagem real do paciente
+    const preReg=await pool.query(`SELECT triagem FROM fila_atendimentos WHERE tel=$1 AND status IN ('triagem','aguardando') ORDER BY criado_em DESC LIMIT 1`,[a.tel]);
+    const triagem=preReg.rowCount>0?(preReg.rows[0].triagem||'(Agendamento)'):'(Agendamento — triagem pendente)';
     const insert=await pool.query(
       `INSERT INTO fila_atendimentos (nome,tel,tel_documentos,cpf,tipo,triagem,status,medico_id,medico_nome,assumido_em)
        VALUES ($1,$2,$3,$4,$5,$6,'assumido',$7,$8,NOW()) RETURNING *`,
-      [a.nome,a.tel,a.tel_documentos||a.tel,a.cpf||"",a.modalidade||"chat","(Agendamento antecipado)",medicoId,medicoNome]
+      [a.nome,a.tel,a.tel_documentos||a.tel,a.cpf||"",a.modalidade||"chat",triagem,medicoId,medicoNome]
     );
     const atendimento = insert.rows[0];
     await pool.query(`UPDATE agendamentos SET status='iniciado' WHERE id=$1`,[req.params.id]);
@@ -978,7 +980,7 @@ app.post("/api/agendamento/:id/cancelar", checkMedico, async (req, res) => {
 
 app.get("/api/agendamentos", checkMedico, async (req, res) => {
   try {
-    const result=await pool.query(`SELECT id,nome,tel,tel_documentos,cpf,modalidade,horario_agendado,status,criado_em FROM agendamentos WHERE status='confirmado' ORDER BY horario_agendado ASC`);
+    const result=await pool.query(`SELECT id,nome,tel,tel_documentos,cpf,modalidade,horario_agendado,status,criado_em FROM agendamentos WHERE status IN ('confirmado','pendente') ORDER BY horario_agendado ASC`);
     return res.json({ok:true,agendamentos:result.rows});
   } catch(e) { return res.status(500).json({ok:false,error:"Erro ao listar agendamentos"}); }
 });
