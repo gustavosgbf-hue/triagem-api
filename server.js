@@ -368,6 +368,114 @@ app.get("/api/payment/:id", async (req, res) => {
   return res.json({ ok: true, status: "pending" });
 });
 
+// ── PAGBANK SANDBOX ────────────────────────────────────────────────────────────
+// Token sandbox (trocar por PAGBANK_TOKEN em produção)
+const PAGBANK_TOKEN = process.env.PAGBANK_TOKEN || "b9771a48-fbaa-4aea-892c-8db52046ac6b3e0e41644d65b0242be53689e0dce6135215-7fbe-4c57-aaaf-2e277a9b28fe";
+const PAGBANK_URL   = process.env.PAGBANK_ENV === "production"
+  ? "https://api.pagseguro.com"
+  : "https://sandbox.api.pagseguro.com";
+
+// Criar order PIX no PagBank (sandbox ou produção)
+app.post("/api/pagbank/order", async (req, res) => {
+  try {
+    const { nome, email, cpf, valor, referenceId } = req.body || {};
+    if (!nome || !email || !cpf || !valor) return res.status(400).json({ ok: false, error: "nome, email, cpf e valor obrigatorios" });
+
+    const orderBody = {
+      reference_id: referenceId || ("CJ-" + Date.now()),
+      customer: {
+        name: nome,
+        email: email,
+        tax_id: cpf.replace(/\D/g, "")
+      },
+      items: [{
+        name: "Consulta Médica Online — ConsultaJá24h",
+        quantity: 1,
+        unit_amount: Math.round(valor * 100) // em centavos
+      }],
+      qr_codes: [{
+        amount: { value: Math.round(valor * 100) }
+      }],
+      notification_urls: [
+        `${process.env.API_URL || "https://triagem-api.onrender.com"}/api/pagbank/webhook`
+      ]
+    };
+
+    const response = await fetch(`${PAGBANK_URL}/orders`, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${PAGBANK_TOKEN}`,
+        "Content-Type": "application/json",
+        "accept": "application/json"
+      },
+      body: JSON.stringify(orderBody)
+    });
+
+    const data = await response.json();
+    console.log("[PAGBANK] Order criada:", JSON.stringify(data).slice(0, 200));
+
+    if (!response.ok) return res.status(400).json({ ok: false, error: data.error_messages || data, raw: data });
+
+    const qrCode = data.qr_codes?.[0];
+    return res.json({
+      ok: true,
+      order_id: data.id,
+      reference_id: data.reference_id,
+      status: data.status,
+      qr_code_text: qrCode?.text,        // copia e cola
+      qr_code_image: qrCode?.links?.find(l => l.media === "image/png")?.href // imagem PNG
+    });
+  } catch (e) {
+    console.error("[PAGBANK] Erro ao criar order:", e);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Webhook PagBank — recebe notificações de pagamento
+app.post("/api/pagbank/webhook", async (req, res) => {
+  try {
+    const event = req.body;
+    console.log("[PAGBANK-WEBHOOK] Evento recebido:", JSON.stringify(event).slice(0, 300));
+
+    const orderId    = event?.data?.id || event?.id;
+    const orderRef   = event?.data?.reference_id || event?.reference_id;
+    const charges    = event?.data?.charges || event?.charges || [];
+    const pago       = charges.some(c => c.status === "PAID");
+
+    if (pago && orderRef) {
+      // Atualiza agendamento se o reference_id for um ID de agendamento
+      const agId = orderRef.replace("CJ-", "").split("-")[0];
+      if (agId && !isNaN(agId)) {
+        await pool.query(
+          `UPDATE agendamentos SET status='confirmado', payment_id=$1 WHERE id=$2 AND status='pendente'`,
+          [orderId, agId]
+        ).catch(e => console.warn("[PAGBANK-WEBHOOK] Update agendamento falhou:", e.message));
+      }
+      console.log("[PAGBANK-WEBHOOK] Pagamento confirmado — order:", orderId, "ref:", orderRef);
+    }
+
+    return res.sendStatus(200);
+  } catch (e) {
+    console.error("[PAGBANK-WEBHOOK] Erro:", e);
+    return res.sendStatus(200); // sempre 200 pro PagBank não retentar indefinidamente
+  }
+});
+
+// Consultar status de uma order PagBank
+app.get("/api/pagbank/order/:id", async (req, res) => {
+  try {
+    const response = await fetch(`${PAGBANK_URL}/orders/${req.params.id}`, {
+      headers: { "Authorization": `Bearer ${PAGBANK_TOKEN}`, "accept": "application/json" }
+    });
+    const data = await response.json();
+    const charges = data.qr_codes || [];
+    const pago = data.charges?.some(c => c.status === "PAID");
+    return res.json({ ok: true, status: data.status, pago, raw: data });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // Helper para montar HTML do email
 function montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno, linkAsumir, medicoNome, horarioAgendado, isLembrete }) {
   const tipoLabel = tipo === "video" ? "Video" : "Chat";
