@@ -147,6 +147,11 @@ async function initDB() {
     await pool.query(`ALTER TABLE medicos ADD COLUMN IF NOT EXISTS telefone TEXT`);
     await pool.query(`ALTER TABLE medicos ADD COLUMN IF NOT EXISTS especialidade TEXT`);
     await pool.query(`ALTER TABLE medicos ADD COLUMN IF NOT EXISTS nome_exibicao TEXT`);
+    await pool.query(`ALTER TABLE medicos ADD COLUMN IF NOT EXISTS cnpj TEXT`);
+    await pool.query(`ALTER TABLE medicos ADD COLUMN IF NOT EXISTS tem_assinatura_digital BOOLEAN DEFAULT false`);
+    await pool.query(`ALTER TABLE medicos ADD COLUMN IF NOT EXISTS provedor_assinatura TEXT`);
+    await pool.query(`ALTER TABLE medicos ADD COLUMN IF NOT EXISTS tem_memed BOOLEAN DEFAULT false`);
+    await pool.query(`ALTER TABLE medicos ADD COLUMN IF NOT EXISTS memed_email TEXT`);
     const cols = [
       ['status_atendimento','TEXT'],['documentos_emitidos','TEXT'],['meet_link','TEXT'],
       ['tel_documentos','TEXT'],['idade','TEXT'],['sexo','TEXT'],['alergias','TEXT'],
@@ -788,14 +793,19 @@ app.get("/atender", async (req, res) => {
 
 app.post("/api/medico/cadastro", async (req, res) => {
   try {
-    const { nome, nome_exibicao, email, senha, crm, uf, telefone, especialidade } = req.body || {};
+    const { nome, nome_exibicao, email, senha, crm, uf, telefone, especialidade,
+            cnpj, tem_assinatura_digital, provedor_assinatura, tem_memed, memed_email } = req.body || {};
     if (!nome||!email||!senha||!crm||!uf||!telefone) return res.status(400).json({ ok: false, error: "Todos os campos obrigatorios devem ser preenchidos" });
     if (senha.length<6) return res.status(400).json({ ok: false, error: "Senha deve ter ao menos 6 caracteres" });
     const senha_hash = await bcrypt.hash(senha, 10);
     const result = await pool.query(
-      `INSERT INTO medicos (nome,nome_exibicao,email,senha_hash,crm,uf,telefone,especialidade,status_online,ativo,role,status)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,false,false,'medico','pendente') RETURNING id,nome,nome_exibicao,email`,
-      [nome.trim(),(nome_exibicao||nome).trim(),email.trim().toLowerCase(),senha_hash,crm.trim().toUpperCase(),uf.trim().toUpperCase(),telefone||"",especialidade||""]
+      `INSERT INTO medicos (nome,nome_exibicao,email,senha_hash,crm,uf,telefone,especialidade,
+        cnpj,tem_assinatura_digital,provedor_assinatura,tem_memed,memed_email,
+        status_online,ativo,role,status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,false,false,'medico','pendente') RETURNING id,nome,nome_exibicao,email`,
+      [nome.trim(),(nome_exibicao||nome).trim(),email.trim().toLowerCase(),senha_hash,
+       crm.trim().toUpperCase(),uf.trim().toUpperCase(),telefone||"",especialidade||"",
+       cnpj||"",!!tem_assinatura_digital,provedor_assinatura||"",!!tem_memed,memed_email||""]
     );
     const med = result.rows[0];
     // E-mail só para o admin — nunca para outros médicos
@@ -828,7 +838,7 @@ app.patch("/api/admin/medico/:id/rejeitar", checkAdmin, async (req, res) => {
 
 app.get("/api/admin/medicos/pendentes", checkAdmin, async (req, res) => {
   try {
-    const result = await pool.query(`SELECT id,nome,email,crm,uf,telefone,especialidade,status,ativo,created_at FROM medicos WHERE status='pendente' ORDER BY created_at DESC`);
+    const result = await pool.query(`SELECT id,nome,nome_exibicao,email,crm,uf,telefone,especialidade,cnpj,tem_assinatura_digital,provedor_assinatura,tem_memed,memed_email,status,ativo,created_at FROM medicos WHERE status='pendente' ORDER BY created_at DESC`);
     return res.json({ ok: true, medicos: result.rows });
   } catch (err) { return res.status(500).json({ ok: false, error: err.message }); }
 });
