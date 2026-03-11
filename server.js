@@ -854,8 +854,8 @@ app.get("/consentimentos", checkAdmin, async (req, res) => {
 app.get("/api/disponibilidade", async (req, res) => {
   try {
     const agora = new Date();
-    const HORA_INICIO=14, HORA_FIM=23;       // atendimento imediato: 14h-23h
-    const HORA_AGEND_INICIO=14, HORA_AGEND_FIM=23; // agendamento: dia todo 8h-23h
+    const HORA_INICIO=13, HORA_FIM=23;       // atendimento imediato: 14h-23h
+    const HORA_AGEND_INICIO=13, HORA_AGEND_FIM=23; // agendamento: dia todo 8h-23h
     const hora = parseInt(new Intl.DateTimeFormat("en-US",{timeZone:"America/Fortaleza",hour:"2-digit",hour12:false}).formatToParts(agora).find(p=>p.type==="hour").value);
     const dentroDoHorario = hora>=HORA_INICIO && hora<HORA_FIM;
     const [medRes,filaRes] = await Promise.all([
