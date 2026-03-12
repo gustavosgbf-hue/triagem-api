@@ -1277,8 +1277,13 @@ app.post("/api/agendamento/:id/iniciar", async (req, res) => {
     let medicoId, medicoNome;
     try { const d=jwt.verify(auth.replace("Bearer ",""),process.env.JWT_SECRET||"fallback_secret"); medicoId=d.id; medicoNome=d.nome; }
     catch(e) { return res.status(401).json({ok:false,error:"Token invalido"}); }
-    const ag=await pool.query(`SELECT * FROM agendamentos WHERE id=$1 AND status IN ('confirmado','pendente')`,[req.params.id]);
-    if (ag.rowCount===0) return res.status(404).json({ok:false,error:"Agendamento nao encontrado"});
+    // Lock: tenta marcar como 'iniciado' atomicamente — só funciona se ainda estiver 'confirmado'
+    const lock = await pool.query(
+      `UPDATE agendamentos SET status='iniciado' WHERE id=$1 AND status='confirmado' RETURNING *`,
+      [req.params.id]
+    );
+    if (lock.rowCount===0) return res.status(409).json({ok:false,error:"Consulta já foi iniciada por outro médico"});
+    const ag = { rows: [lock.rows[0]], rowCount: 1 };
     const a=ag.rows[0];
     // Tenta pegar triagem real do paciente
     const preReg=await pool.query(`SELECT triagem FROM fila_atendimentos WHERE tel=$1 AND status IN ('triagem','aguardando') ORDER BY criado_em DESC LIMIT 1`,[a.tel]);
@@ -1289,7 +1294,7 @@ app.post("/api/agendamento/:id/iniciar", async (req, res) => {
       [a.nome,a.tel,a.tel_documentos||a.tel,a.cpf||"",a.modalidade||"chat",triagem,medicoId,medicoNome]
     );
     const atendimento = insert.rows[0];
-    await pool.query(`UPDATE agendamentos SET status='iniciado' WHERE id=$1`,[req.params.id]);
+    // status já atualizado atomicamente no lock acima
     const SITE_URL=process.env.SITE_URL||"https://consultaja24h.com.br";
     return res.json({
       ok:true,
