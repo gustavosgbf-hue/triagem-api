@@ -550,9 +550,11 @@ async function enviarEmailMedicos({ nome, tel, tipo, triagem, linkRetorno, subje
     const medicosResult = await pool.query(`SELECT id,nome,email FROM medicos WHERE ativo=true AND status='aprovado' ORDER BY status_online DESC`);
     const medicos = medicosResult.rows.filter(m=>m.email);
     // Garante que o admin sempre recebe
-    if (!medicos.find(m=>m.email==="gustavosgbf@gmail.com")) {
-      medicos.push({ id: 0, nome: "Gustavo", email: "gustavosgbf@gmail.com" });
-    }
+    // Admin sempre primeiro
+    const adminEmail = "gustavosgbf@gmail.com";
+    const adminIdx = medicos.findIndex(m=>m.email===adminEmail);
+    if (adminIdx > 0) medicos.splice(adminIdx, 1);
+    if (adminIdx !== 0) medicos.unshift({ id: 0, nome: "Gustavo", email: adminEmail });
 
     const PAINEL_URL = "https://painel.consultaja24h.com.br";
     const API_URL = process.env.API_URL || "https://triagem-api.onrender.com";
