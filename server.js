@@ -152,6 +152,10 @@ async function initDB() {
     await pool.query(`ALTER TABLE medicos ADD COLUMN IF NOT EXISTS provedor_assinatura TEXT`);
     await pool.query(`ALTER TABLE medicos ADD COLUMN IF NOT EXISTS tem_memed BOOLEAN DEFAULT false`);
     await pool.query(`ALTER TABLE medicos ADD COLUMN IF NOT EXISTS memed_email TEXT`);
+    await pool.query(`ALTER TABLE medicos ADD COLUMN IF NOT EXISTS cpf_medico TEXT`);
+    await pool.query(`ALTER TABLE medicos ADD COLUMN IF NOT EXISTS data_nascimento_medico TEXT`);
+    await pool.query(`ALTER TABLE medicos ADD COLUMN IF NOT EXISTS memed_token TEXT`);
+    await pool.query(`ALTER TABLE medicos ADD COLUMN IF NOT EXISTS memed_external_id TEXT`);
     const cols = [
       ['status_atendimento','TEXT'],['documentos_emitidos','TEXT'],['meet_link','TEXT'],
       ['tel_documentos','TEXT'],['idade','TEXT'],['sexo','TEXT'],['alergias','TEXT'],
@@ -989,6 +993,119 @@ app.patch("/api/admin/medico/:id", checkAdmin, async (req, res) => {
     if (result.rowCount===0) return res.status(404).json({ ok: false, error: "Medico nao encontrado" });
     return res.json({ ok: true, medico: result.rows[0] });
   } catch (err) { return res.status(500).json({ ok: false, error: err.message }); }
+});
+
+
+// ── MEMED: obter/criar token do médico ────────────────────────────────────────
+const MEMED_API_URL = process.env.MEMED_API_URL || "https://integrations.api.memed.com.br/v1";
+const MEMED_API_KEY = process.env.MEMED_API_KEY || "iJGiB4kjDGOLeDFPWMG3no9VnN7Abpqe3w1jEFm6olkhkZD6oSfSmYCm";
+const MEMED_SECRET_KEY = process.env.MEMED_SECRET_KEY || "Xe8M5GvBGCr4FStKfxXKisRo3SfYKI7KrTMkJpCAstzu2yXVN4av5nmL";
+
+app.get("/api/memed/token", checkMedico, async (req, res) => {
+  try {
+    const medicoId = req.medico.id;
+    const medResult = await pool.query(
+      `SELECT id,nome,email,crm,uf,telefone,especialidade,cpf_medico,data_nascimento_medico,memed_external_id FROM medicos WHERE id=$1`,
+      [medicoId]
+    );
+    if (medResult.rowCount === 0) return res.status(404).json({ ok: false, error: "Médico não encontrado" });
+    const med = medResult.rows[0];
+
+    // Monta external_id único para o médico
+    const externalId = med.memed_external_id || `consultaja-${med.id}`;
+
+    // Tenta obter token existente primeiro
+    const getUrl = `${MEMED_API_URL}/sinapse-prescricao/usuarios/${externalId}?api-key=${MEMED_API_KEY}&secret-key=${MEMED_SECRET_KEY}`;
+    const getRes = await fetch(getUrl, {
+      headers: { "Accept": "application/vnd.api+json", "Content-Type": "application/json" }
+    });
+    
+    if (getRes.ok) {
+      const getData = await getRes.json();
+      const token = getData?.data?.attributes?.token;
+      if (token) {
+        // Salva external_id se ainda não tinha
+        if (!med.memed_external_id) {
+          await pool.query(`UPDATE medicos SET memed_external_id=$1 WHERE id=$2`, [externalId, medicoId]);
+        }
+        return res.json({ ok: true, token, externalId });
+      }
+    }
+
+    // Médico não existe no Memed — cadastra
+    const [nome, ...sobrenomeArr] = (med.nome || "Médico").split(" ");
+    const sobrenome = sobrenomeArr.join(" ") || "ConsultaJa";
+    const crmNumero = (med.crm || "").replace(/\D/g, "");
+    const uf = (med.uf || "SP").toUpperCase();
+
+    const payload = {
+      data: {
+        type: "usuarios",
+        attributes: {
+          external_id: externalId,
+          nome: nome,
+          sobrenome: sobrenome,
+          cpf: (med.cpf_medico || "").replace(/\D/g, "") || undefined,
+          data_nascimento: med.data_nascimento_medico || undefined,
+          email: med.email || undefined,
+          telefone: (med.telefone || "").replace(/\D/g, "") || undefined,
+          board: {
+            board_code: "CRM",
+            board_number: crmNumero,
+            board_state: uf
+          }
+        }
+      }
+    };
+
+    // Remove campos undefined
+    Object.keys(payload.data.attributes).forEach(k => {
+      if (payload.data.attributes[k] === undefined) delete payload.data.attributes[k];
+    });
+
+    const postUrl = `${MEMED_API_URL}/sinapse-prescricao/usuarios?api-key=${MEMED_API_KEY}&secret-key=${MEMED_SECRET_KEY}`;
+    const postRes = await fetch(postUrl, {
+      method: "POST",
+      headers: { "Accept": "application/vnd.api+json", "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    const postData = await postRes.json();
+    console.log("[MEMED] Cadastro prescritor:", JSON.stringify(postData).substring(0, 200));
+
+    const token = postData?.data?.attributes?.token;
+    if (!token) return res.status(500).json({ ok: false, error: "Não foi possível obter token Memed", detail: postData });
+
+    await pool.query(`UPDATE medicos SET memed_external_id=$1 WHERE id=$2`, [externalId, medicoId]);
+    return res.json({ ok: true, token, externalId });
+
+  } catch(e) {
+    console.error("[MEMED] Erro token:", e.message);
+    return res.status(500).json({ ok: false, error: "Erro ao obter token Memed" });
+  }
+});
+
+// ── ADMIN: histórico geral de todos os atendimentos ───────────────────────────
+app.get("/api/admin/historico", checkAdmin, async (req, res) => {
+  try {
+    const { medico_id, data_inicio, data_fim, busca } = req.query;
+    let where = `WHERE status IN ('encerrado','expirado','arquivado','assumido')`;
+    const params = [];
+    if (medico_id) { params.push(medico_id); where += ` AND medico_id=$${params.length}`; }
+    if (data_inicio) { params.push(data_inicio); where += ` AND criado_em >= $${params.length}::date`; }
+    if (data_fim) { params.push(data_fim); where += ` AND criado_em < ($${params.length}::date + interval '1 day')`; }
+    if (busca) { params.push(`%${busca}%`); where += ` AND (nome ILIKE $${params.length} OR tel ILIKE $${params.length} OR cpf ILIKE $${params.length})`; }
+    const result = await pool.query(
+      `SELECT id,nome,tel,cpf,tipo,triagem,status,medico_id,medico_nome,prontuario,
+              criado_em,assumido_em,encerrado_em,data_nascimento,idade,sexo,solicita,status_atendimento
+       FROM fila_atendimentos ${where} ORDER BY criado_em DESC LIMIT 200`,
+      params
+    );
+    const medicos = await pool.query(`SELECT id,nome,nome_exibicao FROM medicos WHERE ativo=true ORDER BY nome`);
+    return res.json({ ok: true, historico: result.rows, medicos: medicos.rows });
+  } catch(e) {
+    console.error("[ADMIN-HISTORICO]", e.message);
+    return res.status(500).json({ ok: false, error: "Erro ao carregar histórico" });
+  }
 });
 
 app.post("/api/medico/login", async (req, res) => {
