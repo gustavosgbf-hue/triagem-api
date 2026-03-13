@@ -165,6 +165,7 @@ async function initDB() {
       ['prontuario','TEXT'],
       ['solicita','TEXT'],
       ['agendamento_id','INTEGER'],
+      ['horario_agendado','TIMESTAMP'],
     ];
     // Coluna para controle de lembrete de agendamento
     await pool.query(`ALTER TABLE agendamentos ADD COLUMN IF NOT EXISTS lembrete_enviado BOOLEAN DEFAULT false`).catch(()=>{});
@@ -753,6 +754,8 @@ app.post("/api/atendimento/atualizar-triagem", async (req, res) => {
       if (agRow.rows[0]) {
         horarioAgendadoRaw = agRow.rows[0].horario_agendado;
         horarioAgendado = new Date(horarioAgendadoRaw).toLocaleString("pt-BR",{timeZone:"America/Fortaleza",day:"2-digit",month:"2-digit",year:"numeric",hour:"2-digit",minute:"2-digit"});
+        // Salva horario_agendado e agendamento_id na fila para filtrar da lista até a hora da consulta
+        await pool.query(`UPDATE fila_atendimentos SET horario_agendado=$1, agendamento_id=$2 WHERE id=$3`,[horarioAgendadoRaw, agendamentoId, atendimentoId]);
       }
     }
     appendToSheet("Atendimentos",[agora,at.nome||"",at.tel||"",at.cpf||"","Aguardando","",triagem,at.tipo||"","",String(at.id)]).catch(e=>console.error("[Sheets]",e));
@@ -1125,7 +1128,7 @@ app.post("/api/medico/login", async (req, res) => {
 
 app.get("/api/fila", checkMedico, async (req, res) => {
   try {
-    const result = await pool.query(`SELECT id,nome,tel,cpf,tipo,triagem,status,medico_id,medico_nome,meet_link,criado_em,data_nascimento,idade,sexo,alergias,cronicas,medicacoes,queixa,solicita FROM fila_atendimentos WHERE status IN ('aguardando','assumido') ORDER BY criado_em ASC`);
+    const result = await pool.query(`SELECT id,nome,tel,cpf,tipo,triagem,status,medico_id,medico_nome,meet_link,criado_em,data_nascimento,idade,sexo,alergias,cronicas,medicacoes,queixa,solicita,horario_agendado FROM fila_atendimentos WHERE status IN ('aguardando','assumido') AND (horario_agendado IS NULL OR horario_agendado <= NOW() + INTERVAL '15 minutes') ORDER BY criado_em ASC`);
     return res.json({ ok: true, fila: result.rows });
   } catch (err) { return res.status(500).json({ ok: false, error: "Erro ao carregar fila" }); }
 });
