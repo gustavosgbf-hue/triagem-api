@@ -72,7 +72,16 @@ setInterval(async () => {
       const medicosResult = await pool.query(`SELECT id,nome,email FROM medicos WHERE ativo=true AND status='aprovado'`);
       const medicos = medicosResult.rows.filter(m=>m.email);
       if (!medicos.find(m=>m.email==="gustavosgbf@gmail.com")) medicos.push({id:0,nome:"Gustavo",email:"gustavosgbf@gmail.com"});
+      // Marca ANTES do loop para evitar reprocessamento se job rodar novamente
+      await pool.query(`UPDATE agendamentos SET lembrete_enviado=true WHERE id=$1`,[ag.id]);
       for (const med of medicos) {
+        // Verifica se atendimento ainda está aguardando antes de cada envio
+        const statusCheck = await pool.query(`SELECT status FROM fila_atendimentos WHERE id=$1`,[ag.fila_id]);
+        const statusAtual = statusCheck.rows[0]?.status;
+        if (statusAtual && !['aguardando','triagem'].includes(statusAtual)) {
+          console.log(`[LEMBRETE] Agendamento #${ag.id} já assumido (status: ${statusAtual}) — interrompendo envios`);
+          break;
+        }
         const token = jwt.sign(
           { medicoId: med.id, medicoNome: med.nome, atendimentoId: ag.fila_id, tipo: "assumir" },
           process.env.JWT_SECRET || "fallback_secret",
@@ -87,9 +96,8 @@ setInterval(async () => {
         });
         const resendData = await resendRes.json();
         if (resendData.id) console.log(`[LEMBRETE] Enviado para ${med.email} | Agendamento #${ag.id}`);
+        await new Promise(r => setTimeout(r, 600)); // respeita rate limit Resend
       }
-      // Marca como lembrete enviado para não reenviar
-      await pool.query(`UPDATE agendamentos SET lembrete_enviado=true WHERE id=$1`,[ag.id]);
       // Lembrete para o paciente também
       if (ag.email && !ag.lembrete_paciente_enviado) {
         const SITE_URL = process.env.SITE_URL || "https://consultaja24h.com.br";
@@ -794,14 +802,10 @@ app.post("/api/notify", async (req, res) => {
     const agora = new Date().toLocaleString("pt-BR",{timeZone:"America/Fortaleza"});
     appendToSheet("Atendimentos",[agora,nome||"",tel||"",cpf||"",statusInicial,"",triagem||"",tipoConsulta||"","",String(atendimentoId)]).catch(e=>console.error("[Sheets]",e));
 
-    // Email SOMENTE se triagem real (não placeholder)
+    // Email NÃO é disparado aqui — o /api/atendimento/atualizar-triagem dispara após triagem real concluída
+    // Isso evita email duplicado quando notify recebe triagem real diretamente
     if (!ehPlaceholder(triagem)) {
-      const tipoLabel = tipoConsulta === "video" ? "Video" : "Chat";
-      await enviarEmailMedicos({
-        nome, tel, tipo: tipoConsulta, triagem, linkRetorno,
-        atendimentoId,
-        subject: `Nova triagem - ${nome||"Paciente"} (${tipoLabel})`
-      });
+      console.log("[EMAIL-NOTIFY] Triagem real recebida via notify — email será disparado pelo atualizar-triagem");
     } else {
       console.log("[EMAIL-NOTIFY] Pre-registro, email suprimido. Status:", statusInicial);
     }
