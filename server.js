@@ -1000,9 +1000,9 @@ app.patch("/api/admin/medico/:id", checkAdmin, async (req, res) => {
 
 
 // ── MEMED: obter/criar token do médico ────────────────────────────────────────
-const MEMED_API_URL = process.env.MEMED_API_URL || "https://integrations.api.memed.com.br/v1";
-const MEMED_API_KEY = process.env.MEMED_API_KEY || "iJGiB4kjDGOLeDFPWMG3no9VnN7Abpqe3w1jEFm6olkhkZD6oSfSmYCm";
-const MEMED_SECRET_KEY = process.env.MEMED_SECRET_KEY || "Xe8M5GvBGCr4FStKfxXKisRo3SfYKI7KrTMkJpCAstzu2yXVN4av5nmL";
+const MEMED_API_URL = process.env.MEMED_API_URL || "https://api.memed.com.br/v1";
+const MEMED_API_KEY = process.env.MEMED_API_KEY || "";
+const MEMED_SECRET_KEY = process.env.MEMED_SECRET_KEY || "";
 
 app.get("/api/memed/token", checkMedico, async (req, res) => {
   try {
