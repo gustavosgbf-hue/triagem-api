@@ -523,6 +523,11 @@ async function enviarEmailMedicos({ nome, tel, tipo, triagem, linkRetorno, subje
     if (!medicos.find(m=>m.email==="gustavosgbf@gmail.com")) {
       medicos.push({ id: 0, nome: "Gustavo", email: "gustavosgbf@gmail.com" });
     }
+    // Embaralha para não favorecer sempre o mesmo médico
+    for (let i = medicos.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [medicos[i], medicos[j]] = [medicos[j], medicos[i]];
+    }
     const PAINEL_URL = "https://painel.consultaja24h.com.br";
     const API_URL = process.env.API_URL || "https://triagem-api.onrender.com";
     // Envia e-mail individual para cada médico com token único
@@ -548,6 +553,8 @@ async function enviarEmailMedicos({ nome, tel, tipo, triagem, linkRetorno, subje
       const resendData = await resendRes.json();
       if (resendData.id) console.log("[EMAIL] Enviado para:", med.email, "| ID:", resendData.id);
       else console.error("[EMAIL] Resend recusou para", med.email, ":", JSON.stringify(resendData));
+      // Delay para respeitar rate limit do Resend (max 2 req/s)
+      await new Promise(r => setTimeout(r, 600));
     }
   } catch(e) {
     console.error("[EMAIL] Erro:", e.message);
