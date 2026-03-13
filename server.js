@@ -553,11 +553,7 @@ async function enviarEmailMedicos({ nome, tel, tipo, triagem, linkRetorno, subje
     if (!medicos.find(m=>m.email==="gustavosgbf@gmail.com")) {
       medicos.push({ id: 0, nome: "Gustavo", email: "gustavosgbf@gmail.com" });
     }
-    // Embaralha para não favorecer sempre o mesmo médico
-    for (let i = medicos.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [medicos[i], medicos[j]] = [medicos[j], medicos[i]];
-    }
+
     const PAINEL_URL = "https://painel.consultaja24h.com.br";
     const API_URL = process.env.API_URL || "https://triagem-api.onrender.com";
     // Envia e-mail individual para cada médico com token único
