@@ -1038,6 +1038,7 @@ app.get("/api/memed/token", checkMedico, async (req, res) => {
           data_nascimento: med.data_nascimento_medico || undefined,
           email: med.email || undefined,
           telefone: (med.telefone || "").replace(/\D/g, "") || undefined,
+          especialidade: med.especialidade || undefined,
           board: {
             board_code: "CRM",
             board_number: crmNumero,
