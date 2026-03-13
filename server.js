@@ -1000,7 +1000,7 @@ app.patch("/api/admin/medico/:id", checkAdmin, async (req, res) => {
 
 
 // ── MEMED: obter/criar token do médico ────────────────────────────────────────
-const MEMED_API_URL = process.env.MEMED_API_URL || "https://api.memed.com.br/v1";
+const MEMED_API_URL = process.env.MEMED_API_URL || "https://integrations.api.memed.com.br/v1";
 const MEMED_API_KEY = process.env.MEMED_API_KEY || "iJGiB4kjDGOLeDFPWMG3no9VnN7Abpqe3w1jEFm6olkhkZD6oSfSmYCm";
 const MEMED_SECRET_KEY = process.env.MEMED_SECRET_KEY || "Xe8M5GvBGCr4FStKfxXKisRo3SfYKI7KrTMkJpCAstzu2yXVN4av5nmL";
 
@@ -1017,11 +1017,25 @@ app.get("/api/memed/token", checkMedico, async (req, res) => {
     // Monta external_id único para o médico
     const externalId = med.memed_external_id || `consultaja-${med.id}`;
 
-    // Sempre faz POST para obter token novo (tokens Memed expiram rapidamente)
-    // GET retorna token antigo/expirado — por isso sempre recriamos via POST/PUT
-    console.log("[MEMED] Obtendo token novo para externalId:", externalId);
+    // Tenta obter token existente primeiro
+    const getUrl = `${MEMED_API_URL}/sinapse-prescricao/usuarios/${externalId}?api-key=${MEMED_API_KEY}&secret-key=${MEMED_SECRET_KEY}`;
+    const getRes = await fetch(getUrl, {
+      headers: { "Accept": "application/vnd.api+json", "Content-Type": "application/json" }
+    });
+    
+    if (getRes.ok) {
+      const getData = await getRes.json();
+      const token = getData?.data?.attributes?.token;
+      if (token) {
+        // Salva external_id se ainda não tinha
+        if (!med.memed_external_id) {
+          await pool.query(`UPDATE medicos SET memed_external_id=$1 WHERE id=$2`, [externalId, medicoId]);
+        }
+        return res.json({ ok: true, token, externalId });
+      }
+    }
 
-    // Médico pode já existir no Memed — tenta PUT (update) primeiro, depois POST (create)
+    // Médico não existe no Memed — cadastra
     const [nome, ...sobrenomeArr] = (med.nome || "Médico").split(" ");
     const sobrenome = sobrenomeArr.join(" ") || "ConsultaJa";
     const crmNumero = (med.crm || "").replace(/\D/g, "");
@@ -1038,7 +1052,6 @@ app.get("/api/memed/token", checkMedico, async (req, res) => {
           data_nascimento: med.data_nascimento_medico || undefined,
           email: med.email || undefined,
           telefone: (med.telefone || "").replace(/\D/g, "") || undefined,
-          especialidade: med.especialidade || undefined,
           board: {
             board_code: "CRM",
             board_number: crmNumero,
@@ -1053,30 +1066,14 @@ app.get("/api/memed/token", checkMedico, async (req, res) => {
       if (payload.data.attributes[k] === undefined) delete payload.data.attributes[k];
     });
 
-    // Tenta PUT (médico já existe no Memed, só atualiza e obtém token novo)
-    const putUrl = `${MEMED_API_URL}/sinapse-prescricao/usuarios/${externalId}?api-key=${MEMED_API_KEY}&secret-key=${MEMED_SECRET_KEY}`;
-    const putRes = await fetch(putUrl, {
-      method: "PUT",
+    const postUrl = `${MEMED_API_URL}/sinapse-prescricao/usuarios?api-key=${MEMED_API_KEY}&secret-key=${MEMED_SECRET_KEY}`;
+    const postRes = await fetch(postUrl, {
+      method: "POST",
       headers: { "Accept": "application/vnd.api+json", "Content-Type": "application/json" },
       body: JSON.stringify(payload)
     });
-    let postData = null;
-    if (putRes.ok) {
-      postData = await putRes.json();
-      console.log("[MEMED] PUT (token renovado):", JSON.stringify(postData).substring(0, 200));
-    }
-
-    // Se PUT falhou (médico não existe ainda), faz POST para criar
-    if (!postData?.data?.attributes?.token) {
-      const postUrl = `${MEMED_API_URL}/sinapse-prescricao/usuarios?api-key=${MEMED_API_KEY}&secret-key=${MEMED_SECRET_KEY}`;
-      const postRes = await fetch(postUrl, {
-        method: "POST",
-        headers: { "Accept": "application/vnd.api+json", "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
-      });
-      postData = await postRes.json();
-      console.log("[MEMED] POST (novo cadastro):", JSON.stringify(postData).substring(0, 200));
-    }
+    const postData = await postRes.json();
+    console.log("[MEMED] Cadastro prescritor:", JSON.stringify(postData).substring(0, 200));
 
     const token = postData?.data?.attributes?.token;
     if (!token) return res.status(500).json({ ok: false, error: "Não foi possível obter token Memed", detail: postData });
@@ -1134,6 +1131,29 @@ app.get("/api/fila", checkMedico, async (req, res) => {
     const result = await pool.query(`SELECT id,nome,tel,cpf,tipo,triagem,status,medico_id,medico_nome,meet_link,criado_em,data_nascimento,idade,sexo,alergias,cronicas,medicacoes,queixa,solicita,horario_agendado FROM fila_atendimentos WHERE status IN ('aguardando','assumido') AND (horario_agendado IS NULL OR horario_agendado <= NOW() + INTERVAL '15 minutes') ORDER BY criado_em ASC`);
     return res.json({ ok: true, fila: result.rows });
   } catch (err) { return res.status(500).json({ ok: false, error: "Erro ao carregar fila" }); }
+});
+
+// ── BUSCA DE PACIENTES (médico) ───────────────────────────────────────────────
+app.get("/api/pacientes/busca", checkMedico, async (req, res) => {
+  try {
+    const { q } = req.query;
+    if (!q || q.trim().length < 2) return res.json({ ok: true, pacientes: [] });
+    const busca = `%${q.trim()}%`;
+    const result = await pool.query(
+      `SELECT id, nome, tel, cpf, tipo, triagem, queixa, status,
+              encerrado_em, prontuario AS prontuario_salvo
+       FROM fila_atendimentos
+       WHERE status IN ('encerrado','expirado','arquivado')
+         AND (nome ILIKE $1 OR cpf ILIKE $1 OR tel ILIKE $1)
+       ORDER BY encerrado_em DESC
+       LIMIT 50`,
+      [busca]
+    );
+    return res.json({ ok: true, pacientes: result.rows });
+  } catch(e) {
+    console.error("[BUSCA PACIENTES]", e.message);
+    return res.status(500).json({ ok: false, error: "Erro na busca" });
+  }
 });
 
 app.get("/api/historico", checkMedico, async (req, res) => {
