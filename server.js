@@ -837,6 +837,8 @@ app.post("/api/notify", async (req, res) => {
 app.post("/api/chat/upload", upload.single("arquivo"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ ok: false, error: "Nenhum arquivo enviado" });
+    const { atendimentoId, autor, autorId } = req.body || {};
+    if (!atendimentoId || !autor) return res.status(400).json({ ok: false, error: "atendimentoId e autor obrigatorios" });
     const ext = req.file.originalname.split(".").pop().toLowerCase();
     const tipo = req.file.mimetype.startsWith("image/") ? "imagem" : "pdf";
     const key = `chat/${randomUUID()}.${ext}`;
@@ -847,7 +849,11 @@ app.post("/api/chat/upload", upload.single("arquivo"), async (req, res) => {
       ContentType: req.file.mimetype,
     }));
     const url = `${process.env.R2_PUBLIC_URL}/${key}`;
-    return res.json({ ok: true, url, tipo });
+    const result = await pool.query(
+      `INSERT INTO mensagens (atendimento_id,autor,autor_id,texto,arquivo_url,arquivo_tipo) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id,atendimento_id,autor,texto,arquivo_url,arquivo_tipo,criado_em`,
+      [atendimentoId, autor, autorId || null, "", url, tipo]
+    );
+    return res.json({ ok: true, mensagem: result.rows[0] });
   } catch (e) { console.error("Erro em /api/chat/upload:", e); return res.status(500).json({ ok: false, error: "Erro ao fazer upload" }); }
 });
 
