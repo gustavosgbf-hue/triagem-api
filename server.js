@@ -4,12 +4,25 @@ import { google } from "googleapis";
 import pg from "pg";
 import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
+import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import multer from "multer";
+import { randomUUID } from "crypto";
 const { Pool } = pg;
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
+
+const r2 = new S3Client({
+  region: "auto",
+  endpoint: `https://${process.env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+  credentials: {
+    accessKeyId: process.env.R2_ACCESS_KEY_ID,
+    secretAccessKey: process.env.R2_SECRET_ACCESS_KEY,
+  },
+});
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 
 const app = express();
 app.use(cors({
@@ -135,8 +148,12 @@ async function initDB() {
         autor TEXT NOT NULL,
         autor_id INTEGER,
         texto TEXT NOT NULL,
+        arquivo_url TEXT,
+        arquivo_tipo TEXT,
         criado_em TIMESTAMP DEFAULT NOW()
       )`);
+    await pool.query(`ALTER TABLE mensagens ADD COLUMN IF NOT EXISTS arquivo_url TEXT`);
+    await pool.query(`ALTER TABLE mensagens ADD COLUMN IF NOT EXISTS arquivo_tipo TEXT`);
     await pool.query(`CREATE TABLE IF NOT EXISTS agendamentos (
         id SERIAL PRIMARY KEY,
         nome TEXT NOT NULL,
@@ -817,14 +834,31 @@ app.post("/api/notify", async (req, res) => {
   }
 });
 
+app.post("/api/chat/upload", upload.single("arquivo"), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ ok: false, error: "Nenhum arquivo enviado" });
+    const ext = req.file.originalname.split(".").pop().toLowerCase();
+    const tipo = req.file.mimetype.startsWith("image/") ? "imagem" : "pdf";
+    const key = `chat/${randomUUID()}.${ext}`;
+    await r2.send(new PutObjectCommand({
+      Bucket: process.env.R2_BUCKET_NAME,
+      Key: key,
+      Body: req.file.buffer,
+      ContentType: req.file.mimetype,
+    }));
+    const url = `${process.env.R2_PUBLIC_URL}/${key}`;
+    return res.json({ ok: true, url, tipo });
+  } catch (e) { console.error("Erro em /api/chat/upload:", e); return res.status(500).json({ ok: false, error: "Erro ao fazer upload" }); }
+});
+
 app.post("/api/chat/enviar", async (req, res) => {
   try {
-    const { atendimentoId, autor, autorId, texto } = req.body || {};
-    if (!atendimentoId||!autor||!texto) return res.status(400).json({ ok: false, error: "Campos obrigatorios: atendimentoId, autor, texto" });
+    const { atendimentoId, autor, autorId, texto, arquivo_url, arquivo_tipo } = req.body || {};
+    if (!atendimentoId||!autor||(!texto&&!arquivo_url)) return res.status(400).json({ ok: false, error: "Campos obrigatorios: atendimentoId, autor, texto ou arquivo" });
     if (!["paciente","medico"].includes(autor)) return res.status(400).json({ ok: false, error: "autor deve ser paciente ou medico" });
     const result = await pool.query(
-      `INSERT INTO mensagens (atendimento_id,autor,autor_id,texto) VALUES ($1,$2,$3,$4) RETURNING id,atendimento_id,autor,texto,criado_em`,
-      [atendimentoId,autor,autorId||null,texto.trim()]
+      `INSERT INTO mensagens (atendimento_id,autor,autor_id,texto,arquivo_url,arquivo_tipo) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id,atendimento_id,autor,texto,arquivo_url,arquivo_tipo,criado_em`,
+      [atendimentoId,autor,autorId||null,(texto||"").trim(),arquivo_url||null,arquivo_tipo||null]
     );
     return res.json({ ok: true, mensagem: result.rows[0] });
   } catch (e) { console.error("Erro em /api/chat/enviar:", e); return res.status(500).json({ ok: false, error: "Erro ao enviar mensagem" }); }
@@ -839,7 +873,7 @@ app.get("/api/chat/:atendimentoId", async (req, res) => {
     if (token) { try { jwt.verify(token, process.env.JWT_SECRET||"fallback_secret"); autorizado=true; } catch(e){} }
     if (!autorizado) { const check = await pool.query(`SELECT id FROM fila_atendimentos WHERE id=$1`,[atendimentoId]); autorizado=check.rowCount>0; }
     if (!autorizado) return res.status(403).json({ ok: false, error: "Acesso negado" });
-    const result = await pool.query(`SELECT id,atendimento_id,autor,texto,criado_em FROM mensagens WHERE atendimento_id=$1 ORDER BY criado_em ASC`,[atendimentoId]);
+    const result = await pool.query(`SELECT id,atendimento_id,autor,texto,arquivo_url,arquivo_tipo,criado_em FROM mensagens WHERE atendimento_id=$1 ORDER BY criado_em ASC`,[atendimentoId]);
     return res.json({ ok: true, mensagens: result.rows });
   } catch (e) { console.error("Erro em /api/chat/:id:", e); return res.status(500).json({ ok: false, error: "Erro ao buscar mensagens" }); }
 });
