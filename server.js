@@ -312,8 +312,15 @@ async function handleChat(req, res) {
     const { system, messages } = req.body || {};
     if (!system || !Array.isArray(messages)) return res.status(400).json({ ok: false, error: "Payload invalido" });
     const out = await callOpenAI({ system, messages });
-    if (!out.ok) return res.status(503).json({ text: "Sistema temporariamente indisponivel. Tente novamente em instantes." });
-    return res.json({ text: out.text });
+    if (!out.ok) {
+      console.error("[CHAT] Erro tecnico:", out.error);
+      return res.status(503).json({ text: "Ops, tivemos uma instabilidade na mensagem. Por favor, tente enviar novamente." });
+    }
+    const text = String(out.text || "").replace(
+      "Transmissão interrompida. Aguardando a mensagem completa…",
+      "Ops, tivemos uma instabilidade na mensagem. Por favor, tente enviar novamente."
+    );
+    return res.json({ text });
   } catch (e) {
     console.error(e);
     return res.status(500).json({ text: "Erro interno temporario." });
@@ -1434,6 +1441,9 @@ app.post("/api/agendamento/criar", async (req, res) => {
     const { nome,tel,tel_documentos,cpf,modalidade,horario_agendado,email } = req.body||{};
     if (!nome||!tel||!horario_agendado) return res.status(400).json({ok:false,error:"nome, tel e horario_agendado sao obrigatorios"});
     const slotStart=new Date(horario_agendado);
+    if (Number.isNaN(slotStart.getTime())) {
+      return res.status(400).json({ ok: false, error: "horario_agendado invalido" });
+    }
     const slotEnd=new Date(slotStart.getTime()+20*60*1000);
     const existentes=await pool.query(`SELECT COUNT(*) FROM agendamentos WHERE horario_agendado>=$1 AND horario_agendado<$2 AND status IN ('pendente','confirmado')`,[slotStart.toISOString(),slotEnd.toISOString()]);
     if (parseInt(existentes.rows[0].count)>=3) return res.status(409).json({ok:false,error:"Horario indisponivel. Escolha outro horario."});
