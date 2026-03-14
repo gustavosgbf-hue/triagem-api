@@ -102,8 +102,8 @@ setInterval(async () => {
           JWT_SECRET,
           { expiresIn: "3h" }
         );
-        const linkAsumir = `${API_URL}/api/atendimento/assumir-email?token=${token}`;
-        const html = montarHtmlEmail({ nome: ag.nome, tel: ag.tel, tipo: ag.modalidade, triagem: ag.triagem, linkRetorno, linkAsumir, medicoNome: med.nome, horarioAgendado: horarioFormatado, isLembrete: true });
+        const linkAssumir = `${API_URL}/api/atendimento/assumir-email?token=${token}`;
+        const html = montarHtmlEmail({ nome: ag.nome, tel: ag.tel, tipo: ag.modalidade, triagem: ag.triagem, linkRetorno, linkAssumir, medicoNome: med.nome, horarioAgendado: horarioFormatado, isLembrete: true });
         const resendRes = await fetch("https://api.resend.com/emails", {
           method: "POST",
           headers: { "Content-Type": "application/json", Authorization: `Bearer ${RESEND_KEY}` },
@@ -314,8 +314,15 @@ async function handleChat(req, res) {
     const { system, messages } = req.body || {};
     if (!system || !Array.isArray(messages)) return res.status(400).json({ ok: false, error: "Payload invalido" });
     const out = await callOpenAI({ system, messages });
-    if (!out.ok) return res.status(503).json({ text: "Sistema temporariamente indisponivel. Tente novamente em instantes." });
-    return res.json({ text: out.text });
+    if (!out.ok) {
+      console.error("[CHAT] Erro tecnico:", out.error);
+      return res.status(503).json({ text: "Ops, tivemos uma instabilidade na mensagem. Por favor, tente enviar novamente." });
+    }
+    const text = String(out.text || "").replace(
+      "Transmissão interrompida. Aguardando a mensagem completa…",
+      "Ops, tivemos uma instabilidade na mensagem. Por favor, tente enviar novamente."
+    );
+    return res.json({ text });
   } catch (e) {
     console.error(e);
     return res.status(500).json({ text: "Erro interno temporario." });
@@ -509,7 +516,7 @@ app.get("/api/pagbank/order/:id", async (req, res) => {
 });
 
 // Helper para montar HTML do email
-function montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno, linkAsumir, medicoNome, horarioAgendado, isLembrete }) {
+function montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno, linkAssumir, medicoNome, horarioAgendado, isLembrete }) {
   const tipoLabel = tipo === "video" ? "Video" : "Chat";
   const telLimpo = String(tel||"").replace(/\D/g,"");
   function montarTabelaTriagem(texto) {
@@ -533,12 +540,12 @@ function montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno, linkAsumir, me
       </table>
       <table style="width:100%;border-collapse:collapse;border:1px solid rgba(255,255,255,.1);border-radius:10px">${montarTabelaTriagem(triagem)}</table>
       ${isLembrete ? `<div style="margin:16px 0;padding:12px 16px;background:rgba(255,189,46,.08);border:1px solid rgba(255,189,46,.25);border-radius:10px;font-size:12px;color:rgba(255,189,46,.9)">⚠️ Esta triagem foi feita no momento do agendamento e pode estar desatualizada. Confirme os dados com o paciente no início da consulta.</div>` : ""}
-      ${linkAsumir ? `
+      ${linkAssumir ? `
       <div style="margin-top:24px;text-align:center">
-        <a href="${linkAsumir}" style="display:inline-block;padding:14px 32px;border-radius:12px;background:linear-gradient(135deg,#b4e05a,#5ee0a0);color:#051208;font-family:Arial,sans-serif;font-size:15px;font-weight:700;text-decoration:none">
+        <a href="${linkAssumir}" style="display:inline-block;padding:14px 32px;border-radius:12px;background:linear-gradient(135deg,#b4e05a,#5ee0a0);color:#051208;font-family:Arial,sans-serif;font-size:15px;font-weight:700;text-decoration:none">
           ▶ Assumir atendimento
         </a>
-        <p style="margin:10px 0 0;font-size:11px;color:rgba(255,255,255,.3)">Primeiro a clicar assume. Link válido por 2h.</p>
+        <p style="margin:10px 0 0;font-size:11px;color:rgba(255,255,255,.3)">Primeiro a clicar assume.</p>
       </div>` : ''}
       <p style="margin:20px 0 0;font-size:12px;color:rgba(255,255,255,.3)">Enviado automaticamente pelo sistema ConsultaJa24h</p>
     </div>
@@ -575,6 +582,9 @@ async function enviarEmailMedicos({ nome, tel, tipo, triagem, linkRetorno, subje
       const token = jwt.sign(tokenPayload, JWT_SECRET, tokenOpts);
       const linkAsumir = `${API_URL}/api/atendimento/assumir-email?token=${token}`;
       const html = montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno, linkAsumir, medicoNome: med.nome, horarioAgendado });
+      const token = jwt.sign(tokenPayload, process.env.JWT_SECRET || "fallback_secret", tokenOpts);
+      const linkAssumir = `${API_URL}/api/atendimento/assumir-email?token=${token}`;
+      const html = montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno, linkAssumir, medicoNome: med.nome, horarioAgendado });
       const resendRes = await fetch("https://api.resend.com/emails", {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${RESEND_KEY}` },
@@ -922,6 +932,8 @@ app.get("/api/atendimento/assumir-email", async (req, res) => {
     let payload;
     try { payload = jwt.verify(token, JWT_SECRET); }
     catch(e) { return res.send(`<html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#060d0b;color:#fff"><h2 style="color:#ff8080">⏰ Link expirado</h2><p>Este link de assumir atendimento expirou (válido por 2h).</p><a href="${PAINEL_URL}" style="color:#b4e05a">Ir para o painel</a></body></html>`); }
+    try { payload = jwt.verify(token, process.env.JWT_SECRET || "fallback_secret"); }
+    catch(e) { return res.send(`<html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#060d0b;color:#fff"><h2 style="color:#ff8080">⏰ Link expirado</h2><p>Este link de assumir atendimento expirou.</p><a href="${PAINEL_URL}" style="color:#b4e05a">Ir para o painel</a></body></html>`); }
     if (payload.tipo !== "assumir") return res.status(400).send("<h2>Token inválido.</h2>");
     const { medicoId, medicoNome, atendimentoId } = payload;
     // Tenta assumir com trava — só um médico consegue
@@ -1436,6 +1448,9 @@ app.post("/api/agendamento/criar", async (req, res) => {
     const { nome,tel,tel_documentos,cpf,modalidade,horario_agendado,email } = req.body||{};
     if (!nome||!tel||!horario_agendado) return res.status(400).json({ok:false,error:"nome, tel e horario_agendado sao obrigatorios"});
     const slotStart=new Date(horario_agendado);
+    if (Number.isNaN(slotStart.getTime())) {
+      return res.status(400).json({ ok: false, error: "horario_agendado invalido" });
+    }
     const slotEnd=new Date(slotStart.getTime()+20*60*1000);
     const existentes=await pool.query(`SELECT COUNT(*) FROM agendamentos WHERE horario_agendado>=$1 AND horario_agendado<$2 AND status IN ('pendente','confirmado')`,[slotStart.toISOString(),slotEnd.toISOString()]);
     if (parseInt(existentes.rows[0].count)>=3) return res.status(409).json({ok:false,error:"Horario indisponivel. Escolha outro horario."});
