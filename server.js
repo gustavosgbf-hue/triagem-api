@@ -100,8 +100,8 @@ setInterval(async () => {
           process.env.JWT_SECRET || "fallback_secret",
           { expiresIn: "3h" }
         );
-        const linkAsumir = `${API_URL}/api/atendimento/assumir-email?token=${token}`;
-        const html = montarHtmlEmail({ nome: ag.nome, tel: ag.tel, tipo: ag.modalidade, triagem: ag.triagem, linkRetorno, linkAsumir, medicoNome: med.nome, horarioAgendado: horarioFormatado, isLembrete: true });
+        const linkAssumir = `${API_URL}/api/atendimento/assumir-email?token=${token}`;
+        const html = montarHtmlEmail({ nome: ag.nome, tel: ag.tel, tipo: ag.modalidade, triagem: ag.triagem, linkRetorno, linkAssumir, medicoNome: med.nome, horarioAgendado: horarioFormatado, isLembrete: true });
         const resendRes = await fetch("https://api.resend.com/emails", {
           method: "POST",
           headers: { "Content-Type": "application/json", Authorization: `Bearer ${RESEND_KEY}` },
@@ -514,7 +514,7 @@ app.get("/api/pagbank/order/:id", async (req, res) => {
 });
 
 // Helper para montar HTML do email
-function montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno, linkAsumir, medicoNome, horarioAgendado, isLembrete }) {
+function montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno, linkAssumir, medicoNome, horarioAgendado, isLembrete }) {
   const tipoLabel = tipo === "video" ? "Video" : "Chat";
   const telLimpo = String(tel||"").replace(/\D/g,"");
   function montarTabelaTriagem(texto) {
@@ -538,12 +538,12 @@ function montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno, linkAsumir, me
       </table>
       <table style="width:100%;border-collapse:collapse;border:1px solid rgba(255,255,255,.1);border-radius:10px">${montarTabelaTriagem(triagem)}</table>
       ${isLembrete ? `<div style="margin:16px 0;padding:12px 16px;background:rgba(255,189,46,.08);border:1px solid rgba(255,189,46,.25);border-radius:10px;font-size:12px;color:rgba(255,189,46,.9)">⚠️ Esta triagem foi feita no momento do agendamento e pode estar desatualizada. Confirme os dados com o paciente no início da consulta.</div>` : ""}
-      ${linkAsumir ? `
+      ${linkAssumir ? `
       <div style="margin-top:24px;text-align:center">
-        <a href="${linkAsumir}" style="display:inline-block;padding:14px 32px;border-radius:12px;background:linear-gradient(135deg,#b4e05a,#5ee0a0);color:#051208;font-family:Arial,sans-serif;font-size:15px;font-weight:700;text-decoration:none">
+        <a href="${linkAssumir}" style="display:inline-block;padding:14px 32px;border-radius:12px;background:linear-gradient(135deg,#b4e05a,#5ee0a0);color:#051208;font-family:Arial,sans-serif;font-size:15px;font-weight:700;text-decoration:none">
           ▶ Assumir atendimento
         </a>
-        <p style="margin:10px 0 0;font-size:11px;color:rgba(255,255,255,.3)">Primeiro a clicar assume. Link válido por 2h.</p>
+        <p style="margin:10px 0 0;font-size:11px;color:rgba(255,255,255,.3)">Primeiro a clicar assume.</p>
       </div>` : ''}
       <p style="margin:20px 0 0;font-size:12px;color:rgba(255,255,255,.3)">Enviado automaticamente pelo sistema ConsultaJa24h</p>
     </div>
@@ -578,8 +578,8 @@ async function enviarEmailMedicos({ nome, tel, tipo, triagem, linkRetorno, subje
         ? { expiresIn: Math.max(tokenExpiresAt - Math.floor(Date.now()/1000), 3600) } // mínimo 1h
         : { expiresIn: "2h" };
       const token = jwt.sign(tokenPayload, process.env.JWT_SECRET || "fallback_secret", tokenOpts);
-      const linkAsumir = `${API_URL}/api/atendimento/assumir-email?token=${token}`;
-      const html = montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno, linkAsumir, medicoNome: med.nome, horarioAgendado });
+      const linkAssumir = `${API_URL}/api/atendimento/assumir-email?token=${token}`;
+      const html = montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno, linkAssumir, medicoNome: med.nome, horarioAgendado });
       const resendRes = await fetch("https://api.resend.com/emails", {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${RESEND_KEY}` },
@@ -926,7 +926,7 @@ app.get("/api/atendimento/assumir-email", async (req, res) => {
     if (!token) return res.status(400).send("<h2>Link inválido.</h2>");
     let payload;
     try { payload = jwt.verify(token, process.env.JWT_SECRET || "fallback_secret"); }
-    catch(e) { return res.send(`<html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#060d0b;color:#fff"><h2 style="color:#ff8080">⏰ Link expirado</h2><p>Este link de assumir atendimento expirou (válido por 2h).</p><a href="${PAINEL_URL}" style="color:#b4e05a">Ir para o painel</a></body></html>`); }
+    catch(e) { return res.send(`<html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#060d0b;color:#fff"><h2 style="color:#ff8080">⏰ Link expirado</h2><p>Este link de assumir atendimento expirou.</p><a href="${PAINEL_URL}" style="color:#b4e05a">Ir para o painel</a></body></html>`); }
     if (payload.tipo !== "assumir") return res.status(400).send("<h2>Token inválido.</h2>");
     const { medicoId, medicoNome, atendimentoId } = payload;
     // Tenta assumir com trava — só um médico consegue
