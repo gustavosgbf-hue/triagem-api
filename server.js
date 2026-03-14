@@ -196,6 +196,8 @@ async function initDB() {
     ];
     // Coluna para controle de lembrete de agendamento
     await pool.query(`ALTER TABLE agendamentos ADD COLUMN IF NOT EXISTS lembrete_enviado BOOLEAN DEFAULT false`).catch(()=>{});
+    await pool.query(`ALTER TABLE medicos ADD COLUMN IF NOT EXISTS precisa_trocar_senha BOOLEAN DEFAULT false`).catch(()=>{});
+    await pool.query(`ALTER TABLE medicos ADD COLUMN IF NOT EXISTS precisa_trocar_senha BOOLEAN DEFAULT false`).catch(()=>{});
     await pool.query(`ALTER TABLE agendamentos ADD COLUMN IF NOT EXISTS email TEXT`).catch(()=>{});
     await pool.query(`ALTER TABLE agendamentos ADD COLUMN IF NOT EXISTS lembrete_paciente_enviado BOOLEAN DEFAULT false`).catch(()=>{});
     for (const [col, tipo] of cols) {
@@ -343,7 +345,7 @@ function checkMedico(req, res, next) {
   if (!token) return res.status(401).json({ ok: false, error: "Token nao fornecido" });
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
-    req.medico = decoded; next();
+    req.medico = decoded; req.medicoId = decoded.id; next();
   } catch(e) {
     return res.status(401).json({ ok: false, error: "Token invalido ou expirado" });
   }
@@ -1165,18 +1167,99 @@ app.get("/api/admin/historico", checkAdmin, async (req, res) => {
   }
 });
 
+// Rate limiting simples para esqueci-senha
+const esqueciRateLimit = new Map();
+
+app.post("/api/medico/esqueci-senha", async (req, res) => {
+  const MSG_GENERICA = { ok: true, message: "Se o e-mail existir na plataforma, enviamos as instruções de acesso." };
+  try {
+    const { email } = req.body || {};
+    if (!email) return res.json(MSG_GENERICA);
+    const emailNorm = email.trim().toLowerCase();
+    // Rate limit: max 3 tentativas por e-mail a cada 15min
+    const agora = Date.now();
+    const chave = emailNorm;
+    const hist = esqueciRateLimit.get(chave) || [];
+    const recentes = hist.filter(t => agora - t < 15 * 60 * 1000);
+    if (recentes.length >= 3) return res.json(MSG_GENERICA);
+    esqueciRateLimit.set(chave, [...recentes, agora]);
+    // Busca médico
+    const result = await pool.query("SELECT id,nome,email FROM medicos WHERE email=$1 AND ativo=true LIMIT 1",[emailNorm]);
+    if (result.rowCount === 0) return res.json(MSG_GENERICA);
+    const med = result.rows[0];
+    // Gera senha temporária aleatória
+    const { randomBytes } = await import("crypto");
+    const tempSenha = randomBytes(12).toString("base64url"); // 16 chars base64url
+    const tempHash = await bcrypt.hash(tempSenha, 10);
+    await pool.query("UPDATE medicos SET senha_hash=$1, precisa_trocar_senha=true WHERE id=$2",[tempHash, med.id]);
+    // Envia e-mail
+    const RESEND_KEY = process.env.RESEND_API_KEY;
+    const PAINEL_URL = "https://painel.consultaja24h.com.br";
+    if (RESEND_KEY) {
+      const html = `<div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;background:#060d0b;color:#fff;border-radius:12px;overflow:hidden">
+        <div style="background:linear-gradient(135deg,#b4e05a,#5ee0a0);padding:18px 24px"><h2 style="margin:0;color:#051208;font-size:17px">Acesso temporário ao painel médico</h2></div>
+        <div style="padding:28px">
+          <p style="margin:0 0 16px">Olá, <strong>${med.nome}</strong>.</p>
+          <p style="margin:0 0 16px;color:rgba(255,255,255,.7)">Recebemos uma solicitação de recuperação de acesso ao painel médico ConsultaJá24h.</p>
+          <p style="margin:0 0 8px;color:rgba(255,255,255,.5);font-size:13px">Sua senha temporária é:</p>
+          <div style="background:rgba(255,255,255,.07);border:1px solid rgba(180,224,90,.3);border-radius:10px;padding:16px 20px;text-align:center;margin-bottom:20px">
+            <span style="font-family:monospace;font-size:22px;font-weight:700;color:#b4e05a;letter-spacing:3px">${tempSenha}</span>
+          </div>
+          <p style="margin:0 0 20px;color:rgba(255,255,255,.5);font-size:13px">⚠️ Troque esta senha imediatamente após o login. Ela é válida para um único acesso.</p>
+          <a href="${PAINEL_URL}" style="display:inline-block;padding:12px 28px;border-radius:10px;background:linear-gradient(135deg,#b4e05a,#5ee0a0);color:#051208;font-weight:700;font-size:.9rem;text-decoration:none">Acessar o painel</a>
+          <p style="margin:24px 0 0;font-size:11px;color:rgba(255,255,255,.2)">Se você não solicitou isso, ignore este e-mail. Sua senha anterior continuará funcionando.</p>
+        </div>
+      </div>`;
+      await fetch("https://api.resend.com/emails", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${RESEND_KEY}` },
+        body: JSON.stringify({ from: "ConsultaJa24h <contato@consultaja24h.com.br>", to: [med.email], subject: "Acesso temporário ao painel médico", html })
+      });
+    }
+    console.log("[ESQUECI-SENHA] Senha temporária gerada para médico #" + med.id);
+    return res.json(MSG_GENERICA);
+  } catch(e) {
+    console.error("[ESQUECI-SENHA] Erro:", e.message);
+    return res.json({ ok: true, message: "Se o e-mail existir na plataforma, enviamos as instruções de acesso." });
+  }
+});
+
+app.post("/api/medico/trocar-senha", checkMedico, async (req, res) => {
+  try {
+    const { senhaAtual, novaSenha, confirmarSenha } = req.body || {};
+    if (!senhaAtual || !novaSenha || !confirmarSenha)
+      return res.status(400).json({ ok: false, error: "Preencha todos os campos." });
+    if (novaSenha !== confirmarSenha)
+      return res.status(400).json({ ok: false, error: "A nova senha e a confirmação não coincidem." });
+    if (novaSenha.length < 6)
+      return res.status(400).json({ ok: false, error: "A nova senha deve ter pelo menos 6 caracteres." });
+    const medicoId = req.medicoId;
+    const result = await pool.query("SELECT senha_hash FROM medicos WHERE id=$1",[medicoId]);
+    if (result.rowCount === 0) return res.status(404).json({ ok: false, error: "Médico não encontrado." });
+    const senhaOk = await bcrypt.compare(senhaAtual, result.rows[0].senha_hash);
+    if (!senhaOk) return res.status(401).json({ ok: false, error: "Senha atual incorreta." });
+    const novoHash = await bcrypt.hash(novaSenha, 10);
+    await pool.query("UPDATE medicos SET senha_hash=$1, precisa_trocar_senha=false WHERE id=$2",[novoHash, medicoId]);
+    console.log("[TROCAR-SENHA] Senha atualizada para médico #" + medicoId);
+    return res.json({ ok: true });
+  } catch(e) {
+    console.error("[TROCAR-SENHA] Erro:", e.message);
+    return res.status(500).json({ ok: false, error: "Erro ao trocar senha." });
+  }
+});
+
 app.post("/api/medico/login", async (req, res) => {
   try {
     const { email, senha } = req.body || {};
     if (!email||!senha) return res.status(400).json({ ok: false, error: "E-mail e senha sao obrigatorios" });
-    const result = await pool.query("SELECT id,nome,nome_exibicao,email,crm,senha_hash,ativo FROM medicos WHERE email=$1 LIMIT 1",[email.trim().toLowerCase()]);
+    const result = await pool.query("SELECT id,nome,nome_exibicao,email,crm,senha_hash,ativo,precisa_trocar_senha FROM medicos WHERE email=$1 LIMIT 1",[email.trim().toLowerCase()]);
     if (result.rowCount===0) return res.status(401).json({ ok: false, error: "Credenciais invalidas" });
     const med = result.rows[0];
     if (!med.ativo) return res.status(403).json({ ok: false, error: "Seu cadastro ainda esta em analise pela equipe da plataforma." });
     const senhaOk = await bcrypt.compare(senha, med.senha_hash);
     if (!senhaOk) return res.status(401).json({ ok: false, error: "Credenciais invalidas" });
     const token = jwt.sign({ id: med.id, nome: med.nome, crm: med.crm }, JWT_SECRET, { expiresIn: "8h" });
-    return res.json({ ok: true, token, medico: { id: med.id, nome: med.nome_exibicao||med.nome, email: med.email, crm: med.crm } });
+    return res.json({ ok: true, token, precisa_trocar_senha: !!med.precisa_trocar_senha, medico: { id: med.id, nome: med.nome_exibicao||med.nome, email: med.email, crm: med.crm } });
   } catch (err) { return res.status(500).json({ ok: false, error: "Erro interno no login" }); }
 });
 
