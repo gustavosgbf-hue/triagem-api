@@ -582,9 +582,6 @@ async function enviarEmailMedicos({ nome, tel, tipo, triagem, linkRetorno, subje
       const token = jwt.sign(tokenPayload, JWT_SECRET, tokenOpts);
       const linkAsumir = `${API_URL}/api/atendimento/assumir-email?token=${token}`;
       const html = montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno, linkAsumir, medicoNome: med.nome, horarioAgendado });
-      const token = jwt.sign(tokenPayload, process.env.JWT_SECRET || "fallback_secret", tokenOpts);
-      const linkAssumir = `${API_URL}/api/atendimento/assumir-email?token=${token}`;
-      const html = montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno, linkAssumir, medicoNome: med.nome, horarioAgendado });
       const resendRes = await fetch("https://api.resend.com/emails", {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${RESEND_KEY}` },
