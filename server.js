@@ -37,8 +37,10 @@ app.use(cors({
 app.use(express.json({ limit: "1mb" }));
 
 const OPENAI_KEY = process.env.OPENAI_API_KEY;
+const JWT_SECRET = process.env.JWT_SECRET;
 
 if (!OPENAI_KEY) { console.error("OPENAI_API_KEY nao definida"); process.exit(1); }
+if (!JWT_SECRET) { console.error("JWT_SECRET nao definida"); process.exit(1); }
 
 // LIMPEZA AUTOMATICA -- atendimentos travados em 'assumido' por mais de 48h
 setInterval(async () => {
@@ -97,7 +99,7 @@ setInterval(async () => {
         }
         const token = jwt.sign(
           { medicoId: med.id, medicoNome: med.nome, atendimentoId: ag.fila_id, tipo: "assumir" },
-          process.env.JWT_SECRET || "fallback_secret",
+          JWT_SECRET,
           { expiresIn: "3h" }
         );
         const linkAsumir = `${API_URL}/api/atendimento/assumir-email?token=${token}`;
@@ -333,7 +335,7 @@ function checkMedico(req, res, next) {
   const token = auth.replace("Bearer ", "").trim();
   if (!token) return res.status(401).json({ ok: false, error: "Token nao fornecido" });
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET || "fallback_secret");
+    const decoded = jwt.verify(token, JWT_SECRET);
     req.medico = decoded; next();
   } catch(e) {
     return res.status(401).json({ ok: false, error: "Token invalido ou expirado" });
@@ -570,7 +572,7 @@ async function enviarEmailMedicos({ nome, tel, tipo, triagem, linkRetorno, subje
       const tokenOpts = tokenExpiresAt
         ? { expiresIn: Math.max(tokenExpiresAt - Math.floor(Date.now()/1000), 3600) } // mínimo 1h
         : { expiresIn: "2h" };
-      const token = jwt.sign(tokenPayload, process.env.JWT_SECRET || "fallback_secret", tokenOpts);
+      const token = jwt.sign(tokenPayload, JWT_SECRET, tokenOpts);
       const linkAsumir = `${API_URL}/api/atendimento/assumir-email?token=${token}`;
       const html = montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno, linkAsumir, medicoNome: med.nome, horarioAgendado });
       const resendRes = await fetch("https://api.resend.com/emails", {
@@ -874,7 +876,7 @@ app.get("/api/chat/:atendimentoId", async (req, res) => {
     const auth = req.headers["authorization"] || "";
     const token = auth.replace("Bearer ","").trim();
     let autorizado = false;
-    if (token) { try { jwt.verify(token, process.env.JWT_SECRET||"fallback_secret"); autorizado=true; } catch(e){} }
+    if (token) { try { jwt.verify(token, JWT_SECRET); autorizado=true; } catch(e){} }
     if (!autorizado) { const check = await pool.query(`SELECT id FROM fila_atendimentos WHERE id=$1`,[atendimentoId]); autorizado=check.rowCount>0; }
     if (!autorizado) return res.status(403).json({ ok: false, error: "Acesso negado" });
     const result = await pool.query(`SELECT id,atendimento_id,autor,texto,arquivo_url,arquivo_tipo,criado_em FROM mensagens WHERE atendimento_id=$1 ORDER BY criado_em ASC`,[atendimentoId]);
@@ -918,7 +920,7 @@ app.get("/api/atendimento/assumir-email", async (req, res) => {
     const { token } = req.query;
     if (!token) return res.status(400).send("<h2>Link inválido.</h2>");
     let payload;
-    try { payload = jwt.verify(token, process.env.JWT_SECRET || "fallback_secret"); }
+    try { payload = jwt.verify(token, JWT_SECRET); }
     catch(e) { return res.send(`<html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#060d0b;color:#fff"><h2 style="color:#ff8080">⏰ Link expirado</h2><p>Este link de assumir atendimento expirou (válido por 2h).</p><a href="${PAINEL_URL}" style="color:#b4e05a">Ir para o painel</a></body></html>`); }
     if (payload.tipo !== "assumir") return res.status(400).send("<h2>Token inválido.</h2>");
     const { medicoId, medicoNome, atendimentoId } = payload;
@@ -1164,7 +1166,7 @@ app.post("/api/medico/login", async (req, res) => {
     if (!med.ativo) return res.status(403).json({ ok: false, error: "Seu cadastro ainda esta em analise pela equipe da plataforma." });
     const senhaOk = await bcrypt.compare(senha, med.senha_hash);
     if (!senhaOk) return res.status(401).json({ ok: false, error: "Credenciais invalidas" });
-    const token = jwt.sign({ id: med.id, nome: med.nome, crm: med.crm }, process.env.JWT_SECRET||"fallback_secret", { expiresIn: "8h" });
+    const token = jwt.sign({ id: med.id, nome: med.nome, crm: med.crm }, JWT_SECRET, { expiresIn: "8h" });
     return res.json({ ok: true, token, medico: { id: med.id, nome: med.nome_exibicao||med.nome, email: med.email, crm: med.crm } });
   } catch (err) { return res.status(500).json({ ok: false, error: "Erro interno no login" }); }
 });
@@ -1287,7 +1289,7 @@ app.post("/api/atendimento/prontuario", autenticarMedico, async (req, res) => {
 app.post("/api/plantao/entrar", async (req, res) => {
   try {
     const auth = req.headers["authorization"]||"";
-    const decoded = jwt.verify(auth.replace("Bearer ",""), process.env.JWT_SECRET||"fallback_secret");
+    const decoded = jwt.verify(auth.replace("Bearer ",""), JWT_SECRET);
     await pool.query("UPDATE medicos SET status_online=true WHERE id=$1",[decoded.id]);
     return res.json({ ok: true });
   } catch (e) { return res.json({ ok: true }); }
@@ -1296,7 +1298,7 @@ app.post("/api/plantao/entrar", async (req, res) => {
 app.post("/api/plantao/sair", async (req, res) => {
   try {
     const auth = req.headers["authorization"]||"";
-    const decoded = jwt.verify(auth.replace("Bearer ",""), process.env.JWT_SECRET||"fallback_secret");
+    const decoded = jwt.verify(auth.replace("Bearer ",""), JWT_SECRET);
     await pool.query("UPDATE medicos SET status_online=false WHERE id=$1",[decoded.id]);
     return res.json({ ok: true });
   } catch (e) { return res.json({ ok: true }); }
@@ -1468,7 +1470,7 @@ app.post("/api/agendamento/:id/iniciar", async (req, res) => {
   try {
     const auth=req.headers["authorization"]||"";
     let medicoId, medicoNome;
-    try { const d=jwt.verify(auth.replace("Bearer ",""),process.env.JWT_SECRET||"fallback_secret"); medicoId=d.id; medicoNome=d.nome; }
+    try { const d=jwt.verify(auth.replace("Bearer ",""),JWT_SECRET); medicoId=d.id; medicoNome=d.nome; }
     catch(e) { return res.status(401).json({ok:false,error:"Token invalido"}); }
     // Lock: tenta marcar como 'iniciado' atomicamente — só funciona se ainda estiver 'confirmado'
     const lock = await pool.query(
