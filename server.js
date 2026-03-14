@@ -330,7 +330,7 @@ function checkAdmin(req, res, next) {
 
 function checkMedico(req, res, next) {
   const auth = req.headers["authorization"] || "";
-  const token = auth.replace("Bearer ", "").trim();
+  const token = auth.replace(/^Bearer\s+/i, "").trim();
   if (!token) return res.status(401).json({ ok: false, error: "Token nao fornecido" });
   try {
     const decoded = jwt.verify(token, process.env.JWT_SECRET || "fallback_secret");
@@ -468,14 +468,15 @@ app.post("/api/pagbank/webhook", async (req, res) => {
     console.log("[PAGBANK-WEBHOOK] Evento recebido:", JSON.stringify(event).slice(0, 300));
 
     const orderId    = event?.data?.id || event?.id;
-    const orderRef   = event?.data?.reference_id || event?.reference_id;
+    const orderRefRaw = event?.data?.reference_id ?? event?.reference_id;
+    const orderRef   = typeof orderRefRaw === "string" ? orderRefRaw : String(orderRefRaw || "");
     const charges    = event?.data?.charges || event?.charges || [];
     const pago       = charges.some(c => c.status === "PAID");
 
     if (pago && orderRef) {
       // Atualiza agendamento se o reference_id for um ID de agendamento
-      const agId = orderRef.replace("CJ-", "").split("-")[0];
-      if (agId && !isNaN(agId)) {
+      const agId = Number.parseInt(orderRef.replace("CJ-", "").split("-")[0], 10);
+      if (Number.isInteger(agId) && agId > 0) {
         await pool.query(
           `UPDATE agendamentos SET status='confirmado', payment_id=$1 WHERE id=$2 AND status='pendente'`,
           [orderId, agId]
@@ -498,7 +499,6 @@ app.get("/api/pagbank/order/:id", async (req, res) => {
       headers: { "Authorization": `Bearer ${PAGBANK_TOKEN}`, "accept": "application/json" }
     });
     const data = await response.json();
-    const charges = data.qr_codes || [];
     const pago = data.charges?.some(c => c.status === "PAID");
     return res.json({ ok: true, status: data.status, pago, raw: data });
   } catch (e) {
