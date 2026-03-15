@@ -124,14 +124,14 @@ setInterval(async () => {
   } catch(e) { console.error("[LEMBRETE] Erro:", e.message); }
 }, 10 * 60 * 1000); // Roda a cada 10 minutos
 
-// LIMPEZA AUTOMATICA -- historico: encerrados/expirados com mais de 7 dias viram 'arquivado'
+// LIMPEZA AUTOMATICA -- historico: encerrados/expirados com mais de 10 anos viram 'arquivado'
 setInterval(async () => {
   try {
     const result = await pool.query(
       `UPDATE fila_atendimentos
        SET status = 'arquivado'
        WHERE status IN ('encerrado', 'expirado')
-         AND encerrado_em < NOW() - INTERVAL '7 days'
+         AND encerrado_em < NOW() - INTERVAL '10 years'
        RETURNING id`
     );
     if (result.rowCount > 0) {
@@ -1309,7 +1309,7 @@ app.get("/api/historico", checkMedico, async (req, res) => {
        FROM fila_atendimentos
        WHERE medico_id = $1
          AND status IN ('encerrado', 'expirado', 'arquivado')
-         AND encerrado_em >= NOW() - INTERVAL '7 days'
+         AND encerrado_em >= NOW() - INTERVAL '10 years'
        ORDER BY encerrado_em DESC`,
       [medicoId]
     );
