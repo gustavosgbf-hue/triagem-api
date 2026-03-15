@@ -37,10 +37,8 @@ app.use(cors({
 app.use(express.json({ limit: "1mb" }));
 
 const OPENAI_KEY = process.env.OPENAI_API_KEY;
-const JWT_SECRET = process.env.JWT_SECRET;
 
 if (!OPENAI_KEY) { console.error("OPENAI_API_KEY nao definida"); process.exit(1); }
-if (!JWT_SECRET) { console.error("JWT_SECRET nao definida"); process.exit(1); }
 
 // LIMPEZA AUTOMATICA -- atendimentos travados em 'assumido' por mais de 48h
 setInterval(async () => {
@@ -99,11 +97,11 @@ setInterval(async () => {
         }
         const token = jwt.sign(
           { medicoId: med.id, medicoNome: med.nome, atendimentoId: ag.fila_id, tipo: "assumir" },
-          JWT_SECRET,
+          process.env.JWT_SECRET || "fallback_secret",
           { expiresIn: "3h" }
         );
-        const linkAssumir = `${API_URL}/api/atendimento/assumir-email?token=${token}`;
-        const html = montarHtmlEmail({ nome: ag.nome, tel: ag.tel, tipo: ag.modalidade, triagem: ag.triagem, linkRetorno, linkAssumir, medicoNome: med.nome, horarioAgendado: horarioFormatado, isLembrete: true });
+        const linkAsumir = `${API_URL}/api/atendimento/assumir-email?token=${token}`;
+        const html = montarHtmlEmail({ nome: ag.nome, tel: ag.tel, tipo: ag.modalidade, triagem: ag.triagem, linkRetorno, linkAsumir, medicoNome: med.nome, horarioAgendado: horarioFormatado, isLembrete: true });
         const resendRes = await fetch("https://api.resend.com/emails", {
           method: "POST",
           headers: { "Content-Type": "application/json", Authorization: `Bearer ${RESEND_KEY}` },
@@ -124,14 +122,14 @@ setInterval(async () => {
   } catch(e) { console.error("[LEMBRETE] Erro:", e.message); }
 }, 10 * 60 * 1000); // Roda a cada 10 minutos
 
-// LIMPEZA AUTOMATICA -- historico: encerrados/expirados com mais de 10 anos viram 'arquivado'
+// LIMPEZA AUTOMATICA -- historico: encerrados/expirados com mais de 7 dias viram 'arquivado'
 setInterval(async () => {
   try {
     const result = await pool.query(
       `UPDATE fila_atendimentos
        SET status = 'arquivado'
        WHERE status IN ('encerrado', 'expirado')
-         AND encerrado_em < NOW() - INTERVAL '10 years'
+         AND encerrado_em < NOW() - INTERVAL '7 days'
        RETURNING id`
     );
     if (result.rowCount > 0) {
@@ -196,8 +194,6 @@ async function initDB() {
     ];
     // Coluna para controle de lembrete de agendamento
     await pool.query(`ALTER TABLE agendamentos ADD COLUMN IF NOT EXISTS lembrete_enviado BOOLEAN DEFAULT false`).catch(()=>{});
-    await pool.query(`ALTER TABLE medicos ADD COLUMN IF NOT EXISTS precisa_trocar_senha BOOLEAN DEFAULT false`).catch(()=>{});
-    await pool.query(`ALTER TABLE medicos ADD COLUMN IF NOT EXISTS precisa_trocar_senha BOOLEAN DEFAULT false`).catch(()=>{});
     await pool.query(`ALTER TABLE agendamentos ADD COLUMN IF NOT EXISTS email TEXT`).catch(()=>{});
     await pool.query(`ALTER TABLE agendamentos ADD COLUMN IF NOT EXISTS lembrete_paciente_enviado BOOLEAN DEFAULT false`).catch(()=>{});
     for (const [col, tipo] of cols) {
@@ -316,15 +312,8 @@ async function handleChat(req, res) {
     const { system, messages } = req.body || {};
     if (!system || !Array.isArray(messages)) return res.status(400).json({ ok: false, error: "Payload invalido" });
     const out = await callOpenAI({ system, messages });
-    if (!out.ok) {
-      console.error("[CHAT] Erro tecnico:", out.error);
-      return res.status(503).json({ text: "Ops, tivemos uma instabilidade na mensagem. Por favor, tente enviar novamente." });
-    }
-    const text = String(out.text || "").replace(
-      "Transmissão interrompida. Aguardando a mensagem completa…",
-      "Ops, tivemos uma instabilidade na mensagem. Por favor, tente enviar novamente."
-    );
-    return res.json({ text });
+    if (!out.ok) return res.status(503).json({ text: "Sistema temporariamente indisponivel. Tente novamente em instantes." });
+    return res.json({ text: out.text });
   } catch (e) {
     console.error(e);
     return res.status(500).json({ text: "Erro interno temporario." });
@@ -341,11 +330,11 @@ function checkAdmin(req, res, next) {
 
 function checkMedico(req, res, next) {
   const auth = req.headers["authorization"] || "";
-  const token = auth.replace(/^Bearer\s+/i, "").trim();
+  const token = auth.replace("Bearer ", "").trim();
   if (!token) return res.status(401).json({ ok: false, error: "Token nao fornecido" });
   try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    req.medico = decoded; req.medicoId = decoded.id; next();
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || "fallback_secret");
+    req.medico = decoded; next();
   } catch(e) {
     return res.status(401).json({ ok: false, error: "Token invalido ou expirado" });
   }
@@ -479,15 +468,14 @@ app.post("/api/pagbank/webhook", async (req, res) => {
     console.log("[PAGBANK-WEBHOOK] Evento recebido:", JSON.stringify(event).slice(0, 300));
 
     const orderId    = event?.data?.id || event?.id;
-    const orderRefRaw = event?.data?.reference_id ?? event?.reference_id;
-    const orderRef   = typeof orderRefRaw === "string" ? orderRefRaw : String(orderRefRaw || "");
+    const orderRef   = event?.data?.reference_id || event?.reference_id;
     const charges    = event?.data?.charges || event?.charges || [];
     const pago       = charges.some(c => c.status === "PAID");
 
     if (pago && orderRef) {
       // Atualiza agendamento se o reference_id for um ID de agendamento
-      const agId = Number.parseInt(orderRef.replace("CJ-", "").split("-")[0], 10);
-      if (Number.isInteger(agId) && agId > 0) {
+      const agId = orderRef.replace("CJ-", "").split("-")[0];
+      if (agId && !isNaN(agId)) {
         await pool.query(
           `UPDATE agendamentos SET status='confirmado', payment_id=$1 WHERE id=$2 AND status='pendente'`,
           [orderId, agId]
@@ -510,6 +498,7 @@ app.get("/api/pagbank/order/:id", async (req, res) => {
       headers: { "Authorization": `Bearer ${PAGBANK_TOKEN}`, "accept": "application/json" }
     });
     const data = await response.json();
+    const charges = data.qr_codes || [];
     const pago = data.charges?.some(c => c.status === "PAID");
     return res.json({ ok: true, status: data.status, pago, raw: data });
   } catch (e) {
@@ -518,7 +507,7 @@ app.get("/api/pagbank/order/:id", async (req, res) => {
 });
 
 // Helper para montar HTML do email
-function montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno, linkAssumir, medicoNome, horarioAgendado, isLembrete }) {
+function montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno, linkAsumir, medicoNome, horarioAgendado, isLembrete }) {
   const tipoLabel = tipo === "video" ? "Video" : "Chat";
   const telLimpo = String(tel||"").replace(/\D/g,"");
   function montarTabelaTriagem(texto) {
@@ -538,21 +527,17 @@ function montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno, linkAssumir, m
         <tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">Modalidade</td><td style="padding:8px 0;font-weight:600">${tipoLabel}</td></tr>
         ${horarioAgendado ? `<tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">📅 Horário</td><td style="padding:8px 0;font-weight:700;color:#b4e05a;font-size:15px">${horarioAgendado}</td></tr>` : ''}
         <tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">WhatsApp</td><td style="padding:8px 0"><a href="https://wa.me/55${telLimpo}" style="background:#25D366;color:#fff;padding:6px 16px;border-radius:999px;text-decoration:none;font-size:13px;font-weight:600">Chamar no WhatsApp</a></td></tr>
-        <tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">Link do paciente</td><td style="padding:8px 0;font-size:12px"><a href="${linkRetorno}" style="color:#5ee0a0">${linkRetorno}</a><br><span style="font-size:11px;color:rgba(255,255,255,.3)">⚠️ Use apenas se o paciente perder acesso à sala</span></td></tr>
+        <tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">Link consulta</td><td style="padding:8px 0;font-size:12px"><a href="${linkRetorno}" style="color:#5ee0a0">${linkRetorno}</a></td></tr>
       </table>
       <table style="width:100%;border-collapse:collapse;border:1px solid rgba(255,255,255,.1);border-radius:10px">${montarTabelaTriagem(triagem)}</table>
       ${isLembrete ? `<div style="margin:16px 0;padding:12px 16px;background:rgba(255,189,46,.08);border:1px solid rgba(255,189,46,.25);border-radius:10px;font-size:12px;color:rgba(255,189,46,.9)">⚠️ Esta triagem foi feita no momento do agendamento e pode estar desatualizada. Confirme os dados com o paciente no início da consulta.</div>` : ""}
+      ${linkAsumir ? `
       <div style="margin-top:24px;text-align:center">
-        ${linkAssumir ? `
-        <a href="${linkAssumir}" style="display:inline-block;padding:14px 32px;border-radius:12px;background:linear-gradient(135deg,#b4e05a,#5ee0a0);color:#051208;font-family:Arial,sans-serif;font-size:15px;font-weight:700;text-decoration:none;margin-bottom:12px">
+        <a href="${linkAsumir}" style="display:inline-block;padding:14px 32px;border-radius:12px;background:linear-gradient(135deg,#b4e05a,#5ee0a0);color:#051208;font-family:Arial,sans-serif;font-size:15px;font-weight:700;text-decoration:none">
           ▶ Assumir atendimento
         </a>
-        <p style="margin:8px 0 16px;font-size:11px;color:rgba(255,255,255,.3)">Primeiro a clicar assume. Link válido por 2h.</p>` : ''}
-        <a href="https://painel.consultaja24h.com.br" style="display:inline-block;padding:11px 24px;border-radius:10px;border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.05);color:rgba(255,255,255,.7);font-family:Arial,sans-serif;font-size:13px;font-weight:600;text-decoration:none">
-          🔑 Acessar o painel
-        </a>
-        <p style="margin:6px 0 0;font-size:11px;color:rgba(255,255,255,.2)">Entre com seu login para atender</p>
-      </div>
+        <p style="margin:10px 0 0;font-size:11px;color:rgba(255,255,255,.3)">Primeiro a clicar assume. Link válido por 2h.</p>
+      </div>` : ''}
       <p style="margin:20px 0 0;font-size:12px;color:rgba(255,255,255,.3)">Enviado automaticamente pelo sistema ConsultaJa24h</p>
     </div>
   </div>`;
@@ -565,12 +550,14 @@ async function enviarEmailMedicos({ nome, tel, tipo, triagem, linkRetorno, subje
     const medicosResult = await pool.query(`SELECT id,nome,email FROM medicos WHERE ativo=true AND status='aprovado' ORDER BY status_online DESC`);
     const medicos = medicosResult.rows.filter(m=>m.email);
     // Garante que o admin sempre recebe
-    // Admin sempre primeiro
-    const adminEmail = "gustavosgbf@gmail.com";
-    const adminIdx = medicos.findIndex(m=>m.email===adminEmail);
-    if (adminIdx > 0) medicos.splice(adminIdx, 1);
-    if (adminIdx !== 0) medicos.unshift({ id: 0, nome: "Gustavo", email: adminEmail });
-
+    if (!medicos.find(m=>m.email==="gustavosgbf@gmail.com")) {
+      medicos.push({ id: 0, nome: "Gustavo", email: "gustavosgbf@gmail.com" });
+    }
+    // Embaralha para não favorecer sempre o mesmo médico
+    for (let i = medicos.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [medicos[i], medicos[j]] = [medicos[j], medicos[i]];
+    }
     const PAINEL_URL = "https://painel.consultaja24h.com.br";
     const API_URL = process.env.API_URL || "https://triagem-api.onrender.com";
     // Envia e-mail individual para cada médico com token único
@@ -585,7 +572,7 @@ async function enviarEmailMedicos({ nome, tel, tipo, triagem, linkRetorno, subje
       const tokenOpts = tokenExpiresAt
         ? { expiresIn: Math.max(tokenExpiresAt - Math.floor(Date.now()/1000), 3600) } // mínimo 1h
         : { expiresIn: "2h" };
-      const token = jwt.sign(tokenPayload, JWT_SECRET, tokenOpts);
+      const token = jwt.sign(tokenPayload, process.env.JWT_SECRET || "fallback_secret", tokenOpts);
       const linkAsumir = `${API_URL}/api/atendimento/assumir-email?token=${token}`;
       const html = montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno, linkAsumir, medicoNome: med.nome, horarioAgendado });
       const resendRes = await fetch("https://api.resend.com/emails", {
@@ -889,7 +876,7 @@ app.get("/api/chat/:atendimentoId", async (req, res) => {
     const auth = req.headers["authorization"] || "";
     const token = auth.replace("Bearer ","").trim();
     let autorizado = false;
-    if (token) { try { jwt.verify(token, JWT_SECRET); autorizado=true; } catch(e){} }
+    if (token) { try { jwt.verify(token, process.env.JWT_SECRET||"fallback_secret"); autorizado=true; } catch(e){} }
     if (!autorizado) { const check = await pool.query(`SELECT id FROM fila_atendimentos WHERE id=$1`,[atendimentoId]); autorizado=check.rowCount>0; }
     if (!autorizado) return res.status(403).json({ ok: false, error: "Acesso negado" });
     const result = await pool.query(`SELECT id,atendimento_id,autor,texto,arquivo_url,arquivo_tipo,criado_em FROM mensagens WHERE atendimento_id=$1 ORDER BY criado_em ASC`,[atendimentoId]);
@@ -933,10 +920,8 @@ app.get("/api/atendimento/assumir-email", async (req, res) => {
     const { token } = req.query;
     if (!token) return res.status(400).send("<h2>Link inválido.</h2>");
     let payload;
-    try { payload = jwt.verify(token, JWT_SECRET); }
-    catch(e) { return res.send(`<html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#060d0b;color:#fff"><h2 style="color:#ff8080">⏰ Link expirado</h2><p>Este link de assumir atendimento expirou (válido por 2h).</p><a href="${PAINEL_URL}" style="color:#b4e05a">Ir para o painel</a></body></html>`); }
     try { payload = jwt.verify(token, process.env.JWT_SECRET || "fallback_secret"); }
-    catch(e) { return res.send(`<html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#060d0b;color:#fff"><h2 style="color:#ff8080">⏰ Link expirado</h2><p>Este link de assumir atendimento expirou.</p><a href="${PAINEL_URL}" style="color:#b4e05a">Ir para o painel</a></body></html>`); }
+    catch(e) { return res.send(`<html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#060d0b;color:#fff"><h2 style="color:#ff8080">⏰ Link expirado</h2><p>Este link de assumir atendimento expirou (válido por 2h).</p><a href="${PAINEL_URL}" style="color:#b4e05a">Ir para o painel</a></body></html>`); }
     if (payload.tipo !== "assumir") return res.status(400).send("<h2>Token inválido.</h2>");
     const { medicoId, medicoNome, atendimentoId } = payload;
     // Tenta assumir com trava — só um médico consegue
@@ -1171,99 +1156,18 @@ app.get("/api/admin/historico", checkAdmin, async (req, res) => {
   }
 });
 
-// Rate limiting simples para esqueci-senha
-const esqueciRateLimit = new Map();
-
-app.post("/api/medico/esqueci-senha", async (req, res) => {
-  const MSG_GENERICA = { ok: true, message: "Se o e-mail existir na plataforma, enviamos as instruções de acesso." };
-  try {
-    const { email } = req.body || {};
-    if (!email) return res.json(MSG_GENERICA);
-    const emailNorm = email.trim().toLowerCase();
-    // Rate limit: max 3 tentativas por e-mail a cada 15min
-    const agora = Date.now();
-    const chave = emailNorm;
-    const hist = esqueciRateLimit.get(chave) || [];
-    const recentes = hist.filter(t => agora - t < 15 * 60 * 1000);
-    if (recentes.length >= 3) return res.json(MSG_GENERICA);
-    esqueciRateLimit.set(chave, [...recentes, agora]);
-    // Busca médico
-    const result = await pool.query("SELECT id,nome,email FROM medicos WHERE email=$1 AND ativo=true LIMIT 1",[emailNorm]);
-    if (result.rowCount === 0) return res.json(MSG_GENERICA);
-    const med = result.rows[0];
-    // Gera senha temporária aleatória
-    const { randomBytes } = await import("crypto");
-    const tempSenha = randomBytes(12).toString("base64url"); // 16 chars base64url
-    const tempHash = await bcrypt.hash(tempSenha, 10);
-    await pool.query("UPDATE medicos SET senha_hash=$1, precisa_trocar_senha=true WHERE id=$2",[tempHash, med.id]);
-    // Envia e-mail
-    const RESEND_KEY = process.env.RESEND_API_KEY;
-    const PAINEL_URL = "https://painel.consultaja24h.com.br";
-    if (RESEND_KEY) {
-      const html = `<div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;background:#060d0b;color:#fff;border-radius:12px;overflow:hidden">
-        <div style="background:linear-gradient(135deg,#b4e05a,#5ee0a0);padding:18px 24px"><h2 style="margin:0;color:#051208;font-size:17px">Acesso temporário ao painel médico</h2></div>
-        <div style="padding:28px">
-          <p style="margin:0 0 16px">Olá, <strong>${med.nome}</strong>.</p>
-          <p style="margin:0 0 16px;color:rgba(255,255,255,.7)">Recebemos uma solicitação de recuperação de acesso ao painel médico ConsultaJá24h.</p>
-          <p style="margin:0 0 8px;color:rgba(255,255,255,.5);font-size:13px">Sua senha temporária é:</p>
-          <div style="background:rgba(255,255,255,.07);border:1px solid rgba(180,224,90,.3);border-radius:10px;padding:16px 20px;text-align:center;margin-bottom:20px">
-            <span style="font-family:monospace;font-size:22px;font-weight:700;color:#b4e05a;letter-spacing:3px">${tempSenha}</span>
-          </div>
-          <p style="margin:0 0 20px;color:rgba(255,255,255,.5);font-size:13px">⚠️ Troque esta senha imediatamente após o login. Ela é válida para um único acesso.</p>
-          <a href="${PAINEL_URL}" style="display:inline-block;padding:12px 28px;border-radius:10px;background:linear-gradient(135deg,#b4e05a,#5ee0a0);color:#051208;font-weight:700;font-size:.9rem;text-decoration:none">Acessar o painel</a>
-          <p style="margin:24px 0 0;font-size:11px;color:rgba(255,255,255,.2)">Se você não solicitou isso, ignore este e-mail. Sua senha anterior continuará funcionando.</p>
-        </div>
-      </div>`;
-      await fetch("https://api.resend.com/emails", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${RESEND_KEY}` },
-        body: JSON.stringify({ from: "ConsultaJa24h <contato@consultaja24h.com.br>", to: [med.email], subject: "Acesso temporário ao painel médico", html })
-      });
-    }
-    console.log("[ESQUECI-SENHA] Senha temporária gerada para médico #" + med.id);
-    return res.json(MSG_GENERICA);
-  } catch(e) {
-    console.error("[ESQUECI-SENHA] Erro:", e.message);
-    return res.json({ ok: true, message: "Se o e-mail existir na plataforma, enviamos as instruções de acesso." });
-  }
-});
-
-app.post("/api/medico/trocar-senha", checkMedico, async (req, res) => {
-  try {
-    const { senhaAtual, novaSenha, confirmarSenha } = req.body || {};
-    if (!senhaAtual || !novaSenha || !confirmarSenha)
-      return res.status(400).json({ ok: false, error: "Preencha todos os campos." });
-    if (novaSenha !== confirmarSenha)
-      return res.status(400).json({ ok: false, error: "A nova senha e a confirmação não coincidem." });
-    if (novaSenha.length < 6)
-      return res.status(400).json({ ok: false, error: "A nova senha deve ter pelo menos 6 caracteres." });
-    const medicoId = req.medicoId;
-    const result = await pool.query("SELECT senha_hash FROM medicos WHERE id=$1",[medicoId]);
-    if (result.rowCount === 0) return res.status(404).json({ ok: false, error: "Médico não encontrado." });
-    const senhaOk = await bcrypt.compare(senhaAtual, result.rows[0].senha_hash);
-    if (!senhaOk) return res.status(401).json({ ok: false, error: "Senha atual incorreta." });
-    const novoHash = await bcrypt.hash(novaSenha, 10);
-    await pool.query("UPDATE medicos SET senha_hash=$1, precisa_trocar_senha=false WHERE id=$2",[novoHash, medicoId]);
-    console.log("[TROCAR-SENHA] Senha atualizada para médico #" + medicoId);
-    return res.json({ ok: true });
-  } catch(e) {
-    console.error("[TROCAR-SENHA] Erro:", e.message);
-    return res.status(500).json({ ok: false, error: "Erro ao trocar senha." });
-  }
-});
-
 app.post("/api/medico/login", async (req, res) => {
   try {
     const { email, senha } = req.body || {};
     if (!email||!senha) return res.status(400).json({ ok: false, error: "E-mail e senha sao obrigatorios" });
-    const result = await pool.query("SELECT id,nome,nome_exibicao,email,crm,senha_hash,ativo,precisa_trocar_senha FROM medicos WHERE email=$1 LIMIT 1",[email.trim().toLowerCase()]);
+    const result = await pool.query("SELECT id,nome,nome_exibicao,email,crm,senha_hash,ativo FROM medicos WHERE email=$1 LIMIT 1",[email.trim().toLowerCase()]);
     if (result.rowCount===0) return res.status(401).json({ ok: false, error: "Credenciais invalidas" });
     const med = result.rows[0];
     if (!med.ativo) return res.status(403).json({ ok: false, error: "Seu cadastro ainda esta em analise pela equipe da plataforma." });
     const senhaOk = await bcrypt.compare(senha, med.senha_hash);
     if (!senhaOk) return res.status(401).json({ ok: false, error: "Credenciais invalidas" });
-    const token = jwt.sign({ id: med.id, nome: med.nome, crm: med.crm }, JWT_SECRET, { expiresIn: "8h" });
-    return res.json({ ok: true, token, precisa_trocar_senha: !!med.precisa_trocar_senha, medico: { id: med.id, nome: med.nome_exibicao||med.nome, email: med.email, crm: med.crm } });
+    const token = jwt.sign({ id: med.id, nome: med.nome, crm: med.crm }, process.env.JWT_SECRET||"fallback_secret", { expiresIn: "8h" });
+    return res.json({ ok: true, token, medico: { id: med.id, nome: med.nome_exibicao||med.nome, email: med.email, crm: med.crm } });
   } catch (err) { return res.status(500).json({ ok: false, error: "Erro interno no login" }); }
 });
 
@@ -1309,7 +1213,7 @@ app.get("/api/historico", checkMedico, async (req, res) => {
        FROM fila_atendimentos
        WHERE medico_id = $1
          AND status IN ('encerrado', 'expirado', 'arquivado')
-         AND encerrado_em >= NOW() - INTERVAL '10 years'
+         AND encerrado_em >= NOW() - INTERVAL '7 days'
        ORDER BY encerrado_em DESC`,
       [medicoId]
     );
@@ -1368,23 +1272,13 @@ app.post("/api/atendimento/prontuario", autenticarMedico, async (req, res) => {
     return res.status(400).json({ ok: false, error: "filaId e prontuario sao obrigatorios" });
   }
   try {
-    // Permite salvar se for o médico do atendimento OU se o atendimento estiver sendo encerrado
-    // (medico_id pode ser 0 quando assumido via e-mail pelo admin)
     const r = await pool.query(
-      "UPDATE fila_atendimentos SET prontuario = $1 WHERE id = $2 AND (medico_id = $3 OR medico_id = 0 OR medico_id IS NULL OR $3 = (SELECT id FROM medicos WHERE email='gustavosgbf@gmail.com' LIMIT 1))",
+      "UPDATE fila_atendimentos SET prontuario = $1 WHERE id = $2 AND medico_id = $3",
       [prontuario, filaId, req.medico.id]
     );
     if (r.rowCount === 0) {
-      // Fallback: tenta salvar sem restrição de médico (para casos de encerramento)
-      const r2 = await pool.query(
-        "UPDATE fila_atendimentos SET prontuario = $1 WHERE id = $2",
-        [prontuario, filaId]
-      );
-      if (r2.rowCount === 0) {
-        return res.status(403).json({ ok: false, error: "Atendimento nao encontrado." });
-      }
+      return res.status(403).json({ ok: false, error: "Atendimento nao encontrado ou sem permissao." });
     }
-    console.log("[prontuario] Salvo para atendimento #" + filaId);
     res.json({ ok: true });
   } catch (err) {
     console.error("[prontuario] Erro ao salvar:", err.message);
@@ -1395,7 +1289,7 @@ app.post("/api/atendimento/prontuario", autenticarMedico, async (req, res) => {
 app.post("/api/plantao/entrar", async (req, res) => {
   try {
     const auth = req.headers["authorization"]||"";
-    const decoded = jwt.verify(auth.replace("Bearer ",""), JWT_SECRET);
+    const decoded = jwt.verify(auth.replace("Bearer ",""), process.env.JWT_SECRET||"fallback_secret");
     await pool.query("UPDATE medicos SET status_online=true WHERE id=$1",[decoded.id]);
     return res.json({ ok: true });
   } catch (e) { return res.json({ ok: true }); }
@@ -1404,7 +1298,7 @@ app.post("/api/plantao/entrar", async (req, res) => {
 app.post("/api/plantao/sair", async (req, res) => {
   try {
     const auth = req.headers["authorization"]||"";
-    const decoded = jwt.verify(auth.replace("Bearer ",""), JWT_SECRET);
+    const decoded = jwt.verify(auth.replace("Bearer ",""), process.env.JWT_SECRET||"fallback_secret");
     await pool.query("UPDATE medicos SET status_online=false WHERE id=$1",[decoded.id]);
     return res.json({ ok: true });
   } catch (e) { return res.json({ ok: true }); }
@@ -1542,9 +1436,6 @@ app.post("/api/agendamento/criar", async (req, res) => {
     const { nome,tel,tel_documentos,cpf,modalidade,horario_agendado,email } = req.body||{};
     if (!nome||!tel||!horario_agendado) return res.status(400).json({ok:false,error:"nome, tel e horario_agendado sao obrigatorios"});
     const slotStart=new Date(horario_agendado);
-    if (Number.isNaN(slotStart.getTime())) {
-      return res.status(400).json({ ok: false, error: "horario_agendado invalido" });
-    }
     const slotEnd=new Date(slotStart.getTime()+20*60*1000);
     const existentes=await pool.query(`SELECT COUNT(*) FROM agendamentos WHERE horario_agendado>=$1 AND horario_agendado<$2 AND status IN ('pendente','confirmado')`,[slotStart.toISOString(),slotEnd.toISOString()]);
     if (parseInt(existentes.rows[0].count)>=3) return res.status(409).json({ok:false,error:"Horario indisponivel. Escolha outro horario."});
@@ -1579,7 +1470,7 @@ app.post("/api/agendamento/:id/iniciar", async (req, res) => {
   try {
     const auth=req.headers["authorization"]||"";
     let medicoId, medicoNome;
-    try { const d=jwt.verify(auth.replace("Bearer ",""),JWT_SECRET); medicoId=d.id; medicoNome=d.nome; }
+    try { const d=jwt.verify(auth.replace("Bearer ",""),process.env.JWT_SECRET||"fallback_secret"); medicoId=d.id; medicoNome=d.nome; }
     catch(e) { return res.status(401).json({ok:false,error:"Token invalido"}); }
     // Lock: tenta marcar como 'iniciado' atomicamente — só funciona se ainda estiver 'confirmado'
     const lock = await pool.query(
