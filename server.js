@@ -542,13 +542,17 @@ function montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno, linkAssumir, m
       </table>
       <table style="width:100%;border-collapse:collapse;border:1px solid rgba(255,255,255,.1);border-radius:10px">${montarTabelaTriagem(triagem)}</table>
       ${isLembrete ? `<div style="margin:16px 0;padding:12px 16px;background:rgba(255,189,46,.08);border:1px solid rgba(255,189,46,.25);border-radius:10px;font-size:12px;color:rgba(255,189,46,.9)">⚠️ Esta triagem foi feita no momento do agendamento e pode estar desatualizada. Confirme os dados com o paciente no início da consulta.</div>` : ""}
-      ${linkAssumir ? `
       <div style="margin-top:24px;text-align:center">
-        <a href="${linkAssumir}" style="display:inline-block;padding:14px 32px;border-radius:12px;background:linear-gradient(135deg,#b4e05a,#5ee0a0);color:#051208;font-family:Arial,sans-serif;font-size:15px;font-weight:700;text-decoration:none">
+        ${linkAssumir ? `
+        <a href="${linkAssumir}" style="display:inline-block;padding:14px 32px;border-radius:12px;background:linear-gradient(135deg,#b4e05a,#5ee0a0);color:#051208;font-family:Arial,sans-serif;font-size:15px;font-weight:700;text-decoration:none;margin-bottom:12px">
           ▶ Assumir atendimento
         </a>
-        <p style="margin:10px 0 0;font-size:11px;color:rgba(255,255,255,.3)">Primeiro a clicar assume.</p>
-      </div>` : ''}
+        <p style="margin:8px 0 16px;font-size:11px;color:rgba(255,255,255,.3)">Primeiro a clicar assume. Link válido por 2h.</p>` : ''}
+        <a href="https://painel.consultaja24h.com.br" style="display:inline-block;padding:11px 24px;border-radius:10px;border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.05);color:rgba(255,255,255,.7);font-family:Arial,sans-serif;font-size:13px;font-weight:600;text-decoration:none">
+          🔑 Acessar o painel
+        </a>
+        <p style="margin:6px 0 0;font-size:11px;color:rgba(255,255,255,.2)">Entre com seu login para atender</p>
+      </div>
       <p style="margin:20px 0 0;font-size:12px;color:rgba(255,255,255,.3)">Enviado automaticamente pelo sistema ConsultaJa24h</p>
     </div>
   </div>`;
