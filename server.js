@@ -282,7 +282,20 @@ function parsearTriagem(summary) {
   const linhas = summary.split(/[\n;]/);
   for (const linha of linhas) {
     const colonIdx = linha.indexOf(':');
-    if (colonIdx < 1) continue;
+    if (colonIdx < 1) {
+      // FIX 2: tenta capturar padrões sem dois-pontos ex: "Problema principal dor de garganta"
+      // só para queixa (campo mais crítico que a IA omite os dois-pontos)
+      if (!campos.queixa) {
+        const linhaNorm = linha.trim().toLowerCase().replace(/[*•\-]/g, '').trim();
+        for (const p of mapa[0].padroes) {
+          if (linhaNorm.startsWith(p)) {
+            const valor = linha.trim().slice(p.length).trim().replace(/^[:–—\s]+/, '');
+            if (valor && valor.length > 2) { campos.queixa = valor; break; }
+          }
+        }
+      }
+      continue;
+    }
     const chaveRaw = linha.slice(0, colonIdx).trim().toLowerCase().replace(/[*•\-]/g, '').trim();
     const valor = linha.slice(colonIdx + 1).trim().replace(/^[-–—]\s*/, '');
     if (!valor || /^(nega|não|nao|nenhum|sem)$/i.test(valor)) {
@@ -312,6 +325,11 @@ function parsearTriagem(summary) {
     else if (/receita/i.test(summary)) campos.solicita = 'Receita';
     else if (/pedido.*exame|exame/i.test(summary)) campos.solicita = 'Pedido de exame';
     else campos.solicita = 'Não informado';
+  }
+  // FIX 2: fallback final para queixa — usa primeira linha não vazia do summary
+  if (!campos.queixa) {
+    const primeiraLinha = summary.split(/[\n;]/).map(l => l.trim()).find(l => l.length > 5 && !/^\{/.test(l));
+    if (primeiraLinha) campos.queixa = primeiraLinha.replace(/^(queixa|problema|motivo)[:\s]*/i, '').slice(0, 200);
   }
   if (!campos.alergias) campos.alergias = 'Nega';
   if (!campos.cronicas) campos.cronicas = 'Nega';
@@ -835,6 +853,39 @@ app.post("/api/atendimento/atualizar-triagem", async (req, res) => {
   } catch (e) {
     console.error("Erro em /api/atendimento/atualizar-triagem:", e);
     return res.status(500).json({ ok: false, error: "Erro ao atualizar triagem" });
+  }
+});
+
+// ── ROTA PÚBLICA: busca paciente por WhatsApp para autopreenchimento ──────────
+// Sem autenticação — retorna apenas campos básicos para UX de retorno
+app.get("/api/paciente/buscar", rlGeral, async (req, res) => {
+  try {
+    let tel = (req.query.tel || "").replace(/\D/g, "");
+    // Normaliza: remove DDI 55 se presente
+    if (tel.length > 11 && tel.startsWith("55")) tel = tel.slice(2);
+    if (tel.length < 10) return res.json({ ok: false });
+    // Busca o atendimento mais recente do paciente com este número
+    const result = await pool.query(
+      `SELECT nome, tel, data_nascimento
+         FROM fila_atendimentos
+        WHERE regexp_replace(tel, '\D', '', 'g') LIKE $1
+        ORDER BY criado_em DESC
+        LIMIT 1`,
+      [`%${tel}`]
+    );
+    if (result.rows.length === 0) return res.json({ ok: false });
+    const p = result.rows[0];
+    return res.json({
+      ok: true,
+      paciente: {
+        nome: p.nome || "",
+        tel: p.tel || "",
+        data_nascimento: p.data_nascimento || ""
+      }
+    });
+  } catch (e) {
+    console.error("Erro em /api/paciente/buscar:", e);
+    return res.json({ ok: false });
   }
 });
 
