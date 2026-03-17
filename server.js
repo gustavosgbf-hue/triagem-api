@@ -541,9 +541,11 @@ function montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno, linkAssumir, m
     }).join("");
   }
   return `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#060d0b;color:#fff;border-radius:12px;overflow:hidden">
-    <div style="background:linear-gradient(135deg,#b4e05a,#5ee0a0);padding:20px 28px"><h2 style="margin:0;color:#051208;font-size:18px">Nova triagem - ConsultaJa24h</h2></div>
+    <div style="background:linear-gradient(135deg,#b4e05a,#5ee0a0);padding:20px 28px"><h2 style="margin:0;color:#051208;font-size:18px">Novo paciente aguardando atendimento — ConsultaJá24h</h2></div>
     <div style="padding:28px">
-      <table style="width:100%;border-collapse:collapse;margin-bottom:24px">
+      <div style="margin-bottom:18px;padding:10px 16px;background:rgba(94,224,160,.07);border:1px solid rgba(94,224,160,.2);border-radius:10px;font-size:12px;color:rgba(94,224,160,.85)">
+        ✅ Pagamento confirmado automaticamente via PagBank
+      </div>
         <tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px;width:140px">Paciente</td><td style="padding:8px 0;font-weight:600">${nome||"-"}</td></tr>
         <tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">WhatsApp</td><td style="padding:8px 0;font-weight:600">${telLimpo}</td></tr>
         <tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">Modalidade</td><td style="padding:8px 0;font-weight:600">${tipoLabel}</td></tr>
@@ -840,83 +842,33 @@ app.post("/api/atendimento/atualizar-triagem", async (req, res) => {
       return res.json({ ok: true, atendimentoId: at.id });
     }
 
-    // ── CONSULTA IMEDIATA: intercepta para aprovação do admin ──────────────
-    // 1. Gera token JWT de aprovação (10 min)
-    const token = jwt.sign({ atendimentoId, acao: "aprovacao" }, JWT_SECRET, { expiresIn: "10m" });
-
-    // 2. Salva triagem + status aguardando_aprovacao + token
+    // ── CONSULTA IMEDIATA: pagamento já confirmado pelo PagBank — libera direto ─
+    // Status vai direto para 'aguardando' sem passar por aprovação manual
     const result = await pool.query(
       `UPDATE fila_atendimentos
           SET triagem=$2, queixa=$3, idade=$4, sexo=$5, alergias=$6, cronicas=$7,
-              medicacoes=$8, solicita=$9, status='aguardando_aprovacao', aprovacao_token=$10
+              medicacoes=$8, solicita=$9, status='aguardando', aprovacao_token=NULL
         WHERE id=$1 AND status IN ('triagem','aguardando','aguardando_aprovacao')
         RETURNING id,nome,tel,cpf,tipo,triagem,tel_documentos`,
       [atendimentoId,triagem,campos.queixa||triagem,campos.idade||"",campos.sexo||"",
-       campos.alergias||"",campos.cronicas||"",campos.medicacoes||"",campos.solicita||"",token]
+       campos.alergias||"",campos.cronicas||"",campos.medicacoes||"",campos.solicita||""]
     );
     if (result.rowCount === 0) return res.status(404).json({ ok: false, error: "Atendimento nao encontrado" });
     const at = result.rows[0];
 
-    // 3. Envia e-mail apenas para o admin com links de aprovação
-    const API_URL  = process.env.API_URL  || "https://triagem-api.onrender.com";
     const SITE_URL = process.env.SITE_URL || "https://consultaja24h.com.br";
-    const RESEND_KEY = process.env.RESEND_API_KEY;
-    const linkLiberar  = `${API_URL}/api/aprovacao/liberar?id=${at.id}&token=${encodeURIComponent(token)}`;
-    const linkCancelar = `${API_URL}/api/aprovacao/cancelar?id=${at.id}&token=${encodeURIComponent(token)}`;
-    const ADMIN_EMAIL  = "gustavosgbf@gmail.com";
+    const linkRetorno = `${SITE_URL}/triagem.html?consulta=${at.id}`;
+    const tipoLabel = at.tipo === "video" ? "Vídeo" : "Chat";
+    const agora = new Date().toLocaleString("pt-BR", { timeZone: "America/Fortaleza" });
+    appendToSheet("Atendimentos",[agora,at.nome||"",at.tel||"",at.cpf||"","Aguardando","",at.triagem||"",at.tipo||"","",String(at.id)]).catch(()=>{});
 
-    if (RESEND_KEY) {
-      const htmlAdmin = `
-        <div style="font-family:sans-serif;max-width:520px;margin:0 auto;background:#060d0b;color:#fff;border-radius:12px;overflow:hidden">
-          <div style="background:#1a2e1a;padding:20px 24px;border-bottom:1px solid rgba(255,255,255,.08)">
-            <h2 style="margin:0;font-size:1.05rem;color:#b4e05a">⚕️ Novo paciente aguardando aprovação</h2>
-          </div>
-          <div style="padding:24px">
-            <table style="width:100%;border-collapse:collapse;margin-bottom:20px">
-              <tr><td style="color:rgba(255,255,255,.4);padding:5px 0;font-size:.82rem">Paciente</td><td style="color:#fff;font-weight:600">${at.nome||"—"}</td></tr>
-              <tr><td style="color:rgba(255,255,255,.4);padding:5px 0;font-size:.82rem">Telefone</td><td style="color:#fff">${at.tel||"—"}</td></tr>
-              <tr><td style="color:rgba(255,255,255,.4);padding:5px 0;font-size:.82rem">Modalidade</td><td style="color:#fff">${at.tipo==="video"?"Vídeo":"Chat"}</td></tr>
-              <tr><td style="color:rgba(255,255,255,.4);padding:5px 0;font-size:.82rem;vertical-align:top">Triagem</td><td style="color:#fff;font-size:.82rem;line-height:1.5">${(at.triagem||"—").split("\n").join("<br>")}</td></tr>
-            </table>
-            <p style="font-size:.75rem;color:rgba(255,255,255,.4);margin-bottom:20px">
-              ⏱ Liberação automática em <strong style="color:#b4e05a">90 segundos</strong> se nenhuma ação for tomada.
-            </p>
-            <div style="display:flex;gap:12px;flex-wrap:wrap">
-              <a href="${linkLiberar}"
-                 style="flex:1;min-width:150px;display:block;text-align:center;padding:13px 18px;border-radius:10px;background:#5ee0a0;color:#051208;font-weight:700;font-size:.88rem;text-decoration:none">
-                ✅ Liberar atendimento
-              </a>
-              <a href="${linkCancelar}"
-                 style="flex:1;min-width:150px;display:block;text-align:center;padding:13px 18px;border-radius:10px;background:#ff5f57;color:#fff;font-weight:700;font-size:.88rem;text-decoration:none">
-                ❌ Cancelar (não pagou)
-              </a>
-            </div>
-          </div>
-        </div>`;
+    await enviarEmailMedicos({
+      nome: at.nome, tel: at.tel, tipo: at.tipo, triagem, linkRetorno,
+      atendimentoId: at.id, horarioAgendado: null, horarioAgendadoRaw: null,
+      subject: `Novo paciente aguardando atendimento — ${at.nome||"Paciente"}`
+    });
 
-      fetch("https://api.resend.com/emails", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${RESEND_KEY}` },
-        body: JSON.stringify({
-          from: "ConsultaJa24h <contato@consultaja24h.com.br>",
-          to:   [ADMIN_EMAIL],
-          subject: `⚕️ Aprovar pagamento — ${at.nome||"Paciente"} (#${at.id})`,
-          html: htmlAdmin
-        })
-      }).then(r=>r.json())
-        .then(d=>{ if(d.id) console.log(`[APROVACAO] E-mail admin enviado — #${at.id}`); else console.warn("[APROVACAO] Resend recusou:", JSON.stringify(d)); })
-        .catch(e=>console.error("[APROVACAO] Erro ao enviar e-mail admin:", e.message));
-    } else {
-      console.warn("[APROVACAO] RESEND_API_KEY não definida — e-mail admin suprimido.");
-    }
-
-    // 4. Timer de 90s: libera automaticamente se admin não agiu
-    setTimeout(async () => {
-      try { await liberarAtendimentoParaMedicos(at.id); }
-      catch(e) { console.error("[APROVACAO] Erro no timer de liberação automática:", e.message); }
-    }, 90_000);
-
-    console.log(`[APROVACAO] Atendimento #${at.id} aguardando aprovação admin (90s timeout).`);
+    console.log(`[TRIAGEM] Atendimento #${at.id} liberado direto — pagamento já confirmado via PagBank.`);
     return res.json({ ok: true, atendimentoId: at.id });
 
   } catch (e) {
