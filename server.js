@@ -434,11 +434,11 @@ app.post("/api/pagbank/order", async (req, res) => {
       items: [{
         name:        "Consulta Médica Online — ConsultaJá24h",
         quantity:    1,
-        unit_amount: Math.round(valor * 100) // centavos
+        unit_amount: Math.round(valor * 4990) // centavos
       }],
       // ✅ qr_codes (não charges) — conforme doc oficial PagBank para QR Code PIX
       qr_codes: [{
-        amount:          { value: Math.round(valor * 100) },
+        amount:          { value: Math.round(valor * 4990) },
         expiration_date: expiracaoISO
       }],
       notification_urls: [
