@@ -457,7 +457,7 @@ app.post("/api/pagbank/order", async (req, res) => {
     });
 
     const data = await response.json();
-    console.log("[PAGBANK] Order criada:", JSON.stringify(data).slice(0, 300));
+    console.log("PAGBANK COMPLETO:", JSON.stringify(data, null, 2));
 
     if (!response.ok) {
       console.error("[PAGBANK] Erro PagBank:", JSON.stringify(data));
