@@ -402,86 +402,44 @@ const autenticarMedico = checkMedico;
 app.post("/api/triage", rlTriagem, handleChat);
 app.post("/api/doctor", handleChat);
 
-// PAGAMENTO MANUAL VIA PIX INTER
-// O paciente vê o QR fixo do Inter, paga e clica "Já paguei"
-// O sistema registra o pré-cadastro e libera a triagem
-// Verificação manual pelo admin no app Inter
+// ── PAGBANK — FLUXO ÚNICO DE PAGAMENTO ────────────────────────────────────────
+// Rotas /api/payment (Inter/manual) foram removidas.
+// Todo pagamento passa por aqui. Backend é a única fonte da verdade.
 
-const PIX_CHAVE = process.env.PIX_CHAVE_INTER || ""; // Chave Pix do Inter (CNPJ ou email)
+const PAGBANK_TOKEN = process.env.PAGBANK_TOKEN?.trim();
+const PAGBANK_URL   = "https://api.pagseguro.com";
 
-app.post("/api/payment", async (req, res) => {
-  try {
-    const { nome } = req.body || {};
-    // Gera um ID único para rastrear este pagamento
-    const paymentId = "PIX-" + Date.now() + "-" + Math.random().toString(36).slice(2,8).toUpperCase();
-    console.log("[PAYMENT-MANUAL] Novo pagamento gerado:", paymentId, "| Paciente:", nome || "-");
-    return res.json({
-      ok: true,
-      payment_id: paymentId,
-      status: "pending",
-      manual: true,  // sinaliza para o frontend que é pagamento manual
-      pix_chave: PIX_CHAVE
-    });
-  } catch (e) {
-    console.error("Erro em /api/payment:", e);
-    return res.status(500).json({ ok: false, error: "Erro interno" });
-  }
-});
+if (!PAGBANK_TOKEN) {
+  console.error("[PAGBANK] Token não configurado");
+}
 
-// Confirmar pagamento manual (paciente clicou em "Já paguei")
-app.post("/api/payment/confirmar-manual", async (req, res) => {
-  try {
-    const { paymentId, atendimentoId } = req.body || {};
-    if (!paymentId) return res.status(400).json({ ok: false, error: "paymentId obrigatorio" });
-    console.log("[PAYMENT-MANUAL] Confirmação manual:", paymentId, "| atendimentoId:", atendimentoId || "sem pre-registro");
-    // Se já tem atendimentoId (pré-registro), atualiza o payment_id no registro
-    if (atendimentoId) {
-      await pool.query(
-        `UPDATE fila_atendimentos SET triagem='(Pagamento confirmado — aguardando triagem)' WHERE id=$1 AND status='triagem'`,
-        [atendimentoId]
-      ).catch(e => console.warn("[PAYMENT-MANUAL] Update opcional falhou:", e.message));
-    }
-    return res.json({ ok: true, status: "approved" });
-  } catch (e) {
-    console.error("Erro em /api/payment/confirmar-manual:", e);
-    return res.status(500).json({ ok: false, error: "Erro interno" });
-  }
-});
-
-// Status do pagamento (polling do frontend)
-app.get("/api/payment/:id", async (req, res) => {
-  // Pagamento manual: sempre retorna pending até o front confirmar via botão
-  // Esta rota não é mais usada no fluxo manual, mas mantida para compatibilidade
-  return res.json({ ok: true, status: "pending" });
-});
-
-// ── PAGBANK SANDBOX ────────────────────────────────────────────────────────────
-// Token sandbox (trocar por PAGBANK_TOKEN em produção)
-const PAGBANK_TOKEN = process.env.PAGBANK_TOKEN || "b9771a48-fbaa-4aea-892c-8db52046ac6b3e0e41644d65b0242be53689e0dce6135215-7fbe-4c57-aaaf-2e277a9b28fe";
-const PAGBANK_URL   = process.env.PAGBANK_ENV === "production"
-  ? "https://api.pagseguro.com"
-  : "https://sandbox.api.pagseguro.com";
-
-// Criar order PIX no PagBank (sandbox ou produção)
+// Criar order PIX no PagBank
 app.post("/api/pagbank/order", async (req, res) => {
   try {
     const { nome, email, cpf, valor, referenceId } = req.body || {};
-    if (!nome || !email || !cpf || !valor) return res.status(400).json({ ok: false, error: "nome, email, cpf e valor obrigatorios" });
+    if (!nome || !cpf || !valor) return res.status(400).json({ ok: false, error: "nome, cpf e valor obrigatorios" });
+    if (!PAGBANK_TOKEN) return res.status(503).json({ ok: false, error: "Gateway de pagamento indisponivel" });
+
+    // Expiração: 30 minutos a partir de agora (formato com offset BRT)
+    const expiracao = new Date(Date.now() + 30 * 60 * 1000);
+    const expiracaoISO = expiracao.toISOString().replace("Z", "-03:00");
 
     const orderBody = {
-      reference_id: referenceId || ("CJ-" + Date.now()),
+      reference_id: referenceId || ("CJ-" + Date.now() + "-" + Math.random().toString(36).slice(2,6).toUpperCase()),
       customer: {
-        name: nome,
-        email: email,
+        name:   nome,
+        email:  email || `paciente+${cpf.replace(/\D/g,"")}@consultaja24h.com.br`,
         tax_id: cpf.replace(/\D/g, "")
       },
       items: [{
-        name: "Consulta Médica Online — ConsultaJá24h",
-        quantity: 1,
-        unit_amount: Math.round(valor * 100) // em centavos
+        name:        "Consulta Médica Online — ConsultaJá24h",
+        quantity:    1,
+        unit_amount: Math.round(valor * 100) // centavos
       }],
+      // ✅ qr_codes (não charges) — conforme doc oficial PagBank para QR Code PIX
       qr_codes: [{
-        amount: { value: Math.round(valor * 100) }
+        amount:          { value: Math.round(valor * 100) },
+        expiration_date: expiracaoISO
       }],
       notification_urls: [
         `${process.env.API_URL || "https://triagem-api.onrender.com"}/api/pagbank/webhook`
@@ -492,25 +450,36 @@ app.post("/api/pagbank/order", async (req, res) => {
       method: "POST",
       headers: {
         "Authorization": `Bearer ${PAGBANK_TOKEN}`,
-        "Content-Type": "application/json",
-        "accept": "application/json"
+        "Content-Type":  "application/json",
+        "accept":        "application/json"
       },
       body: JSON.stringify(orderBody)
     });
 
     const data = await response.json();
-    console.log("[PAGBANK] Order criada:", JSON.stringify(data).slice(0, 200));
+    console.log("[PAGBANK] Order criada:", JSON.stringify(data).slice(0, 300));
 
-    if (!response.ok) return res.status(400).json({ ok: false, error: data.error_messages || data, raw: data });
+    if (!response.ok) {
+      console.error("[PAGBANK] Erro PagBank:", JSON.stringify(data));
+      return res.status(400).json({ ok: false, error: data.error_messages || "Erro ao criar cobrança", raw: data });
+    }
 
-    const qrCode = data.qr_codes?.[0];
+    const qrCode       = data.qr_codes?.[0];
+    const pixCopaCola  = qrCode?.text;
+    const qrImageLink  = qrCode?.links?.find(l => l.media === "image/png" || l.rel?.includes("PNG"))?.href ?? null;
+
+    if (!pixCopaCola) {
+      console.error("[PAGBANK] qr_codes ausente na resposta:", JSON.stringify(data));
+      return res.status(502).json({ ok: false, error: "PagBank nao retornou QR Code. Verifique chave PIX cadastrada na conta." });
+    }
+
     return res.json({
-      ok: true,
-      order_id: data.id,
-      reference_id: data.reference_id,
-      status: data.status,
-      qr_code_text: qrCode?.text,        // copia e cola
-      qr_code_image: qrCode?.links?.find(l => l.media === "image/png")?.href // imagem PNG
+      ok:             true,
+      order_id:       data.id,
+      reference_id:   data.reference_id,
+      status:         data.status,
+      qr_code_text:   pixCopaCola,   // copia e cola (payload EMV)
+      qr_code_image:  qrImageLink    // URL da imagem PNG (pode ser null — frontend gera localmente)
     });
   } catch (e) {
     console.error("[PAGBANK] Erro ao criar order:", e);
@@ -518,46 +487,73 @@ app.post("/api/pagbank/order", async (req, res) => {
   }
 });
 
-// Webhook PagBank — recebe notificações de pagamento
+// Webhook PagBank — notificação de pagamento confirmado
+// Fluxo: valida payload → responde 200 → processa de forma assíncrona
 app.post("/api/pagbank/webhook", async (req, res) => {
+  // 1. Valida que veio JSON parseável com estrutura mínima
+  const event = req.body;
+  if (!event || typeof event !== "object") {
+    console.warn("[PAGBANK-WEBHOOK] Payload invalido recebido");
+    return res.status(400).end();
+  }
+
+  const orderId    = event?.data?.id  || event?.id;
+  const orderRefRaw = event?.data?.reference_id ?? event?.reference_id;
+  const orderRef   = typeof orderRefRaw === "string" ? orderRefRaw : String(orderRefRaw || "");
+  const charges    = event?.data?.charges || event?.charges || [];
+  const pago       = charges.some(c => c.status === "PAID");
+
+  console.log("[PAGBANK-WEBHOOK] Evento recebido:", JSON.stringify({ orderId, orderRef, pago }).slice(0, 200));
+
+  // 2. Responde 200 imediatamente para o PagBank não fazer retry
+  res.sendStatus(200);
+
+  // 3. Processamento assíncrono
+  if (!pago || !orderId) return;
+
   try {
-    const event = req.body;
-    console.log("[PAGBANK-WEBHOOK] Evento recebido:", JSON.stringify(event).slice(0, 300));
-
-    const orderId    = event?.data?.id || event?.id;
-    const orderRefRaw = event?.data?.reference_id ?? event?.reference_id;
-    const orderRef   = typeof orderRefRaw === "string" ? orderRefRaw : String(orderRefRaw || "");
-    const charges    = event?.data?.charges || event?.charges || [];
-    const pago       = charges.some(c => c.status === "PAID");
-
-    if (pago && orderRef) {
-      // Atualiza agendamento se o reference_id for um ID de agendamento
-      const agId = Number.parseInt(orderRef.replace("CJ-", "").split("-")[0], 10);
-      if (Number.isInteger(agId) && agId > 0) {
-        await pool.query(
-          `UPDATE agendamentos SET status='confirmado', payment_id=$1 WHERE id=$2 AND status='pendente'`,
-          [orderId, agId]
-        ).catch(e => console.warn("[PAGBANK-WEBHOOK] Update agendamento falhou:", e.message));
+    // Atualiza agendamento confirmado via PIX (fluxo de agendamento)
+    // reference_id formato: CJ-{agendamentoId}-... ou CJ-{timestamp}-...
+    const partes = orderRef.replace(/^CJ-/, "").split("-");
+    const agId   = Number.parseInt(partes[0], 10);
+    if (Number.isInteger(agId) && agId > 0) {
+      const upd = await pool.query(
+        `UPDATE agendamentos SET status='confirmado', payment_id=$1 WHERE id=$2 AND status='pendente' RETURNING id`,
+        [orderId, agId]
+      );
+      if (upd.rowCount > 0) {
+        console.log("[PAGBANK-WEBHOOK] Agendamento #" + agId + " confirmado via PIX. Order:", orderId);
       }
-      console.log("[PAGBANK-WEBHOOK] Pagamento confirmado — order:", orderId, "ref:", orderRef);
     }
 
-    return res.sendStatus(200);
+    // Atualiza atendimento imediato: se há fila_atendimentos com pagamento pendente desta order
+    // (pré-registro criado antes do pagamento para rastreabilidade)
+    await pool.query(
+      `UPDATE fila_atendimentos
+       SET status = CASE WHEN status = 'triagem' THEN 'aguardando' ELSE status END,
+           triagem = CASE WHEN status = 'triagem' THEN '(Pagamento confirmado — aguardando triagem)' ELSE triagem END
+       WHERE status = 'triagem'
+         AND (triagem LIKE '%(Aguardando pagamento)%' OR triagem LIKE '%(pagamento pendente)%')
+         AND criado_em > NOW() - INTERVAL '2 hours'`
+    ).catch(e => console.warn("[PAGBANK-WEBHOOK] Update fila opcional falhou:", e.message));
+
+    console.log("[PAGBANK-WEBHOOK] ✅ Processado — order:", orderId, "ref:", orderRef);
   } catch (e) {
-    console.error("[PAGBANK-WEBHOOK] Erro:", e);
-    return res.sendStatus(200); // sempre 200 pro PagBank não retentar indefinidamente
+    console.error("[PAGBANK-WEBHOOK] Erro no processamento:", e.message);
   }
 });
 
-// Consultar status de uma order PagBank
+// Consultar status de uma order PagBank — usado como fallback de polling
 app.get("/api/pagbank/order/:id", async (req, res) => {
   try {
+    if (!PAGBANK_TOKEN) return res.status(503).json({ ok: false, error: "Gateway indisponivel" });
     const response = await fetch(`${PAGBANK_URL}/orders/${req.params.id}`, {
       headers: { "Authorization": `Bearer ${PAGBANK_TOKEN}`, "accept": "application/json" }
     });
     const data = await response.json();
-    const pago = data.charges?.some(c => c.status === "PAID");
-    return res.json({ ok: true, status: data.status, pago, raw: data });
+    // Verifica pagamento tanto em charges quanto em qr_codes
+    const pago = data.charges?.some(c => c.status === "PAID") || false;
+    return res.json({ ok: true, status: data.status, pago });
   } catch (e) {
     return res.status(500).json({ ok: false, error: e.message });
   }
