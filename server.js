@@ -976,7 +976,7 @@ app.get("/api/chat/:atendimentoId", async (req, res) => {
 
 app.get("/api/atendimento/status/:id", async (req, res) => {
   try {
-    const result = await pool.query(`SELECT id,status,tipo,medico_nome,meet_link,criado_em,assumido_em,encerrado_em,nome,tel,cpf,data_nascimento,idade,sexo,alergias,cronicas,medicacoes,queixa FROM fila_atendimentos WHERE id=$1`,[req.params.id]);
+    const result = await pool.query(`SELECT id,status,tipo,medico_nome,meet_link,criado_em,assumido_em,encerrado_em,nome,tel,cpf,data_nascimento,idade,sexo,alergias,cronicas,medicacoes,queixa,email FROM fila_atendimentos WHERE id=$1`,[req.params.id]);
     if (result.rowCount===0) return res.status(404).json({ ok: false, error: "Atendimento nao encontrado" });
     return res.json({ ok: true, atendimento: result.rows[0] });
   } catch (e) { return res.status(500).json({ ok: false, error: "Erro ao buscar status" }); }
