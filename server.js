@@ -911,8 +911,7 @@ app.post("/api/atendimento/atualizar-triagem", async (req, res) => {
               <tr><td style="color:rgba(255,255,255,.4);padding:5px 0;font-size:.82rem">Paciente</td><td style="color:#fff;font-weight:600">${at.nome||"—"}</td></tr>
               <tr><td style="color:rgba(255,255,255,.4);padding:5px 0;font-size:.82rem">Telefone</td><td style="color:#fff">${at.tel||"—"}</td></tr>
               <tr><td style="color:rgba(255,255,255,.4);padding:5px 0;font-size:.82rem">Modalidade</td><td style="color:#fff">${at.tipo==="video"?"Vídeo":"Chat"}</td></tr>
-              <tr><td style="color:rgba(255,255,255,.4);padding:5px 0;font-size:.82rem;vertical-align:top">Triagem</td><td style="color:#fff;font-size:.82rem;line-height:1.5">${(at.triagem||"—").replace(/
-/g,"<br>")}</td></tr>
+              <tr><td style="color:rgba(255,255,255,.4);padding:5px 0;font-size:.82rem;vertical-align:top">Triagem</td><td style="color:#fff;font-size:.82rem;line-height:1.5">${(at.triagem||"—").split("\n").join("<br>")}</td></tr>
             </table>
             <p style="font-size:.75rem;color:rgba(255,255,255,.4);margin-bottom:20px">
               ⏱ Liberação automática em <strong style="color:#b4e05a">90 segundos</strong> se nenhuma ação for tomada.
