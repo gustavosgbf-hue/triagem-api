@@ -402,24 +402,20 @@ const autenticarMedico = checkMedico;
 app.post("/api/triage", rlTriagem, handleChat);
 app.post("/api/doctor", handleChat);
 
-// ── PAGBANK — FLUXO ÚNICO DE PAGAMENTO ────────────────────────────────────────
+// ── PAGBANK ───────────────────────────────────────────────────────────────────
 const PAGBANK_TOKEN = process.env.PAGBANK_TOKEN?.trim();
 const PAGBANK_URL   = "https://api.pagseguro.com";
+const VALOR_CENTAVOS = 4990; // R$ 49,90 — fixo no backend
 
-if (!PAGBANK_TOKEN) {
-  console.error("[PAGBANK] Token não configurado");
-}
+if (!PAGBANK_TOKEN) console.error("[PAGBANK] Token não configurado");
 
-// Criar order PIX no PagBank
 app.post("/api/pagbank/order", async (req, res) => {
   try {
     const { nome, email, cpf } = req.body || {};
     if (!nome || !cpf) return res.status(400).json({ ok: false, error: "nome e cpf obrigatorios" });
     if (!PAGBANK_TOKEN) return res.status(503).json({ ok: false, error: "Gateway de pagamento indisponivel" });
 
-    const VALOR_CENTAVOS = 4990; // R$ 49,90 — fixo no backend, não aceito do frontend
-
-    const expiracao = new Date(Date.now() + 30 * 60 * 1000);
+    const expiracao    = new Date(Date.now() + 30 * 60 * 1000);
     const expiracaoISO = expiracao.toISOString().replace("Z", "-03:00");
 
     const orderBody = {
@@ -429,15 +425,8 @@ app.post("/api/pagbank/order", async (req, res) => {
         email:  email || `paciente+${cpf.replace(/\D/g,"")}@consultaja24h.com.br`,
         tax_id: cpf.replace(/\D/g, "")
       },
-      items: [{
-        name:        "Consulta Médica Online — ConsultaJá24h",
-        quantity:    1,
-        unit_amount: VALOR_CENTAVOS
-      }],
-      qr_codes: [{
-        amount:          { value: VALOR_CENTAVOS },
-        expiration_date: expiracaoISO
-      }],
+      items: [{ name: "Consulta Médica Online — ConsultaJá24h", quantity: 1, unit_amount: VALOR_CENTAVOS }],
+      qr_codes: [{ amount: { value: VALOR_CENTAVOS }, expiration_date: expiracaoISO }],
       notification_urls: [
         `${process.env.API_URL || "https://triagem-api.onrender.com"}/api/pagbank/webhook`
       ]
@@ -445,38 +434,27 @@ app.post("/api/pagbank/order", async (req, res) => {
 
     const response = await fetch(`${PAGBANK_URL}/orders`, {
       method: "POST",
-      headers: {
-        "Authorization": `Bearer ${PAGBANK_TOKEN}`,
-        "Content-Type":  "application/json",
-        "accept":        "application/json"
-      },
+      headers: { "Authorization": `Bearer ${PAGBANK_TOKEN}`, "Content-Type": "application/json", "accept": "application/json" },
       body: JSON.stringify(orderBody)
     });
 
     const data = await response.json();
-    console.log("[PAGBANK] Order criada:", JSON.stringify(data).slice(0, 400));
+    console.log("[PAGBANK] Order:", JSON.stringify(data).slice(0, 400));
 
     if (!response.ok) {
       console.error("[PAGBANK] Erro:", JSON.stringify(data));
-      return res.status(400).json({ ok: false, error: data.error_messages || "Erro ao criar cobrança", raw: data });
+      return res.status(400).json({ ok: false, error: data.error_messages || "Erro ao criar cobrança" });
     }
 
-    const qrCode      = data.qr_codes?.[0];
-    const pixCopaCola = qrCode?.text;
-
-    if (!pixCopaCola) {
-      console.error("[PAGBANK] qr_codes ausente:", JSON.stringify(data));
+    const qrCode = data.qr_codes?.[0];
+    if (!qrCode?.text) {
+      console.error("[PAGBANK] QR Code ausente:", JSON.stringify(data));
       return res.status(502).json({ ok: false, error: "PagBank nao retornou QR Code. Verifique chave PIX cadastrada na conta." });
     }
 
-    return res.json({
-      ok:           true,
-      order_id:     data.id,
-      reference_id: data.reference_id,
-      qr_code_text: pixCopaCola
-    });
+    return res.json({ ok: true, order_id: data.id, qr_code_text: qrCode.text });
   } catch (e) {
-    console.error("[PAGBANK] Erro ao criar order:", e);
+    console.error("[PAGBANK] Erro:", e);
     return res.status(500).json({ ok: false, error: e.message });
   }
 });
