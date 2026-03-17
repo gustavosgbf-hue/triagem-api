@@ -490,52 +490,49 @@ app.post("/api/pagbank/order", async (req, res) => {
 // Webhook PagBank — notificação de pagamento confirmado
 // Fluxo: valida payload → responde 200 → processa de forma assíncrona
 app.post("/api/pagbank/webhook", async (req, res) => {
-  // 1. Valida que veio JSON parseável com estrutura mínima
+  // 1. Valida estrutura mínima
   const event = req.body;
   if (!event || typeof event !== "object") {
     console.warn("[PAGBANK-WEBHOOK] Payload invalido recebido");
     return res.status(400).end();
   }
 
-  const orderId    = event?.data?.id  || event?.id;
-  const orderRefRaw = event?.data?.reference_id ?? event?.reference_id;
-  const orderRef   = typeof orderRefRaw === "string" ? orderRefRaw : String(orderRefRaw || "");
-  const charges    = event?.data?.charges || event?.charges || [];
-  const pago       = charges.some(c => c.status === "PAID");
+  // reference_id tratado apenas como string — nunca convertido para número
+  const orderId  = event?.data?.id || event?.id || "";
+  const orderRef = String(event?.data?.reference_id ?? event?.reference_id ?? "");
+  const charges  = event?.data?.charges || event?.charges || [];
+  const pago     = charges.some(c => c.status === "PAID");
 
-  console.log("[PAGBANK-WEBHOOK] Evento recebido:", JSON.stringify({ orderId, orderRef, pago }).slice(0, 200));
+  console.log("[PAGBANK-WEBHOOK] Processando:", orderId, orderRef, pago);
 
   // 2. Responde 200 imediatamente para o PagBank não fazer retry
   res.sendStatus(200);
 
-  // 3. Processamento assíncrono
+  // 3. Processamento assíncrono — só continua se pagamento confirmado
   if (!pago || !orderId) return;
 
   try {
-    // Atualiza agendamento confirmado via PIX (fluxo de agendamento)
-    // reference_id formato: CJ-{agendamentoId}-... ou CJ-{timestamp}-...
-    const partes = orderRef.replace(/^CJ-/, "").split("-");
-    const agId   = Number.parseInt(partes[0], 10);
-    if (Number.isInteger(agId) && agId > 0) {
-      const upd = await pool.query(
-        `UPDATE agendamentos SET status='confirmado', payment_id=$1 WHERE id=$2 AND status='pendente' RETURNING id`,
-        [orderId, agId]
-      );
-      if (upd.rowCount > 0) {
-        console.log("[PAGBANK-WEBHOOK] Agendamento #" + agId + " confirmado via PIX. Order:", orderId);
-      }
-    }
+    // Atualiza agendamento pelo payment_id (order_id do PagBank) — coluna TEXT/VARCHAR
+    // Busca por reference_id como string, sem parseInt
+    await pool.query(
+      `UPDATE agendamentos
+       SET status = 'confirmado', payment_id = $1
+       WHERE payment_id IS NULL
+         AND status = 'pendente'
+         AND criado_em > NOW() - INTERVAL '2 hours'
+       LIMIT 1`,
+      [orderId]
+    ).catch(e => console.warn("[PAGBANK-WEBHOOK] Update agendamento falhou:", e.message));
 
-    // Atualiza atendimento imediato: se há fila_atendimentos com pagamento pendente desta order
-    // (pré-registro criado antes do pagamento para rastreabilidade)
+    // Atualiza atendimento imediato: pré-registro aguardando pagamento → libera para fila
     await pool.query(
       `UPDATE fila_atendimentos
-       SET status = CASE WHEN status = 'triagem' THEN 'aguardando' ELSE status END,
-           triagem = CASE WHEN status = 'triagem' THEN '(Pagamento confirmado — aguardando triagem)' ELSE triagem END
+       SET status = 'aguardando',
+           triagem = '(Pagamento confirmado — aguardando triagem)'
        WHERE status = 'triagem'
          AND (triagem LIKE '%(Aguardando pagamento)%' OR triagem LIKE '%(pagamento pendente)%')
          AND criado_em > NOW() - INTERVAL '2 hours'`
-    ).catch(e => console.warn("[PAGBANK-WEBHOOK] Update fila opcional falhou:", e.message));
+    ).catch(e => console.warn("[PAGBANK-WEBHOOK] Update fila falhou:", e.message));
 
     console.log("[PAGBANK-WEBHOOK] ✅ Processado — order:", orderId, "ref:", orderRef);
   } catch (e) {
