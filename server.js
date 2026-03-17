@@ -403,9 +403,6 @@ app.post("/api/triage", rlTriagem, handleChat);
 app.post("/api/doctor", handleChat);
 
 // ── PAGBANK — FLUXO ÚNICO DE PAGAMENTO ────────────────────────────────────────
-// Rotas /api/payment (Inter/manual) foram removidas.
-// Todo pagamento passa por aqui. Backend é a única fonte da verdade.
-
 const PAGBANK_TOKEN = process.env.PAGBANK_TOKEN?.trim();
 const PAGBANK_URL   = "https://api.pagseguro.com";
 
@@ -416,16 +413,17 @@ if (!PAGBANK_TOKEN) {
 // Criar order PIX no PagBank
 app.post("/api/pagbank/order", async (req, res) => {
   try {
-    const { nome, email, cpf, valor, referenceId } = req.body || {};
-    if (!nome || !cpf || !valor) return res.status(400).json({ ok: false, error: "nome, cpf e valor obrigatorios" });
+    const { nome, email, cpf } = req.body || {};
+    if (!nome || !cpf) return res.status(400).json({ ok: false, error: "nome e cpf obrigatorios" });
     if (!PAGBANK_TOKEN) return res.status(503).json({ ok: false, error: "Gateway de pagamento indisponivel" });
 
-    // Expiração: 30 minutos a partir de agora (formato com offset BRT)
+    const VALOR_CENTAVOS = 4990; // R$ 49,90 — fixo no backend, não aceito do frontend
+
     const expiracao = new Date(Date.now() + 30 * 60 * 1000);
     const expiracaoISO = expiracao.toISOString().replace("Z", "-03:00");
 
     const orderBody = {
-      reference_id: referenceId || ("CJ-" + Date.now() + "-" + Math.random().toString(36).slice(2,6).toUpperCase()),
+      reference_id: "CJ-" + Date.now() + "-" + Math.random().toString(36).slice(2,6).toUpperCase(),
       customer: {
         name:   nome,
         email:  email || `paciente+${cpf.replace(/\D/g,"")}@consultaja24h.com.br`,
@@ -434,11 +432,10 @@ app.post("/api/pagbank/order", async (req, res) => {
       items: [{
         name:        "Consulta Médica Online — ConsultaJá24h",
         quantity:    1,
-        unit_amount: Math.round(valor * 4990) // centavos
+        unit_amount: VALOR_CENTAVOS
       }],
-      // ✅ qr_codes (não charges) — conforme doc oficial PagBank para QR Code PIX
       qr_codes: [{
-        amount:          { value: Math.round(valor * 4990) },
+        amount:          { value: VALOR_CENTAVOS },
         expiration_date: expiracaoISO
       }],
       notification_urls: [
@@ -457,29 +454,26 @@ app.post("/api/pagbank/order", async (req, res) => {
     });
 
     const data = await response.json();
-    console.log("PAGBANK COMPLETO:", JSON.stringify(data, null, 2));
+    console.log("[PAGBANK] Order criada:", JSON.stringify(data).slice(0, 400));
 
     if (!response.ok) {
-      console.error("[PAGBANK] Erro PagBank:", JSON.stringify(data));
+      console.error("[PAGBANK] Erro:", JSON.stringify(data));
       return res.status(400).json({ ok: false, error: data.error_messages || "Erro ao criar cobrança", raw: data });
     }
 
-    const qrCode       = data.qr_codes?.[0];
-    const pixCopaCola  = qrCode?.text;
-    const qrImageLink  = qrCode?.links?.find(l => l.media === "image/png" || l.rel?.includes("PNG"))?.href ?? null;
+    const qrCode      = data.qr_codes?.[0];
+    const pixCopaCola = qrCode?.text;
 
     if (!pixCopaCola) {
-      console.error("[PAGBANK] qr_codes ausente na resposta:", JSON.stringify(data));
+      console.error("[PAGBANK] qr_codes ausente:", JSON.stringify(data));
       return res.status(502).json({ ok: false, error: "PagBank nao retornou QR Code. Verifique chave PIX cadastrada na conta." });
     }
 
     return res.json({
-      ok:             true,
-      order_id:       data.id,
-      reference_id:   data.reference_id,
-      status:         data.status,
-      qr_code_text:   pixCopaCola,   // copia e cola (payload EMV)
-      qr_code_image:  qrImageLink    // URL da imagem PNG (pode ser null — frontend gera localmente)
+      ok:           true,
+      order_id:     data.id,
+      reference_id: data.reference_id,
+      qr_code_text: pixCopaCola
     });
   } catch (e) {
     console.error("[PAGBANK] Erro ao criar order:", e);
