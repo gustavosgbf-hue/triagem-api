@@ -212,6 +212,8 @@ async function initDB() {
       ['solicita','TEXT'],
       ['agendamento_id','INTEGER'],
       ['horario_agendado','TIMESTAMP'],
+      ['email','TEXT'],
+      ['aprovacao_token','TEXT'],
     ];
     // Coluna para controle de lembrete de agendamento
     await pool.query(`ALTER TABLE agendamentos ADD COLUMN IF NOT EXISTS lembrete_enviado BOOLEAN DEFAULT false`).catch(()=>{});
@@ -813,43 +815,146 @@ function ehPlaceholder(triagem) {
   return t.includes("aguardando pagamento") || t.includes("triagem em andamento") || t.includes("aguardando resposta");
 }
 
+// ── Helper: libera atendimento para médicos (timer + endpoint de aprovação) ───
+async function liberarAtendimentoParaMedicos(atendimentoId) {
+  const r = await pool.query(
+    `UPDATE fila_atendimentos SET status='aguardando', aprovacao_token=NULL
+     WHERE id=$1 AND status='aguardando_aprovacao' RETURNING id,nome,tel,cpf,tipo,triagem,tel_documentos`,
+    [atendimentoId]
+  );
+  if (r.rowCount === 0) {
+    console.log(`[APROVACAO] #${atendimentoId} já foi liberado ou cancelado — ignorando.`);
+    return;
+  }
+  const at = r.rows[0];
+  const SITE_URL = process.env.SITE_URL || "https://consultaja24h.com.br";
+  const linkRetorno = `${SITE_URL}/triagem.html?consulta=${at.id}`;
+  const tipoLabel = at.tipo === "video" ? "Video" : "Chat";
+  const agora = new Date().toLocaleString("pt-BR", { timeZone: "America/Fortaleza" });
+  appendToSheet("Atendimentos",[agora,at.nome||"",at.tel||"",at.cpf||"","Aguardando","",at.triagem||"",at.tipo||"","",String(at.id)]).catch(()=>{});
+  await enviarEmailMedicos({
+    nome: at.nome, tel: at.tel, tipo: at.tipo, triagem: at.triagem, linkRetorno,
+    atendimentoId: at.id, horarioAgendado: null, horarioAgendadoRaw: null,
+    subject: `Nova triagem - ${at.nome||"Paciente"} (${tipoLabel})`
+  });
+  console.log(`[LIBERADO] Atendimento #${atendimentoId} liberado para médicos.`);
+}
+
 app.post("/api/atendimento/atualizar-triagem", async (req, res) => {
   try {
     const { atendimentoId, triagem, agendamentoId } = req.body || {};
     if (!atendimentoId || !triagem) return res.status(400).json({ ok: false, error: "atendimentoId e triagem sao obrigatorios" });
     const campos = parsearTriagem(triagem);
-    const result = await pool.query(
-      `UPDATE fila_atendimentos SET triagem=$2,queixa=$3,idade=$4,sexo=$5,alergias=$6,cronicas=$7,medicacoes=$8,solicita=$9,status='aguardando'
-       WHERE id=$1 AND status IN ('triagem','aguardando') RETURNING id,nome,tel,cpf,tipo,triagem,tel_documentos,medico_nome`,
-      [atendimentoId,triagem,campos.queixa||triagem,campos.idade||"",campos.sexo||"",campos.alergias||"",campos.cronicas||"",campos.medicacoes||"",campos.solicita||""]
-    );
-    if (result.rowCount === 0) return res.status(404).json({ ok: false, error: "Atendimento nao encontrado ou ja em andamento" });
-    const at = result.rows[0];
-    const SITE_URL = process.env.SITE_URL || "https://consultaja24h.com.br";
-    const linkRetorno = `${SITE_URL}/triagem.html?consulta=${at.id}`;
-    const tipoLabel = at.tipo === "video" ? "Video" : "Chat";
-    const agora = new Date().toLocaleString("pt-BR", { timeZone: "America/Fortaleza" });
-    // Buscar horário agendado se for agendamento
-    let horarioAgendado = null, horarioAgendadoRaw = null;
+
+    // ── AGENDAMENTO: fluxo original sem interceptação ──────────────────────
     if (agendamentoId) {
+      const result = await pool.query(
+        `UPDATE fila_atendimentos SET triagem=$2,queixa=$3,idade=$4,sexo=$5,alergias=$6,cronicas=$7,medicacoes=$8,solicita=$9,status='aguardando'
+         WHERE id=$1 AND status IN ('triagem','aguardando') RETURNING id,nome,tel,cpf,tipo,triagem,tel_documentos,medico_nome`,
+        [atendimentoId,triagem,campos.queixa||triagem,campos.idade||"",campos.sexo||"",campos.alergias||"",campos.cronicas||"",campos.medicacoes||"",campos.solicita||""]
+      );
+      if (result.rowCount === 0) return res.status(404).json({ ok: false, error: "Atendimento nao encontrado ou ja em andamento" });
+      const at = result.rows[0];
+      const SITE_URL = process.env.SITE_URL || "https://consultaja24h.com.br";
+      const linkRetorno = `${SITE_URL}/triagem.html?consulta=${at.id}`;
+      const tipoLabel = at.tipo === "video" ? "Video" : "Chat";
+      const agora = new Date().toLocaleString("pt-BR", { timeZone: "America/Fortaleza" });
       const agRow = await pool.query(`SELECT horario_agendado FROM agendamentos WHERE id=$1`,[agendamentoId]);
+      let horarioAgendado = null, horarioAgendadoRaw = null;
       if (agRow.rows[0]) {
         horarioAgendadoRaw = agRow.rows[0].horario_agendado;
         horarioAgendado = new Date(horarioAgendadoRaw).toLocaleString("pt-BR",{timeZone:"America/Fortaleza",day:"2-digit",month:"2-digit",year:"numeric",hour:"2-digit",minute:"2-digit"});
-        // Salva horario_agendado e agendamento_id na fila para filtrar da lista até a hora da consulta
         await pool.query(`UPDATE fila_atendimentos SET horario_agendado=$1, agendamento_id=$2 WHERE id=$3`,[horarioAgendadoRaw, agendamentoId, atendimentoId]);
       }
+      appendToSheet("Atendimentos",[agora,at.nome||"",at.tel||"",at.cpf||"","Aguardando","",triagem,at.tipo||"","",String(at.id)]).catch(e=>console.error("[Sheets]",e));
+      await enviarEmailMedicos({
+        nome: at.nome, tel: at.tel, tipo: at.tipo, triagem, linkRetorno,
+        atendimentoId: at.id, horarioAgendado, horarioAgendadoRaw,
+        subject: `Agendamento - ${at.nome||"Paciente"} (${tipoLabel}) - ${horarioAgendado}`
+      });
+      return res.json({ ok: true, atendimentoId: at.id });
     }
-    appendToSheet("Atendimentos",[agora,at.nome||"",at.tel||"",at.cpf||"","Aguardando","",triagem,at.tipo||"","",String(at.id)]).catch(e=>console.error("[Sheets]",e));
-    // Email disparado AQUI — após triagem real concluída
-    await enviarEmailMedicos({
-      nome: at.nome, tel: at.tel, tipo: at.tipo, triagem, linkRetorno,
-      atendimentoId: at.id, horarioAgendado, horarioAgendadoRaw: agendamentoId ? horarioAgendadoRaw : null,
-      subject: horarioAgendado
-        ? `Agendamento - ${at.nome||"Paciente"} (${tipoLabel}) - ${horarioAgendado}`
-        : `Nova triagem - ${at.nome||"Paciente"} (${tipoLabel})`
-    });
+
+    // ── CONSULTA IMEDIATA: intercepta para aprovação do admin ──────────────
+    // 1. Gera token JWT de aprovação (10 min)
+    const token = jwt.sign({ atendimentoId, acao: "aprovacao" }, JWT_SECRET, { expiresIn: "10m" });
+
+    // 2. Salva triagem + status aguardando_aprovacao + token
+    const result = await pool.query(
+      `UPDATE fila_atendimentos
+          SET triagem=$2, queixa=$3, idade=$4, sexo=$5, alergias=$6, cronicas=$7,
+              medicacoes=$8, solicita=$9, status='aguardando_aprovacao', aprovacao_token=$10
+        WHERE id=$1 AND status IN ('triagem','aguardando','aguardando_aprovacao')
+        RETURNING id,nome,tel,cpf,tipo,triagem,tel_documentos`,
+      [atendimentoId,triagem,campos.queixa||triagem,campos.idade||"",campos.sexo||"",
+       campos.alergias||"",campos.cronicas||"",campos.medicacoes||"",campos.solicita||"",token]
+    );
+    if (result.rowCount === 0) return res.status(404).json({ ok: false, error: "Atendimento nao encontrado" });
+    const at = result.rows[0];
+
+    // 3. Envia e-mail apenas para o admin com links de aprovação
+    const API_URL  = process.env.API_URL  || "https://triagem-api.onrender.com";
+    const SITE_URL = process.env.SITE_URL || "https://consultaja24h.com.br";
+    const RESEND_KEY = process.env.RESEND_API_KEY;
+    const linkLiberar  = `${API_URL}/api/aprovacao/liberar?id=${at.id}&token=${encodeURIComponent(token)}`;
+    const linkCancelar = `${API_URL}/api/aprovacao/cancelar?id=${at.id}&token=${encodeURIComponent(token)}`;
+    const ADMIN_EMAIL  = "gustavosgbf@gmail.com";
+
+    if (RESEND_KEY) {
+      const htmlAdmin = `
+        <div style="font-family:sans-serif;max-width:520px;margin:0 auto;background:#060d0b;color:#fff;border-radius:12px;overflow:hidden">
+          <div style="background:#1a2e1a;padding:20px 24px;border-bottom:1px solid rgba(255,255,255,.08)">
+            <h2 style="margin:0;font-size:1.05rem;color:#b4e05a">⚕️ Novo paciente aguardando aprovação</h2>
+          </div>
+          <div style="padding:24px">
+            <table style="width:100%;border-collapse:collapse;margin-bottom:20px">
+              <tr><td style="color:rgba(255,255,255,.4);padding:5px 0;font-size:.82rem">Paciente</td><td style="color:#fff;font-weight:600">${at.nome||"—"}</td></tr>
+              <tr><td style="color:rgba(255,255,255,.4);padding:5px 0;font-size:.82rem">Telefone</td><td style="color:#fff">${at.tel||"—"}</td></tr>
+              <tr><td style="color:rgba(255,255,255,.4);padding:5px 0;font-size:.82rem">Modalidade</td><td style="color:#fff">${at.tipo==="video"?"Vídeo":"Chat"}</td></tr>
+              <tr><td style="color:rgba(255,255,255,.4);padding:5px 0;font-size:.82rem;vertical-align:top">Triagem</td><td style="color:#fff;font-size:.82rem;line-height:1.5">${(at.triagem||"—").replace(/
+/g,"<br>")}</td></tr>
+            </table>
+            <p style="font-size:.75rem;color:rgba(255,255,255,.4);margin-bottom:20px">
+              ⏱ Liberação automática em <strong style="color:#b4e05a">90 segundos</strong> se nenhuma ação for tomada.
+            </p>
+            <div style="display:flex;gap:12px;flex-wrap:wrap">
+              <a href="${linkLiberar}"
+                 style="flex:1;min-width:150px;display:block;text-align:center;padding:13px 18px;border-radius:10px;background:#5ee0a0;color:#051208;font-weight:700;font-size:.88rem;text-decoration:none">
+                ✅ Liberar atendimento
+              </a>
+              <a href="${linkCancelar}"
+                 style="flex:1;min-width:150px;display:block;text-align:center;padding:13px 18px;border-radius:10px;background:#ff5f57;color:#fff;font-weight:700;font-size:.88rem;text-decoration:none">
+                ❌ Cancelar (não pagou)
+              </a>
+            </div>
+          </div>
+        </div>`;
+
+      fetch("https://api.resend.com/emails", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${RESEND_KEY}` },
+        body: JSON.stringify({
+          from: "ConsultaJa24h <contato@consultaja24h.com.br>",
+          to:   [ADMIN_EMAIL],
+          subject: `⚕️ Aprovar pagamento — ${at.nome||"Paciente"} (#${at.id})`,
+          html: htmlAdmin
+        })
+      }).then(r=>r.json())
+        .then(d=>{ if(d.id) console.log(`[APROVACAO] E-mail admin enviado — #${at.id}`); else console.warn("[APROVACAO] Resend recusou:", JSON.stringify(d)); })
+        .catch(e=>console.error("[APROVACAO] Erro ao enviar e-mail admin:", e.message));
+    } else {
+      console.warn("[APROVACAO] RESEND_API_KEY não definida — e-mail admin suprimido.");
+    }
+
+    // 4. Timer de 90s: libera automaticamente se admin não agiu
+    setTimeout(async () => {
+      try { await liberarAtendimentoParaMedicos(at.id); }
+      catch(e) { console.error("[APROVACAO] Erro no timer de liberação automática:", e.message); }
+    }, 90_000);
+
+    console.log(`[APROVACAO] Atendimento #${at.id} aguardando aprovação admin (90s timeout).`);
     return res.json({ ok: true, atendimentoId: at.id });
+
   } catch (e) {
     console.error("Erro em /api/atendimento/atualizar-triagem:", e);
     return res.status(500).json({ ok: false, error: "Erro ao atualizar triagem" });
@@ -1419,6 +1524,70 @@ app.post("/api/atendimento/meet", async (req, res) => {
     if (result.rowCount===0) return res.status(404).json({ ok: false, error: "Atendimento nao encontrado" });
     return res.json({ ok: true, meet_link: result.rows[0].meet_link });
   } catch (err) { return res.status(500).json({ ok: false, error: "Erro ao salvar link" }); }
+});
+
+// ── GET /api/aprovacao/liberar ────────────────────────────────────────────────
+app.get("/api/aprovacao/liberar", async (req, res) => {
+  const { id, token } = req.query;
+  const page = (titulo, cor, icone, msg) => res.send(
+    `<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${titulo}</title><style>body{font-family:sans-serif;background:#060d0b;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}.box{max-width:400px;text-align:center;padding:32px 24px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.09);border-radius:16px}.icon{font-size:2.8rem;margin-bottom:14px}.title{font-size:1.15rem;font-weight:600;color:${cor};margin-bottom:8px}.msg{font-size:.85rem;color:rgba(255,255,255,.45);line-height:1.65}</style></head><body><div class="box"><div class="icon">${icone}</div><div class="title">${titulo}</div><p class="msg">${msg}</p></div></body></html>`
+  );
+  if (!id || !token) return page("Erro", "#ff5f57", "❌", "Link inválido.");
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    if (String(payload.atendimentoId) !== String(id) || payload.acao !== "aprovacao")
+      return page("Erro", "#ff5f57", "❌", "Token inválido.");
+    const row = await pool.query(`SELECT status, aprovacao_token FROM fila_atendimentos WHERE id=$1`,[id]);
+    if (!row.rows[0]) return page("Não encontrado", "#ffbd2e", "⚠️", "Atendimento não encontrado.");
+    const { status, aprovacao_token } = row.rows[0];
+    if (status === "cancelado")   return page("Já cancelado",  "#ffbd2e", "⚠️", "Este atendimento já foi cancelado.");
+    if (["aguardando","assumido","encerrado"].includes(status))
+      return page("Já liberado", "#5ee0a0", "✅", "Atendimento já liberado para os médicos.");
+    if (status !== "aguardando_aprovacao")
+      return page("Status inválido", "#ffbd2e", "⚠️", `Status atual: ${status}.`);
+    if (aprovacao_token !== token)
+      return page("Token expirado", "#ffbd2e", "⚠️", "Este link já foi usado ou expirou.");
+    await liberarAtendimentoParaMedicos(Number(id));
+    return page("Liberado!", "#5ee0a0", "✅", "Atendimento liberado. O paciente será conectado ao médico.");
+  } catch(e) {
+    if (e.name === "TokenExpiredError")
+      return page("Link expirado", "#ffbd2e", "⚠️", "O link expirou (10 min). O atendimento pode ter sido liberado automaticamente.");
+    console.error("[APROVACAO] Erro ao liberar:", e.message);
+    return page("Erro", "#ff5f57", "❌", "Erro interno. Tente novamente.");
+  }
+});
+
+// ── GET /api/aprovacao/cancelar ───────────────────────────────────────────────
+app.get("/api/aprovacao/cancelar", async (req, res) => {
+  const { id, token } = req.query;
+  const page = (titulo, cor, icone, msg) => res.send(
+    `<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${titulo}</title><style>body{font-family:sans-serif;background:#060d0b;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}.box{max-width:400px;text-align:center;padding:32px 24px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.09);border-radius:16px}.icon{font-size:2.8rem;margin-bottom:14px}.title{font-size:1.15rem;font-weight:600;color:${cor};margin-bottom:8px}.msg{font-size:.85rem;color:rgba(255,255,255,.45);line-height:1.65}</style></head><body><div class="box"><div class="icon">${icone}</div><div class="title">${titulo}</div><p class="msg">${msg}</p></div></body></html>`
+  );
+  if (!id || !token) return page("Erro", "#ff5f57", "❌", "Link inválido.");
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    if (String(payload.atendimentoId) !== String(id) || payload.acao !== "aprovacao")
+      return page("Erro", "#ff5f57", "❌", "Token inválido.");
+    const row = await pool.query(`SELECT status, aprovacao_token FROM fila_atendimentos WHERE id=$1`,[id]);
+    if (!row.rows[0]) return page("Não encontrado", "#ffbd2e", "⚠️", "Atendimento não encontrado.");
+    const { status, aprovacao_token } = row.rows[0];
+    if (status === "cancelado")    return page("Já cancelado", "#ffbd2e", "⚠️", "Este atendimento já foi cancelado.");
+    if (status !== "aguardando_aprovacao")
+      return page("Ação indisponível", "#ffbd2e", "⚠️", `O atendimento já está em status: ${status}.`);
+    if (aprovacao_token !== token)
+      return page("Token expirado", "#ffbd2e", "⚠️", "Este link já foi usado ou expirou.");
+    await pool.query(
+      `UPDATE fila_atendimentos SET status='cancelado', aprovacao_token=NULL, encerrado_em=NOW() WHERE id=$1 AND status='aguardando_aprovacao'`,
+      [id]
+    );
+    console.log(`[CANCELADO] Atendimento #${id} cancelado pelo admin.`);
+    return page("Cancelado", "#ff5f57", "❌", "Pagamento não confirmado. Atendimento cancelado.");
+  } catch(e) {
+    if (e.name === "TokenExpiredError")
+      return page("Link expirado", "#ffbd2e", "⚠️", "O link expirou. Verifique o status no painel.");
+    console.error("[APROVACAO] Erro ao cancelar:", e.message);
+    return page("Erro", "#ff5f57", "❌", "Erro interno. Tente novamente.");
+  }
 });
 
 app.post("/api/atendimento/encerrar", async (req, res) => {
