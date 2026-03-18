@@ -1632,6 +1632,30 @@ app.post("/api/atendimento/encerrar", async (req, res) => {
   } catch (err) { console.error("Erro em /api/atendimento/encerrar:", err); return res.status(500).json({ ok: false, error: "Erro ao encerrar atendimento" }); }
 });
 
+app.post("/api/atendimento/reabrir", autenticarMedico, async (req, res) => {
+  try {
+    const { filaId } = req.body || {};
+    if (!filaId) return res.status(400).json({ ok: false, error: "filaId obrigatorio" });
+    const check = await pool.query(
+      "SELECT id, medico_id, status FROM fila_atendimentos WHERE id=$1",
+      [filaId]
+    );
+    if (check.rowCount === 0) return res.status(404).json({ ok: false, error: "Atendimento nao encontrado" });
+    const at = check.rows[0];
+    if (at.status !== "encerrado") return res.status(400).json({ ok: false, error: "Apenas atendimentos encerrados podem ser reabertos" });
+    if (String(at.medico_id) !== String(req.medico.id)) return res.status(403).json({ ok: false, error: "Voce nao foi o medico deste atendimento" });
+    const result = await pool.query(
+      "UPDATE fila_atendimentos SET status='assumido', encerrado_em=NULL, status_atendimento=NULL WHERE id=$1 RETURNING *",
+      [filaId]
+    );
+    console.log("[REABRIR] Atendimento #" + filaId + " reaberto pelo medico " + req.medico.nome);
+    return res.json({ ok: true, atendimento: result.rows[0] });
+  } catch(e) {
+    console.error("[REABRIR]", e.message);
+    return res.status(500).json({ ok: false, error: "Erro ao reabrir atendimento" });
+  }
+});
+
 app.post("/api/atendimento/prontuario", autenticarMedico, async (req, res) => {
   const { filaId, prontuario } = req.body;
   if (!filaId || prontuario === undefined) {
