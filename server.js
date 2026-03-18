@@ -1492,6 +1492,24 @@ app.post("/api/atendimento/assumir", async (req, res) => {
     );
     if (result.rowCount===0) return res.status(409).json({ ok: false, error: "Paciente ja foi assumido" });
     const at2 = result.rows[0];
+
+    // Da baixa no agendamento para sair do badge de agendamentos
+    if (at2.agendamento_id) {
+      await pool.query(
+        `UPDATE agendamentos SET status='iniciado' WHERE id=$1 AND status='confirmado'`,
+        [at2.agendamento_id]
+      ).catch(e => console.warn("[ASSUMIR] Update agendamento falhou:", e.message));
+    } else {
+      // Fallback: busca por tel + janela de 30min ao redor do horario agendado
+      await pool.query(
+        `UPDATE agendamentos SET status='iniciado'
+          WHERE tel=$1
+            AND status='confirmado'
+            AND horario_agendado BETWEEN NOW() - INTERVAL '30 minutes' AND NOW() + INTERVAL '30 minutes'`,
+        [at2.tel]
+      ).catch(e => console.warn("[ASSUMIR] Fallback agendamento falhou:", e.message));
+    }
+
     const agora2 = new Date().toLocaleString("pt-BR",{timeZone:"America/Fortaleza"});
     appendToSheet("Atendimentos",[agora2,at2.nome||"",at2.tel||"",at2.cpf||"","Assumido",medicoNome||"",at2.triagem||"",at2.tipo||"","",String(filaId)]).catch(e=>console.error("[Sheets]",e));
     return res.json({ ok: true, atendimento: at2 });
