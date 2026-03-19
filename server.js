@@ -495,7 +495,18 @@ app.post("/api/pagbank/webhook", async (req, res) => {
           SET pagamento_status        = 'confirmado',
               pagamento_confirmado_em = NOW(),
               status = CASE
-                WHEN status = 'triagem' THEN 'triagem'
+                WHEN status = 'pagamento_pendente' THEN 'triagem'
+                WHEN status = 'triagem' THEN
+                  CASE
+                    WHEN LOWER(TRIM(triagem)) NOT IN (
+                      '(aguardando pagamento)',
+                      '(pagamento confirmado — aguardando triagem)',
+                      '(triagem em andamento)',
+                      '(aguardando triagem de agendamento)',
+                      '(aguardando resposta)'
+                    ) THEN 'aguardando'
+                    ELSE 'triagem'
+                  END
                 ELSE 'aguardando'
               END
         WHERE pagbank_order_id = $1
@@ -919,7 +930,7 @@ app.post("/api/atendimento/atualizar-triagem", async (req, res) => {
       `UPDATE fila_atendimentos
           SET triagem=$2, queixa=$3, idade=$4, sexo=$5, alergias=$6, cronicas=$7,
               medicacoes=$8, solicita=$9, status=$10, aprovacao_token=NULL
-        WHERE id=$1 AND status IN ('triagem','aguardando','aguardando_aprovacao')
+        WHERE id=$1 AND status IN ('triagem','aguardando','aguardando_aprovacao','pagamento_pendente')
         RETURNING id,nome,tel,cpf,tipo,triagem,tel_documentos`,
       [atendimentoId, triagem, campos.queixa||triagem, campos.idade||"", campos.sexo||"",
        campos.alergias||"", campos.cronicas||"", campos.medicacoes||"", campos.solicita||"",
@@ -982,9 +993,11 @@ app.post("/api/notify", rlTriagem, async (req, res) => {
     const tipoConsulta = tipo === "video" ? "video" : "chat";
     const SITE_URL = process.env.SITE_URL || "https://consultaja24h.com.br";
     const campos = parsearTriagem(triagem);
-    // STATUS: se triagem for placeholder (pré-registro durante pagamento/triagem), usa 'triagem'
-    // Se triagem real (chamado diretamente sem atendimentoId prévio), usa 'aguardando'
-    const statusInicial = ehPlaceholder(triagem) ? 'triagem' : 'aguardando';
+    // STATUS:
+    // 'pagamento_pendente' = pré-registro antes do pagamento confirmado — invisível para o painel médico
+    // 'triagem' = pagamento confirmado, triagem em andamento
+    // 'aguardando' = triagem concluída + pagamento confirmado — visível para médicos
+    const statusInicial = ehPlaceholder(triagem) ? 'pagamento_pendente' : 'aguardando';
     const insertResult = await pool.query(
       `INSERT INTO fila_atendimentos (nome,tel,tel_documentos,cpf,tipo,triagem,status,queixa,idade,sexo,alergias,cronicas,medicacoes,data_nascimento)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING id`,
