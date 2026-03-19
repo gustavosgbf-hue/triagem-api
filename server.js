@@ -1853,6 +1853,17 @@ app.post("/api/agendamento/criar", async (req, res) => {
       return res.status(400).json({ ok: false, error: "horario_agendado invalido" });
     }
     const slotEnd=new Date(slotStart.getTime()+20*60*1000);
+
+    // Trava de duplicata: mesmo tel + mesmo horário já existe?
+    const duplicata=await pool.query(
+      `SELECT id FROM agendamentos WHERE tel=$1 AND horario_agendado=$2 AND status IN ('pendente','confirmado') LIMIT 1`,
+      [tel, slotStart.toISOString()]
+    );
+    if (duplicata.rowCount>0) {
+      console.log(`[AGENDAMENTO] Duplicata bloqueada — tel:${tel} horario:${slotStart.toISOString()} id existente:#${duplicata.rows[0].id}`);
+      return res.json({ok:true, agendamentoId:duplicata.rows[0].id}); // retorna o existente, não cria novo
+    }
+
     const existentes=await pool.query(`SELECT COUNT(*) FROM agendamentos WHERE horario_agendado>=$1 AND horario_agendado<$2 AND status IN ('pendente','confirmado')`,[slotStart.toISOString(),slotEnd.toISOString()]);
     if (parseInt(existentes.rows[0].count)>=3) return res.status(409).json({ok:false,error:"Horario indisponivel. Escolha outro horario."});
     const result=await pool.query(`INSERT INTO agendamentos (nome,tel,tel_documentos,cpf,modalidade,horario_agendado,status,email) VALUES ($1,$2,$3,$4,$5,$6,'pendente',$7) RETURNING id`,[nome,tel,tel_documentos||tel,cpf||"",modalidade||"chat",horario_agendado,email||null]);
