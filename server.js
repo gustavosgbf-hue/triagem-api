@@ -1248,6 +1248,18 @@ app.get("/api/memed/token", checkMedico, async (req, res) => {
     if (medResult.rowCount === 0) return res.status(404).json({ ok: false, error: "Médico não encontrado" });
     const med = medResult.rows[0];
 
+    // UF obrigatória — não assume fallback
+    if (!med.uf || med.uf.trim().length < 2) {
+      console.warn(`[MEMED] Médico id=${med.id} sem UF cadastrada.`);
+      return res.status(400).json({ ok: false, error: "UF do médico não cadastrada. Atualize seu perfil antes de usar a prescrição." });
+    }
+    const ufLocal = med.uf.trim().toUpperCase();
+
+    // Separa nome/sobrenome a partir do banco (usado tanto no GET quanto no POST)
+    const partesNome = (med.nome || "Médico").trim().split(/\s+/);
+    const nomeLocal = partesNome[0];
+    const sobrenomeLocal = partesNome.slice(1).join(" ") || "ConsultaJa";
+
     // Monta external_id único para o médico
     const externalId = med.memed_external_id || `consultaja-${med.id}`;
 
@@ -1256,7 +1268,7 @@ app.get("/api/memed/token", checkMedico, async (req, res) => {
     const getRes = await fetch(getUrl, {
       headers: { "Accept": "application/vnd.api+json", "Content-Type": "application/json" }
     });
-    
+
     if (getRes.ok) {
       const getData = await getRes.json();
       const token = getData?.data?.attributes?.token;
@@ -1265,23 +1277,67 @@ app.get("/api/memed/token", checkMedico, async (req, res) => {
         if (!med.memed_external_id) {
           await pool.query(`UPDATE medicos SET memed_external_id=$1 WHERE id=$2`, [externalId, medicoId]);
         }
+
+        // Verifica consistência de UF e sobrenome (case-insensitive + trim)
+        const ufMemed       = (getData?.data?.attributes?.board?.board_state || "").trim().toUpperCase();
+        const sobrenomeMemed = (getData?.data?.attributes?.sobrenome || "").trim().toLowerCase();
+        const ufOk          = ufMemed === ufLocal;
+        const sobrenomeOk   = sobrenomeMemed === sobrenomeLocal.toLowerCase();
+
+        if (!ufOk || !sobrenomeOk) {
+          console.warn(`[MEMED] Inconsistência médico id=${med.id}: UF banco=${ufLocal} Memed=${ufMemed} | sobrenome banco="${sobrenomeLocal}" Memed="${getData?.data?.attributes?.sobrenome}"`);
+          // Tenta corrigir via PATCH — sem recriar usuário
+          try {
+            const patchUrl = `${MEMED_API_URL}/sinapse-prescricao/usuarios/${externalId}?api-key=${MEMED_API_KEY}&secret-key=${MEMED_SECRET_KEY}`;
+            const patchRes = await fetch(patchUrl, {
+              method: "PATCH",
+              headers: { "Accept": "application/vnd.api+json", "Content-Type": "application/json" },
+              body: JSON.stringify({
+                data: {
+                  type: "usuarios",
+                  attributes: {
+                    nome: nomeLocal,
+                    sobrenome: sobrenomeLocal,
+                    board: {
+                      board_code: "CRM",
+                      board_number: (med.crm || "").replace(/\D/g, ""),
+                      board_state: ufLocal
+                    }
+                  }
+                }
+              })
+            });
+            const patchData = await patchRes.json();
+            if (patchRes.ok) {
+              console.log(`[MEMED] Cadastro corrigido médico id=${med.id} (UF→${ufLocal}, sobrenome→"${sobrenomeLocal}")`);
+              const tokenCorrigido = patchData?.data?.attributes?.token || token;
+              return res.json({ ok: true, token: tokenCorrigido, externalId });
+            } else {
+              console.error(`[MEMED] PATCH falhou médico id=${med.id}:`, JSON.stringify(patchData).substring(0, 300));
+              // Não quebra — retorna token atual mesmo com dados ainda desatualizados
+              return res.json({ ok: true, token, externalId });
+            }
+          } catch (patchErr) {
+            console.error(`[MEMED] Erro PATCH médico id=${med.id}:`, patchErr.message);
+            return res.json({ ok: true, token, externalId });
+          }
+        }
+
+        // Dados consistentes — reutiliza token sem alteração
         return res.json({ ok: true, token, externalId });
       }
     }
 
     // Médico não existe no Memed — cadastra
-    const [nome, ...sobrenomeArr] = (med.nome || "Médico").split(" ");
-    const sobrenome = sobrenomeArr.join(" ") || "ConsultaJa";
     const crmNumero = (med.crm || "").replace(/\D/g, "");
-    const uf = (med.uf || "SP").toUpperCase();
 
     const payload = {
       data: {
         type: "usuarios",
         attributes: {
           external_id: externalId,
-          nome: nome,
-          sobrenome: sobrenome,
+          nome: nomeLocal,
+          sobrenome: sobrenomeLocal,
           cpf: (med.cpf_medico || "").replace(/\D/g, "") || undefined,
           data_nascimento: med.data_nascimento_medico || undefined,
           email: med.email || undefined,
@@ -1290,7 +1346,7 @@ app.get("/api/memed/token", checkMedico, async (req, res) => {
           board: {
             board_code: "CRM",
             board_number: crmNumero,
-            board_state: uf
+            board_state: ufLocal
           }
         }
       }
