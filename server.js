@@ -516,8 +516,48 @@ app.post("/api/pagbank/webhook", async (req, res) => {
     );
 
     if (rowCount === 0) {
-      console.log("[PAGBANK-WEBHOOK] Order " + orderId + " nao encontrado ou ja processado — ignorando retry.");
-      // Fallback legado: tenta agendamentos ainda sem pagbank_order_id vinculado
+      console.log("[PAGBANK-WEBHOOK] Order " + orderId + " nao encontrado pelo pagbank_order_id — tentando fallback por fila_atendimentos.");
+
+      // Fallback 1: fila_atendimentos sem pagbank_order_id ainda vinculado (race condition vincular-order)
+      const fbFila = await pool.query(
+        `UPDATE fila_atendimentos
+            SET pagamento_status        = 'confirmado',
+                pagamento_confirmado_em = NOW(),
+                pagbank_order_id        = $1,
+                status = CASE
+                  WHEN status = 'pagamento_pendente' THEN 'triagem'
+                  WHEN status = 'triagem' THEN
+                    CASE
+                      WHEN LOWER(TRIM(triagem)) NOT IN (
+                        '(aguardando pagamento)',
+                        '(pagamento confirmado — aguardando triagem)',
+                        '(triagem em andamento)',
+                        '(aguardando triagem de agendamento)',
+                        '(aguardando resposta)'
+                      ) THEN 'aguardando'
+                      ELSE 'triagem'
+                    END
+                  ELSE 'aguardando'
+                END
+          WHERE pagbank_order_id IS NULL
+            AND pagamento_status  = 'pendente'
+            AND criado_em > NOW() - INTERVAL '2 hours'
+          ORDER BY criado_em DESC
+          LIMIT 1
+          RETURNING id, nome, tel, cpf, tipo, triagem, status`,
+        [orderId]
+      ).catch(e => { console.warn("[PAGBANK-WEBHOOK] Fallback fila_atendimentos:", e.message); return { rowCount: 0, rows: [] }; });
+
+      if (fbFila.rowCount > 0) {
+        const atFb = fbFila.rows[0];
+        console.log("[PAGBANK-WEBHOOK] Fallback fila_atendimentos: atendimento #" + atFb.id + " atualizado via race-condition recovery.");
+        if (atFb.status === 'aguardando' && !isTriagemPlaceholder(atFb.triagem)) {
+          await notificarMedicos(atFb);
+        }
+        return;
+      }
+
+      // Fallback 2: agendamentos legados sem pagbank_order_id
       await pool.query(
         `WITH alvo AS (
            SELECT id FROM agendamentos
@@ -916,12 +956,35 @@ app.post("/api/atendimento/atualizar-triagem", async (req, res) => {
 
     // ── CONSULTA IMEDIATA: verifica pagamento_status para decidir se libera agora ──
     const check = await pool.query(
-      "SELECT pagamento_status FROM fila_atendimentos WHERE id = $1",
+      "SELECT pagamento_status, pagbank_order_id FROM fila_atendimentos WHERE id = $1",
       [atendimentoId]
     );
     if (!check.rows[0]) return res.status(404).json({ ok: false, error: "Atendimento nao encontrado" });
 
-    const pagamentoConfirmado = check.rows[0].pagamento_status === 'confirmado';
+    let pagamentoConfirmado = check.rows[0].pagamento_status === 'confirmado';
+
+    // Se ainda pendente, consulta PagBank diretamente — cobre casos onde webhook falhou na entrega
+    if (!pagamentoConfirmado && check.rows[0].pagbank_order_id && PAGBANK_TOKEN) {
+      try {
+        const pbRes = await fetch(`${PAGBANK_URL}/orders/${check.rows[0].pagbank_order_id}`, {
+          headers: { "Authorization": `Bearer ${PAGBANK_TOKEN}`, "accept": "application/json" }
+        });
+        const pbData = await pbRes.json();
+        const pagoNaPagBank = pbData.charges?.some(c => c.status === "PAID") || false;
+        if (pagoNaPagBank) {
+          // Confirma no banco para não depender do webhook atrasado
+          await pool.query(
+            `UPDATE fila_atendimentos SET pagamento_status='confirmado', pagamento_confirmado_em=NOW() WHERE id=$1`,
+            [atendimentoId]
+          );
+          pagamentoConfirmado = true;
+          console.log("[TRIAGEM] Pagamento confirmado via consulta direta PagBank — atendimento #" + atendimentoId);
+        }
+      } catch (e) {
+        console.warn("[TRIAGEM] Falha ao consultar PagBank diretamente:", e.message);
+      }
+    }
+
     // Se pagamento confirmado -> vai direto para 'aguardando' e notifica medicos
     // Se ainda pendente -> salva triagem mas mantém 'triagem'; webhook notifica quando chegar
     const novoStatus = pagamentoConfirmado ? 'aguardando' : 'triagem';
