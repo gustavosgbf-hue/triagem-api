@@ -226,6 +226,32 @@ async function initDB() {
     for (const [col, tipo] of cols) {
       await pool.query(`ALTER TABLE fila_atendimentos ADD COLUMN IF NOT EXISTS ${col} ${tipo}`);
     }
+    // ── PSICÓLOGOS: tabela e índices ──────────────────────────────────────────
+    await pool.query(`CREATE TABLE IF NOT EXISTS psicologos (
+      id              SERIAL PRIMARY KEY,
+      nome            TEXT NOT NULL,
+      nome_exibicao   TEXT NOT NULL,
+      email           TEXT NOT NULL UNIQUE,
+      senha_hash      TEXT NOT NULL,
+      crp             TEXT NOT NULL,
+      uf              TEXT NOT NULL,
+      telefone        TEXT,
+      abordagem       TEXT,
+      focos           TEXT,
+      valor_sessao    TEXT,
+      atende_online   BOOLEAN NOT NULL DEFAULT true,
+      tem_avaliacao   BOOLEAN NOT NULL DEFAULT false,
+      valor_avaliacao TEXT,
+      apresentacao    TEXT,
+      disponibilidade TEXT,
+      status          TEXT NOT NULL DEFAULT 'pendente',
+      ativo           BOOLEAN NOT NULL DEFAULT false,
+      created_at      TIMESTAMP DEFAULT NOW()
+    )`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_psicologos_status ON psicologos(status)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_psicologos_email  ON psicologos(email)`);
+    await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_psicologos_crp_uf ON psicologos(crp, uf)`);
+
     // Índices de performance para queries frequentes
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_mensagens_atendimento ON mensagens(atendimento_id)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_mensagens_atendimento_criado ON mensagens(atendimento_id, criado_em)`);
@@ -1234,6 +1260,204 @@ app.post("/api/medico/cadastro", async (req, res) => {
     return res.status(500).json({ ok: false, error: err.message });
   }
 });
+
+// ── PSICÓLOGOS ───────────────────────────────────────────────────────────────
+
+function authPsicologo(req, res, next) {
+  const auth = req.headers['authorization'] || '';
+  const token = auth.replace(/^Bearers+/i, '').trim();
+  if (!token) return res.status(401).json({ ok: false, error: 'Token nao fornecido' });
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    if (decoded.tipo !== 'psicologo') return res.status(401).json({ ok: false, error: 'Token invalido' });
+    req.psicologo = decoded;
+    req.psicologoId = decoded.id;
+    next();
+  } catch(e) {
+    return res.status(401).json({ ok: false, error: 'Token invalido ou expirado' });
+  }
+}
+
+async function enviarEmailNovoCadastroPsicologo({ nome, email, crp, uf, telefone, abordagem, valor_sessao }) {
+  const RESEND_KEY = process.env.RESEND_API_KEY;
+  if (!RESEND_KEY) { console.warn('[EMAIL-PSICOLOGO] RESEND_API_KEY nao definida.'); return; }
+  try {
+    const html = `<div style="background:#060d0b;padding:32px 20px;font-family:sans-serif"><div style="max-width:520px;margin:0 auto;background:#0d1a14;border:1px solid rgba(255,255,255,.08);border-radius:16px;overflow:hidden"><div style="padding:24px;border-bottom:1px solid rgba(255,255,255,.08)"><span style="font-size:1.1rem;font-weight:700;color:#26508e">ConsultaJá24h</span><span style="font-size:.8rem;color:rgba(255,255,255,.4);margin-left:8px">Novo cadastro pendente de psicólogo</span></div><div style="padding:24px"><p style="color:rgba(255,255,255,.9);font-size:.95rem;margin-bottom:20px">Um novo psicólogo solicitou acesso:</p><table style="width:100%;border-collapse:collapse;font-size:.85rem"><tr><td style="color:rgba(255,255,255,.4);padding:6px 0;width:40%">Nome</td><td style="color:#fff;font-weight:500">${nome}</td></tr><tr><td style="color:rgba(255,255,255,.4);padding:6px 0">E-mail</td><td style="color:#fff">${email}</td></tr><tr><td style="color:rgba(255,255,255,.4);padding:6px 0">CRP</td><td style="color:#fff">${crp}/${uf}</td></tr>${telefone ? `<tr><td style="color:rgba(255,255,255,.4);padding:6px 0">Telefone</td><td style="color:#fff">${telefone}</td></tr>` : ''}${abordagem ? `<tr><td style="color:rgba(255,255,255,.4);padding:6px 0">Abordagem</td><td style="color:#fff">${abordagem}</td></tr>` : ''}${valor_sessao ? `<tr><td style="color:rgba(255,255,255,.4);padding:6px 0">Valor sessão</td><td style="color:#fff">R$ ${valor_sessao}</td></tr>` : ''}</table><p style="margin:20px 0 0;font-size:.78rem;color:rgba(255,255,255,.3)">Acesse o painel admin para aprovar.</p></div></div></div>`;
+    const r = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${RESEND_KEY}` },
+      body: JSON.stringify({ from: 'ConsultaJá24h <contato@consultaja24h.com.br>', to: ['gustavosgbf@gmail.com'], subject: `Novo cadastro de psicólogo: ${nome} (CRP ${crp}/${uf})`, html })
+    });
+    const d = await r.json();
+    if (d.id) console.log('[EMAIL-PSICOLOGO] Enviado | ID:', d.id);
+    else console.error('[EMAIL-PSICOLOGO] Resend recusou:', JSON.stringify(d));
+  } catch(e) { console.error('[EMAIL-PSICOLOGO] Erro:', e.message); }
+}
+
+async function enviarEmailAprovacaoPsicologo({ nome, email }) {
+  const RESEND_KEY = process.env.RESEND_API_KEY;
+  if (!RESEND_KEY) { console.warn('[EMAIL-APROVACAO-PSI] RESEND_API_KEY nao definida.'); return; }
+  try {
+    const html = `<div style="background:#f2f0ec;padding:32px 20px;font-family:sans-serif"><div style="max-width:520px;margin:0 auto;background:#fff;border:1px solid rgba(22,18,14,.1);border-radius:16px;overflow:hidden"><div style="padding:24px;border-bottom:1px solid rgba(22,18,14,.08)"><span style="font-size:1.1rem;font-weight:600;color:#26508e">ConsultaJá24h</span></div><div style="padding:24px"><p style="color:#16120e;font-size:.95rem;margin-bottom:12px">Olá, <strong>${nome}</strong>!</p><p style="color:#443e38;font-size:.9rem;line-height:1.65;margin-bottom:24px">Seu cadastro na plataforma foi aprovado. Você já pode acessar o painel.</p><a href="https://painel.consultaja24h.com.br/psicologo" style="display:inline-block;padding:12px 28px;border-radius:12px;background:#26508e;color:#fff;font-weight:600;font-size:.9rem;text-decoration:none">Acessar o painel</a></div></div></div>`;
+    const r = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${RESEND_KEY}` },
+      body: JSON.stringify({ from: 'ConsultaJá24h <contato@consultaja24h.com.br>', to: [email], subject: 'Seu cadastro foi aprovado na ConsultaJá24h Psicologia', html })
+    });
+    const d = await r.json();
+    if (d.id) console.log('[EMAIL-APROVACAO-PSI] Enviado para:', email, '| ID:', d.id);
+    else console.error('[EMAIL-APROVACAO-PSI] Resend recusou:', JSON.stringify(d));
+  } catch(e) { console.error('[EMAIL-APROVACAO-PSI] Erro:', e.message); }
+}
+
+app.post('/api/psicologo/cadastro', rlGeral, async (req, res) => {
+  try {
+    const {
+      nome, nome_exibicao, email, senha, crp, uf, telefone,
+      abordagem, focos, valor_sessao, atende_online,
+      tem_avaliacao, valor_avaliacao, apresentacao, disponibilidade
+    } = req.body || {};
+    if (!nome || !email || !senha || !crp || !uf || !telefone || !abordagem || !valor_sessao) {
+      return res.status(400).json({ ok: false, error: 'Todos os campos obrigatorios devem ser preenchidos' });
+    }
+    if (!/^[^s@]+@[^s@]+.[^s@]+$/.test(String(email))) {
+      return res.status(400).json({ ok: false, error: 'Informe um e-mail valido' });
+    }
+    const dupCrp = await pool.query(
+      'SELECT id FROM psicologos WHERE crp=$1 AND uf=$2 LIMIT 1',
+      [String(crp).trim().toUpperCase(), String(uf).trim().toUpperCase()]
+    );
+    if (dupCrp.rowCount > 0) {
+      return res.status(400).json({ ok: false, error: 'Ja existe um psicologo cadastrado com este CRP/UF' });
+    }
+    if (senha.length < 6) {
+      return res.status(400).json({ ok: false, error: 'Senha deve ter ao menos 6 caracteres' });
+    }
+    const normalizarValor = v => String(v || '').trim().replace(/[^d,.]/g, '');
+    const senha_hash = await bcrypt.hash(senha, 10);
+    const result = await pool.query(
+      `INSERT INTO psicologos
+        (nome, nome_exibicao, email, senha_hash, crp, uf, telefone,
+         abordagem, focos, valor_sessao, atende_online,
+         tem_avaliacao, valor_avaliacao, apresentacao, disponibilidade,
+         status, ativo)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'pendente',false)
+       RETURNING id, nome, nome_exibicao, email`,
+      [
+        nome.trim(), (nome_exibicao || nome).trim(), email.trim().toLowerCase(), senha_hash,
+        crp.trim().toUpperCase(), uf.trim().toUpperCase(), String(telefone || '').trim(),
+        String(abordagem || '').trim(), String(focos || '').trim(), normalizarValor(valor_sessao),
+        atende_online !== false, !!tem_avaliacao,
+        tem_avaliacao ? normalizarValor(valor_avaliacao) : '',
+        String(apresentacao || '').trim(), String(disponibilidade || '').trim()
+      ]
+    );
+    const psi = result.rows[0];
+    enviarEmailNovoCadastroPsicologo({
+      nome: psi.nome, email: psi.email,
+      crp: crp.trim().toUpperCase(), uf: uf.trim().toUpperCase(),
+      telefone: telefone || '', abordagem: abordagem || '', valor_sessao: valor_sessao || ''
+    }).catch(() => {});
+    return res.json({ ok: true, psicologo: psi });
+  } catch (err) {
+    if (err.code === '23505') {
+      const msg = err.constraint && err.constraint.includes('crp') ? 'Ja existe um psicologo cadastrado com este CRP/UF' : 'E-mail ja cadastrado';
+      return res.status(400).json({ ok: false, error: msg });
+    }
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.post('/api/psicologo/login', rlLogin, async (req, res) => {
+  try {
+    const { email, senha } = req.body || {};
+    if (!email || !senha) return res.status(400).json({ ok: false, error: 'E-mail e senha sao obrigatorios' });
+    const result = await pool.query(
+      `SELECT id, nome, nome_exibicao, email, crp, uf, telefone,
+              abordagem, focos, valor_sessao, atende_online,
+              tem_avaliacao, valor_avaliacao, apresentacao, disponibilidade,
+              status, ativo, senha_hash
+         FROM psicologos WHERE email=$1 LIMIT 1`,
+      [email.trim().toLowerCase()]
+    );
+    if (result.rowCount === 0) return res.status(401).json({ ok: false, error: 'E-mail ou senha incorretos' });
+    const psi = result.rows[0];
+    if (psi.status === 'pendente') return res.status(403).json({ ok: false, error: 'Seu cadastro ainda esta em analise pela equipe da plataforma.' });
+    if (psi.status === 'rejeitado' || !psi.ativo) return res.status(403).json({ ok: false, error: 'Seu cadastro nao foi aprovado. Entre em contato com a equipe.' });
+    const senhaOk = await bcrypt.compare(senha, psi.senha_hash);
+    if (!senhaOk) return res.status(401).json({ ok: false, error: 'E-mail ou senha incorretos' });
+    const token = jwt.sign({ id: psi.id, tipo: 'psicologo' }, JWT_SECRET, { expiresIn: '8h' });
+    const { senha_hash: _, ...psicologoPublico } = psi;
+    psicologoPublico.nome_exibicao = psicologoPublico.nome_exibicao || psicologoPublico.nome;
+    return res.json({ ok: true, token, psicologo: psicologoPublico });
+  } catch (err) { return res.status(500).json({ ok: false, error: 'Erro interno no login' }); }
+});
+
+app.get('/api/psicologo/me', authPsicologo, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, nome, nome_exibicao, email, crp, uf, telefone,
+              abordagem, focos, valor_sessao, atende_online,
+              tem_avaliacao, valor_avaliacao, apresentacao, disponibilidade,
+              status, ativo
+         FROM psicologos WHERE id=$1 LIMIT 1`,
+      [req.psicologoId]
+    );
+    if (result.rowCount === 0) return res.status(404).json({ ok: false, error: 'Psicologo nao encontrado' });
+    const psi = result.rows[0];
+    psi.nome_exibicao = psi.nome_exibicao || psi.nome;
+    return res.json({ ok: true, psicologo: psi });
+  } catch (err) { return res.status(500).json({ ok: false, error: err.message }); }
+});
+
+app.patch('/api/admin/psicologo/:id/aprovar', checkAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `UPDATE psicologos SET ativo=true, status='aprovado' WHERE id=$1 RETURNING id, nome, email, status, ativo`,
+      [req.params.id]
+    );
+    if (result.rowCount === 0) return res.status(404).json({ ok: false, error: 'Psicologo nao encontrado' });
+    const psi = result.rows[0];
+    enviarEmailAprovacaoPsicologo({ nome: psi.nome, email: psi.email }).catch(() => {});
+    return res.json({ ok: true, psicologo: psi });
+  } catch (err) { return res.status(500).json({ ok: false, error: err.message }); }
+});
+
+app.patch('/api/admin/psicologo/:id/rejeitar', checkAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `UPDATE psicologos SET ativo=false, status='rejeitado' WHERE id=$1 RETURNING id, nome, status`,
+      [req.params.id]
+    );
+    if (result.rowCount === 0) return res.status(404).json({ ok: false, error: 'Psicologo nao encontrado' });
+    return res.json({ ok: true, psicologo: result.rows[0] });
+  } catch (err) { return res.status(500).json({ ok: false, error: err.message }); }
+});
+
+app.get('/api/admin/psicologos/pendentes', checkAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, nome, nome_exibicao, email, crp, uf, telefone,
+              abordagem, focos, valor_sessao, atende_online,
+              tem_avaliacao, valor_avaliacao, apresentacao, disponibilidade,
+              status, ativo, created_at
+         FROM psicologos WHERE status='pendente' ORDER BY created_at DESC`
+    );
+    return res.json({ ok: true, psicologos: result.rows });
+  } catch (err) { return res.status(500).json({ ok: false, error: err.message }); }
+});
+
+app.get('/api/admin/psicologos', checkAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, nome, email, crp, uf, abordagem, status, ativo, created_at
+         FROM psicologos ORDER BY id DESC`
+    );
+    return res.json({ ok: true, psicologos: result.rows });
+  } catch (err) { return res.status(500).json({ ok: false, error: err.message }); }
+});
+
+// ── FIM PSICÓLOGOS ────────────────────────────────────────────────────────────
 
 app.patch("/api/admin/medico/:id/aprovar", checkAdmin, async (req, res) => {
   try {
