@@ -2295,5 +2295,38 @@ app.get("/api/test-db", async (req, res) => {
   catch (err) { res.status(500).json({error:err.message}); }
 });
 
+const agent = new https.Agent({
+  pfx: fs.readFileSync("./homologacao-890996-consulta24h-prod.p12"),
+  passphrase: process.env.EFI_CERT_PASS || ""
+});
+
+const auth = Buffer.from(
+  `${process.env.EFI_CLIENT_ID}:${process.env.EFI_CLIENT_SECRET}`
+).toString("base64");
+
+async function testarEfi() {
+  try {
+    const res = await axios.post(
+      "https://apis-h.efipay.com.br/v1/authorize",
+      { grant_type: "client_credentials" },
+      {
+        httpsAgent: agent,
+        headers: {
+          Authorization: `Basic ${auth}`,
+          "Content-Type": "application/json"
+        }
+      }
+    );
+
+    console.log("EFI OK:", res.data);
+  } catch (err) {
+    console.log("EFI ERRO:", err.response?.data || err.message);
+  }
+}
+
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log("Servidor rodando na porta", PORT));
+
+app.listen(PORT, () => {
+  console.log("Servidor rodando na porta", PORT);
+  testarEfi();
+});
