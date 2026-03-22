@@ -2305,8 +2305,8 @@ app.get("/api/test-db", async (req, res) => {
 
 // URL base: homologação. Troque EFI_ENV=producao quando for ao ar.
 const EFI_BASE_URL = process.env.EFI_ENV === "producao"
-  ? "https://apis.efipay.com.br"
-  : "https://apis-h.efipay.com.br";
+  ? "https://cobrancas.api.efipay.com.br"
+  : "https://cobrancas-h.api.efipay.com.br";
 
 // Cache do caminho do .p12 reconstruído — só grava uma vez por execução
 let _efiCertPath = null;
