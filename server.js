@@ -1,5 +1,7 @@
 import fs from "fs";
 import https from "https";
+import os from "os";
+import path from "path";
 import axios from "axios";
 import express from "express";
 import cors from "cors";
@@ -2295,38 +2297,107 @@ app.get("/api/test-db", async (req, res) => {
   catch (err) { res.status(500).json({error:err.message}); }
 });
 
-const agent = new https.Agent({
-  pfx: fs.readFileSync("./homologacao-890996-consulta24h-prod.p12"),
-  passphrase: process.env.EFI_CERT_PASS || ""
+// ── EFÍ: certificado + OAuth2 ─────────────────────────────────────────────────
+// Pré-requisito no Render: adicionar a env EFI_CERT_BASE64
+// Para gerar (Linux/Mac): base64 -w 0 seu-certificado.p12
+// macOS alternativo:   openssl base64 -in cert.p12 | tr -d '\n'
+
+
+// URL base: homologação. Troque EFI_ENV=producao quando for ao ar.
+const EFI_BASE_URL = process.env.EFI_ENV === "producao"
+  ? "https://apis.efipay.com.br"
+  : "https://apis-h.efipay.com.br";
+
+// Cache do caminho do .p12 reconstruído — só grava uma vez por execução
+let _efiCertPath = null;
+function getEfiCertPath() {
+  if (_efiCertPath) return _efiCertPath;
+  const b64 = process.env.EFI_CERT_BASE64;
+  if (!b64) throw new Error("[EFI] EFI_CERT_BASE64 não definida. Adicione no Render.");
+  const buf = Buffer.from(b64, "base64");
+  const tmpPath = path.join(os.tmpdir(), `efi_cert_${process.pid}.p12`);
+  fs.writeFileSync(tmpPath, buf);
+  _efiCertPath = tmpPath;
+  console.log("[EFI] Certificado reconstruído em:", tmpPath);
+  return tmpPath;
+}
+
+// Cache do https.Agent — reutiliza durante toda a vida do processo
+let _efiAgent = null;
+function getEfiAgent() {
+  if (_efiAgent) return _efiAgent;
+  _efiAgent = new https.Agent({
+    pfx: fs.readFileSync(getEfiCertPath()),
+    passphrase: process.env.EFI_CERT_PASS || ""
+  });
+  return _efiAgent;
+}
+
+/**
+ * Obtém access_token OAuth2 da Efí.
+ * Chame antes de qualquer request autenticado à API Efí.
+ */
+async function efiGetToken() {
+  const clientId     = process.env.EFI_CLIENT_ID;
+  const clientSecret = process.env.EFI_CLIENT_SECRET;
+  if (!clientId || !clientSecret) {
+    throw new Error("[EFI] EFI_CLIENT_ID ou EFI_CLIENT_SECRET não definidos");
+  }
+  const basicAuth = Buffer.from(`${clientId}:${clientSecret}`).toString("base64");
+  const response = await axios.post(
+    `${EFI_BASE_URL}/v1/authorize`,
+    { grant_type: "client_credentials" },
+    {
+      httpsAgent: getEfiAgent(),
+      headers: {
+        Authorization: `Basic ${basicAuth}`,
+        "Content-Type": "application/json"
+      }
+    }
+  );
+  return response.data.access_token; // string JWT
+}
+
+// ── EFÍ: rota de teste (admin) ────────────────────────────────────────────────
+// GET /api/efi/test?senha=ADMIN_PASSWORD
+// Confirma que o certificado e as credenciais estão funcionando.
+app.get("/api/efi/test", checkAdmin, async (req, res) => {
+  try {
+    const token = await efiGetToken();
+    console.log("[EFI] Teste OAuth2 OK");
+    return res.json({ ok: true, token_preview: token.slice(0, 20) + "..." });
+  } catch (e) {
+    console.error("[EFI] Teste falhou:", e.response?.data || e.message);
+    return res.status(500).json({ ok: false, error: e.response?.data || e.message });
+  }
 });
 
-const auth = Buffer.from(
-  `${process.env.EFI_CLIENT_ID}:${process.env.EFI_CLIENT_SECRET}`
-).toString("base64");
+// ── EFÍ: webhook de cartão (estrutura pronta para produção) ───────────────────
+// POST /api/efi/cartao/webhook
+// A Efí envia notificação aqui quando o status de uma cobrança muda.
+// Quando implementar cobrança de cartão, processe o evento aqui.
+app.post("/api/efi/cartao/webhook", async (req, res) => {
+  // Responde 200 imediatamente — Efí não aguarda processamento
+  res.sendStatus(200);
 
-async function testarEfi() {
   try {
-    const res = await axios.post(
-      "https://apis-h.efipay.com.br/v1/authorize",
-      { grant_type: "client_credentials" },
-      {
-        httpsAgent: agent,
-        headers: {
-          Authorization: `Basic ${auth}`,
-          "Content-Type": "application/json"
-        }
-      }
-    );
+    const evento = req.body;
+    if (!evento || typeof evento !== "object") return;
 
-    console.log("EFI OK:", res.data);
-  } catch (err) {
-    console.log("EFI ERRO:", err.response?.data || err.message);
+    console.log("[EFI-WEBHOOK] Evento recebido:", JSON.stringify(evento).slice(0, 300));
+
+    // Quando implementar cobrança de cartão, o evento terá estrutura similar a:
+    // { type: "charge.status.changed", data: { charge_id, status, ... } }
+    // Adicione o processamento aqui nessa etapa.
+
+  } catch (e) {
+    console.error("[EFI-WEBHOOK] Erro no processamento:", e.message);
   }
-}
+});
+// ── FIM EFÍ ───────────────────────────────────────────────────────────────────
 
 const PORT = process.env.PORT || 10000;
 
 app.listen(PORT, () => {
   console.log("Servidor rodando na porta", PORT);
-  testarEfi();
 });
