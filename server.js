@@ -2292,5 +2292,19 @@ app.get("/api/test-db", async (req, res) => {
   catch (err) { res.status(500).json({error:err.message}); }
 });
 
+app.get('/seed-gustavo-temp', async (req, res) => {
+  try {
+    const senha_hash = await bcrypt.hash('hibbohotel3', 10);
+    const r = await pool.query(
+      `INSERT INTO psicologos (nome,nome_exibicao,email,senha_hash,crp,uf,telefone,abordagem,focos,valor_sessao,atende_online,tem_avaliacao,valor_avaliacao,apresentacao,disponibilidade,status,ativo)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+       ON CONFLICT (email) DO UPDATE SET senha_hash=EXCLUDED.senha_hash,status='aprovado',ativo=true
+       RETURNING id,email,status,ativo`,
+      ['Gustavo Fonseca','Dr. Gustavo Fonseca','gustavosgbf@gmail.com',senha_hash,'00000','MA','','Psiquiatria','Ansiedade, saude mental','0,00',true,false,'','Responsavel pela plataforma.','A definir','aprovado',true]
+    );
+    res.json({ ok: true, psicologo: r.rows[0] });
+  } catch(e) { res.json({ ok: false, error: e.message }); }
+});
+
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log("Servidor rodando na porta", PORT));
