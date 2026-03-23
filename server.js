@@ -1644,6 +1644,13 @@ app.post('/api/psicologia/pagbank/order', rlGeral, async (req, res) => {
       await pool.query(`UPDATE agendamentos_psicologia SET status='cancelado' WHERE id=$1`, [agendamentoId]);
       return res.status(409).json({ ok: false, error: 'Horário indisponível. Por favor, escolha outro horário.' });
     }
+
+    const valorCentavos = Math.round(parseFloat(ag.valor_cobrado) * 100);
+    if (!valorCentavos || valorCentavos < 1) {
+      console.error('[PSI-PAGBANK] valor_cobrado inválido:', ag.valor_cobrado);
+      return res.status(400).json({ ok: false, error: 'Valor do agendamento inválido. Contate o suporte.' });
+    }
+
     const expiracao = new Date(Date.now() + 30 * 60 * 1000);
     const expiracaoISO = expiracao.toISOString().replace('Z', '-03:00');
 
@@ -1976,6 +1983,62 @@ app.patch('/api/psicologo/disponibilidade', authPsicologo, async (req, res) => {
     console.log(`[PSI-DISP] Psicólogo #${req.psicologoId} atualizou disponibilidade`);
     return res.json({ ok: true });
   } catch (e) { return res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// ── PSICOLOGIA: painel — upload de foto ───────────────────────────────────────
+// POST /api/psicologo/foto
+// Recebe imagem, faz upload pro R2, salva foto_url no banco
+app.post('/api/psicologo/foto', rlUpload, authPsicologo, upload.single('foto'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ ok: false, error: 'Nenhum arquivo enviado' });
+    const mime = req.file.mimetype;
+    if (!mime.startsWith('image/')) return res.status(400).json({ ok: false, error: 'Apenas imagens são aceitas' });
+    if (req.file.size > 5 * 1024 * 1024) return res.status(400).json({ ok: false, error: 'Imagem deve ter no máximo 5MB' });
+    const ext = req.file.originalname.split('.').pop().toLowerCase() || 'jpg';
+    const key = `psicologos/${req.psicologoId}_${Date.now()}.${ext}`;
+    await r2.send(new PutObjectCommand({
+      Bucket: process.env.R2_BUCKET_NAME,
+      Key: key,
+      Body: req.file.buffer,
+      ContentType: mime,
+    }));
+    const url = `${process.env.R2_PUBLIC_URL}/${key}`;
+    await pool.query(`UPDATE psicologos SET foto_url = $1 WHERE id = $2`, [url, req.psicologoId]);
+    console.log(`[PSI-FOTO] Psicólogo #${req.psicologoId} atualizou foto: ${url}`);
+    return res.json({ ok: true, foto_url: url });
+  } catch (e) {
+    console.error('[PSI-FOTO] Erro:', e.message);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── PSICOLOGIA: painel — editar perfil (apresentação, abordagem, focos) ───────
+// PATCH /api/psicologo/perfil
+app.patch('/api/psicologo/perfil', authPsicologo, async (req, res) => {
+  try {
+    const { apresentacao, abordagem, focos } = req.body || {};
+    if (apresentacao === undefined && abordagem === undefined && focos === undefined) {
+      return res.status(400).json({ ok: false, error: 'Nenhum campo enviado' });
+    }
+    await pool.query(
+      `UPDATE psicologos
+          SET apresentacao = COALESCE($1, apresentacao),
+              abordagem    = COALESCE($2, abordagem),
+              focos        = COALESCE($3, focos)
+        WHERE id = $4`,
+      [
+        apresentacao !== undefined ? String(apresentacao).trim() : null,
+        abordagem    !== undefined ? String(abordagem).trim()    : null,
+        focos        !== undefined ? String(focos).trim()        : null,
+        req.psicologoId
+      ]
+    );
+    console.log(`[PSI-PERFIL] Psicólogo #${req.psicologoId} atualizou perfil`);
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('[PSI-PERFIL] Erro:', e.message);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
 // ── PSICOLOGIA: Google Sheets — salvar dados do paciente aba Psicologia ───────
