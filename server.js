@@ -2531,7 +2531,7 @@ app.post("/api/efi/cartao/cobrar", rlGeral, async (req, res) => {
       }
 
       // Se já veio "paid" (ex: sandbox), confirma na hora igual ao webhook faria
-      if (status === "paid" && atendimentoId) {
+      if ((status === "paid" || status === "approved") && atendimentoId) {
         const { rows: atRows } = await pool.query(
           `UPDATE fila_atendimentos
               SET pagamento_status        = 'confirmado',
