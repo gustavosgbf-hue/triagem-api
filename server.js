@@ -310,6 +310,14 @@ async function initDB() {
     await pool.query(`ALTER TABLE agendamentos_psicologia ADD COLUMN IF NOT EXISTS paciente_id INTEGER REFERENCES pacientes(id)`).catch(()=>{});
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_ag_psi_paciente_id ON agendamentos_psicologia(paciente_id)`).catch(()=>{});
     await pool.query(`ALTER TABLE agendamentos_psicologia ADD COLUMN IF NOT EXISTS lembrete_psi_enviado BOOLEAN DEFAULT false`).catch(()=>{});
+    // ── CONTROLE FINANCEIRO DE SESSÕES ────────────────────────────────────────
+    await pool.query(`ALTER TABLE agendamentos_psicologia ADD COLUMN IF NOT EXISTS status_sessao TEXT NOT NULL DEFAULT 'agendado'`).catch(()=>{});
+    await pool.query(`ALTER TABLE agendamentos_psicologia ADD COLUMN IF NOT EXISTS realizado_em TIMESTAMPTZ`).catch(()=>{});
+    await pool.query(`ALTER TABLE agendamentos_psicologia ADD COLUMN IF NOT EXISTS valor_repasse NUMERIC(10,2)`).catch(()=>{});
+    await pool.query(`ALTER TABLE agendamentos_psicologia ADD COLUMN IF NOT EXISTS pago_psicologo BOOLEAN NOT NULL DEFAULT false`).catch(()=>{});
+    await pool.query(`ALTER TABLE agendamentos_psicologia ADD COLUMN IF NOT EXISTS data_pagamento_psicologo TIMESTAMPTZ`).catch(()=>{});
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_ag_psi_status_sessao ON agendamentos_psicologia(status_sessao)`).catch(()=>{});
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_ag_psi_pago_psicologo ON agendamentos_psicologia(pago_psicologo)`).catch(()=>{});
 
     // Índices de performance para queries frequentes
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_mensagens_atendimento ON mensagens(atendimento_id)`);
@@ -497,6 +505,10 @@ app.post("/api/doctor", handleChat);
 const PAGBANK_TOKEN = process.env.PAGBANK_TOKEN?.trim();
 const PAGBANK_URL   = "https://api.pagseguro.com";
 const VALOR_CENTAVOS = 4990; // R$ 49,90 — fixo no backend
+
+// Comissão da plataforma sobre sessões de psicologia (%)
+// Pode ser sobrescrita por variável de ambiente PSI_COMISSAO_PCT
+const PSI_COMISSAO_PCT = parseFloat(process.env.PSI_COMISSAO_PCT || '20');
 
 if (!PAGBANK_TOKEN) console.error("[PAGBANK] Token não configurado");
 
@@ -1846,10 +1858,12 @@ app.post('/api/psicologia/pagbank/webhook', async (req, res) => {
   try {
     const { rows } = await pool.query(
       `UPDATE agendamentos_psicologia
-          SET pagamento_status = 'confirmado', pagamento_confirmado_em = NOW(), status = 'confirmado'
+          SET pagamento_status = 'confirmado', pagamento_confirmado_em = NOW(), status = 'confirmado',
+              status_sessao = 'pago',
+              valor_repasse = ROUND(valor_cobrado * (1 - $2::numeric / 100), 2)
         WHERE pagbank_order_id = $1 AND pagamento_status = 'pendente'
-        RETURNING id, paciente_nome, psicologo_nome, horario_agendado, valor_cobrado, paciente_email`,
-      [orderId]
+        RETURNING id, paciente_nome, psicologo_nome, horario_agendado, valor_cobrado, paciente_email, tipo_consulta`,
+      [orderId, PSI_COMISSAO_PCT]
     );
     if (rows.length === 0) {
       console.log('[PSI-PAGBANK-WH] Order não encontrada ou já processada:', orderId);
@@ -1996,10 +2010,12 @@ app.post('/api/psicologia/efi/cartao/cobrar', rlGeral, async (req, res) => {
       if (status === 'paid' || status === 'approved') {
         const { rows } = await pool.query(
           `UPDATE agendamentos_psicologia
-              SET pagamento_status = 'confirmado', pagamento_confirmado_em = NOW(), status = 'confirmado'
+              SET pagamento_status = 'confirmado', pagamento_confirmado_em = NOW(), status = 'confirmado',
+                  status_sessao = 'pago',
+                  valor_repasse = ROUND(valor_cobrado * (1 - $2::numeric / 100), 2)
             WHERE id = $1 AND pagamento_status = 'pendente'
-            RETURNING id, paciente_nome, psicologo_nome, horario_agendado, valor_cobrado, paciente_email`,
-          [agendamentoId]
+            RETURNING id, paciente_nome, psicologo_nome, horario_agendado, valor_cobrado, paciente_email, tipo_consulta`,
+          [agendamentoId, PSI_COMISSAO_PCT]
         );
         if (rows[0]) {
           enviarEmailAdminPsicologia(rows[0]).catch(() => {});
@@ -2034,10 +2050,12 @@ app.post('/api/psicologia/efi/cartao/webhook', async (req, res) => {
       if (!chargeId) continue;
       const { rows } = await pool.query(
         `UPDATE agendamentos_psicologia
-            SET pagamento_status = 'confirmado', pagamento_confirmado_em = NOW(), status = 'confirmado'
+            SET pagamento_status = 'confirmado', pagamento_confirmado_em = NOW(), status = 'confirmado',
+                status_sessao = 'pago',
+                valor_repasse = ROUND(valor_cobrado * (1 - $2::numeric / 100), 2)
           WHERE efi_charge_id = $1 AND pagamento_status = 'pendente'
-          RETURNING id, paciente_nome, psicologo_nome, horario_agendado, valor_cobrado, paciente_email`,
-        [chargeId]
+          RETURNING id, paciente_nome, psicologo_nome, horario_agendado, valor_cobrado, paciente_email, tipo_consulta`,
+        [chargeId, PSI_COMISSAO_PCT]
       );
       if (rows[0]) {
         console.log(`[PSI-EFI-WH] Agendamento #${rows[0].id} confirmado via webhook`);
@@ -3653,6 +3671,471 @@ app.post("/api/efi/cartao/webhook", async (req, res) => {
   }
 });
 // ── FIM EFÍ ───────────────────────────────────────────────────────────────────
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CONTROLE FINANCEIRO DE SESSÕES DE PSICOLOGIA
+// ══════════════════════════════════════════════════════════════════════════════
+
+// POST /api/psicologia/:id/realizar  — admin ou psicólogo dono da sessão
+app.post('/api/psicologia/:id/realizar', async (req, res) => {
+  // Aceita checkAdmin (header x-admin-password) OU authPsicologo (Bearer token)
+  const senhaAdmin = process.env.ADMIN_PASSWORD;
+  const headerAdmin = req.headers['x-admin-password'] || req.query.senha;
+  let autorizadoPor = null;
+
+  if (senhaAdmin && headerAdmin === senhaAdmin) {
+    autorizadoPor = 'admin';
+  } else {
+    const auth = req.headers['authorization'] || '';
+    const tok  = auth.replace(/^Bearer\s+/i, '').trim();
+    if (tok) {
+      try {
+        const dec = jwt.verify(tok, JWT_SECRET);
+        if (dec.tipo === 'psicologo') autorizadoPor = 'psicologo:' + dec.id;
+      } catch(_) {}
+    }
+  }
+  if (!autorizadoPor) return res.status(403).json({ ok: false, error: 'Acesso negado' });
+
+  const id = parseInt(req.params.id, 10);
+  if (!id) return res.status(400).json({ ok: false, error: 'ID inválido' });
+
+  try {
+    // Se for psicólogo, garante que a sessão é dele
+    let whereExtra = '';
+    const params = [id];
+    if (autorizadoPor.startsWith('psicologo:')) {
+      whereExtra = ' AND psicologo_id = $2';
+      params.push(parseInt(autorizadoPor.split(':')[1], 10));
+    }
+
+    const { rows } = await pool.query(
+      `UPDATE agendamentos_psicologia
+          SET status_sessao = 'realizado', realizado_em = NOW()
+        WHERE id = $1${whereExtra}
+          AND status_sessao IN ('pago','agendado')
+          AND pagamento_status = 'confirmado'
+        RETURNING id, paciente_nome, psicologo_nome, status_sessao`,
+      params
+    );
+    if (rows.length === 0) return res.status(404).json({ ok: false, error: 'Agendamento não encontrado, já marcado ou pagamento não confirmado' });
+    console.log(`[PSI-REALIZAR] #${rows[0].id} marcado como realizado por ${autorizadoPor}`);
+    return res.json({ ok: true, agendamento: rows[0] });
+  } catch (e) {
+    console.error('[PSI-REALIZAR] Erro:', e.message);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// POST /api/psicologia/:id/faltou  — admin
+app.post('/api/psicologia/:id/faltou', checkAdmin, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!id) return res.status(400).json({ ok: false, error: 'ID inválido' });
+  try {
+    const { rows } = await pool.query(
+      `UPDATE agendamentos_psicologia SET status_sessao = 'faltou'
+        WHERE id = $1 AND status_sessao IN ('pago','agendado')
+        RETURNING id`,
+      [id]
+    );
+    if (rows.length === 0) return res.status(404).json({ ok: false, error: 'Não encontrado ou status incompatível' });
+    return res.json({ ok: true });
+  } catch (e) { return res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// POST /api/psicologia/:id/pagar  — admin only
+// Marca repasse como pago. Só funciona se status_sessao = 'realizado'.
+app.post('/api/psicologia/:id/pagar', checkAdmin, async (req, res) => {
+  const id = parseInt(req.params.id, 10);
+  if (!id) return res.status(400).json({ ok: false, error: 'ID inválido' });
+  try {
+    const { rows } = await pool.query(
+      `UPDATE agendamentos_psicologia
+          SET pago_psicologo = true, data_pagamento_psicologo = NOW()
+        WHERE id = $1
+          AND status_sessao = 'realizado'
+          AND pago_psicologo = false
+        RETURNING id, paciente_nome, psicologo_nome, valor_repasse`,
+      [id]
+    );
+    if (rows.length === 0) return res.status(404).json({ ok: false, error: 'Não encontrado, sessão não realizada ou já pago' });
+    console.log(`[PSI-PAGAR] #${rows[0].id} marcado como pago — repasse R$ ${rows[0].valor_repasse}`);
+    return res.json({ ok: true, agendamento: rows[0] });
+  } catch (e) {
+    console.error('[PSI-PAGAR] Erro:', e.message);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// GET /api/admin/psicologia/financeiro  — listagem para o painel admin
+// Filtros: ?psicologo_id=&mes=2025-03&status_sessao=
+app.get('/api/admin/psicologia/financeiro', checkAdmin, async (req, res) => {
+  try {
+    const { psicologo_id, mes, status_sessao } = req.query;
+    const conds = ['1=1'];
+    const params = [];
+
+    if (psicologo_id) { params.push(parseInt(psicologo_id, 10)); conds.push(`ap.psicologo_id = $${params.length}`); }
+    if (mes) {
+      // mes = "2025-03"
+      params.push(mes + '-01');
+      conds.push(`DATE_TRUNC('month', ap.horario_agendado) = DATE_TRUNC('month', $${params.length}::date)`);
+    }
+    if (status_sessao) { params.push(status_sessao); conds.push(`ap.status_sessao = $${params.length}`); }
+
+    const { rows } = await pool.query(
+      `SELECT ap.id,
+              ap.psicologo_id,
+              ap.psicologo_nome,
+              ap.paciente_nome,
+              ap.paciente_email,
+              ap.tipo_consulta,
+              ap.horario_agendado,
+              ap.valor_cobrado,
+              ap.valor_repasse,
+              ap.status_sessao,
+              ap.pagamento_status,
+              ap.pago_psicologo,
+              ap.data_pagamento_psicologo,
+              ap.realizado_em
+         FROM agendamentos_psicologia ap
+        WHERE ${conds.join(' AND ')}
+        ORDER BY ap.horario_agendado DESC
+        LIMIT 500`,
+      params
+    );
+    return res.json({ ok: true, sessoes: rows, comissao_pct: PSI_COMISSAO_PCT });
+  } catch (e) {
+    console.error('[PSI-FIN] Erro:', e.message);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// GET /api/admin/psicologia/resumo  — totais por psicólogo
+app.get('/api/admin/psicologia/resumo', checkAdmin, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT ap.psicologo_id,
+              ap.psicologo_nome,
+              COUNT(*) FILTER (WHERE ap.status_sessao = 'realizado')                          AS total_realizadas,
+              COUNT(*) FILTER (WHERE ap.status_sessao = 'realizado' AND ap.pago_psicologo = false) AS total_pendente_pagamento,
+              COUNT(*) FILTER (WHERE ap.pago_psicologo = true)                                AS total_pagas,
+              COALESCE(SUM(ap.valor_repasse) FILTER (WHERE ap.status_sessao = 'realizado'), 0) AS valor_total_repasse,
+              COALESCE(SUM(ap.valor_repasse) FILTER (WHERE ap.status_sessao = 'realizado' AND ap.pago_psicologo = false), 0) AS valor_pendente,
+              COALESCE(SUM(ap.valor_repasse) FILTER (WHERE ap.pago_psicologo = true), 0)       AS valor_pago
+         FROM agendamentos_psicologia ap
+        GROUP BY ap.psicologo_id, ap.psicologo_nome
+        ORDER BY ap.psicologo_nome`
+    );
+    return res.json({ ok: true, resumo: rows, comissao_pct: PSI_COMISSAO_PCT });
+  } catch (e) {
+    console.error('[PSI-RESUMO] Erro:', e.message);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// GET /api/admin/psicologia/psicologos-lista  — para popular filtro no painel
+app.get('/api/admin/psicologia/psicologos-lista', checkAdmin, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, nome_exibicao AS nome FROM psicologos WHERE ativo = true ORDER BY nome_exibicao`
+    );
+    return res.json({ ok: true, psicologos: rows });
+  } catch (e) { return res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// GET /admin/psicologia  — painel financeiro (autenticação feita no próprio HTML via x-admin-password)
+app.get('/admin/psicologia', (req, res) => {
+  const html = `<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Financeiro Psicologia · Admin · ConsultaJá24h</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0f1117;--surface:#181c25;--surface2:#1e2330;--border:rgba(255,255,255,.07);
+  --text:#e8eaf0;--text2:#8b8fa8;--text3:#555a70;
+  --blue:#4e7cf6;--blue-dim:rgba(78,124,246,.15);
+  --green:#34d399;--green-dim:rgba(52,211,153,.12);
+  --yellow:#fbbf24;--yellow-dim:rgba(251,191,36,.12);
+  --red:#f87171;--red-dim:rgba(248,113,113,.12);
+  --purple:#a78bfa;--purple-dim:rgba(167,139,250,.12);
+  --radius:10px;
+}
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap');
+body{background:var(--bg);color:var(--text);font-family:'IBM Plex Sans',sans-serif;font-size:14px;min-height:100vh;line-height:1.5}
+nav{background:var(--surface);border-bottom:1px solid var(--border);padding:0 28px;height:52px;display:flex;align-items:center;gap:16px;position:sticky;top:0;z-index:100}
+.nav-brand{font-family:'IBM Plex Mono',monospace;font-size:.8rem;font-weight:600;color:var(--blue);letter-spacing:.08em;text-transform:uppercase}
+.nav-sep{color:var(--border);font-size:1.2rem}
+.nav-title{font-size:.82rem;color:var(--text2)}
+.nav-right{margin-left:auto;display:flex;align-items:center;gap:10px}
+.badge-admin{background:var(--blue-dim);color:var(--blue);font-size:.68rem;font-weight:600;padding:3px 9px;border-radius:999px;letter-spacing:.05em;text-transform:uppercase;border:1px solid rgba(78,124,246,.25)}
+#login-overlay{position:fixed;inset:0;background:var(--bg);z-index:999;display:flex;align-items:center;justify-content:center}
+.login-box{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:40px 36px;width:340px}
+.login-box h2{font-family:'IBM Plex Mono',monospace;font-size:1rem;color:var(--blue);margin-bottom:6px}
+.login-box p{font-size:.82rem;color:var(--text2);margin-bottom:24px}
+.login-box input{width:100%;background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:10px 14px;color:var(--text);font-family:inherit;font-size:.88rem;outline:none;transition:border .2s}
+.login-box input:focus{border-color:var(--blue)}
+.login-box button{margin-top:14px;width:100%;background:var(--blue);color:#fff;border:none;border-radius:8px;padding:11px;font-family:inherit;font-size:.88rem;font-weight:600;cursor:pointer;transition:opacity .2s}
+.login-box button:hover{opacity:.85}
+.login-err{margin-top:10px;font-size:.78rem;color:var(--red);display:none}
+main{max-width:1280px;margin:0 auto;padding:28px 24px}
+.page-header{display:flex;align-items:baseline;justify-content:space-between;margin-bottom:24px;gap:16px;flex-wrap:wrap}
+.page-header h1{font-family:'IBM Plex Mono',monospace;font-size:1rem;font-weight:600;letter-spacing:.04em}
+.page-header p{font-size:.78rem;color:var(--text2);margin-top:3px}
+.kpi-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:28px}
+.kpi{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:16px 18px}
+.kpi-label{font-size:.68rem;font-weight:600;text-transform:uppercase;letter-spacing:.1em;color:var(--text3);margin-bottom:6px}
+.kpi-val{font-family:'IBM Plex Mono',monospace;font-size:1.3rem;font-weight:500}
+.kpi-val.green{color:var(--green)}.kpi-val.yellow{color:var(--yellow)}.kpi-val.blue{color:var(--blue)}
+.filters{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:16px 18px;display:flex;flex-wrap:wrap;gap:12px;margin-bottom:20px;align-items:flex-end}
+.f-group{display:flex;flex-direction:column;gap:5px}
+.f-group label{font-size:.68rem;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:var(--text3)}
+.f-group select,.f-group input{background:var(--bg);border:1px solid var(--border);border-radius:7px;padding:7px 11px;color:var(--text);font-family:inherit;font-size:.82rem;outline:none;min-width:150px;transition:border .2s}
+.f-group select:focus,.f-group input:focus{border-color:var(--blue)}
+.btn{padding:8px 18px;border-radius:7px;border:none;font-family:inherit;font-size:.82rem;font-weight:600;cursor:pointer;transition:opacity .2s}
+.btn:hover{opacity:.82}
+.btn-primary{background:var(--blue);color:#fff}
+.btn-ghost{background:var(--surface2);color:var(--text2);border:1px solid var(--border)}
+.tabs{display:flex;gap:2px;margin-bottom:20px;background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:4px;width:fit-content}
+.tab{padding:7px 18px;border-radius:7px;font-size:.8rem;font-weight:500;cursor:pointer;color:var(--text2);border:none;background:none;font-family:inherit;transition:all .2s}
+.tab.active{background:var(--blue);color:#fff}
+.table-wrap{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);overflow:auto}
+table{width:100%;border-collapse:collapse;font-size:.8rem}
+thead th{padding:10px 14px;text-align:left;font-size:.65rem;font-weight:600;text-transform:uppercase;letter-spacing:.1em;color:var(--text3);border-bottom:1px solid var(--border);white-space:nowrap;position:sticky;top:0;background:var(--surface)}
+tbody tr{border-bottom:1px solid var(--border);transition:background .15s}
+tbody tr:last-child{border-bottom:none}
+tbody tr:hover{background:rgba(255,255,255,.025)}
+td{padding:10px 14px;vertical-align:middle;white-space:nowrap}
+.td-wrap{white-space:normal;min-width:120px;max-width:200px}
+.chip{display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border-radius:999px;font-size:.68rem;font-weight:600;text-transform:uppercase;letter-spacing:.04em;border:1px solid transparent}
+.chip-agendado{background:var(--purple-dim);color:var(--purple);border-color:rgba(167,139,250,.2)}
+.chip-pago{background:var(--blue-dim);color:var(--blue);border-color:rgba(78,124,246,.2)}
+.chip-realizado{background:var(--green-dim);color:var(--green);border-color:rgba(52,211,153,.2)}
+.chip-cancelado{background:var(--red-dim);color:var(--red);border-color:rgba(248,113,113,.2)}
+.chip-faltou{background:var(--yellow-dim);color:var(--yellow);border-color:rgba(251,191,36,.2)}
+.chip-pago-sim{background:var(--green-dim);color:var(--green);border-color:rgba(52,211,153,.2)}
+.chip-pago-nao{background:rgba(255,255,255,.04);color:var(--text3);border-color:var(--border)}
+.btn-sm{padding:4px 11px;border-radius:6px;font-size:.7rem;font-weight:600;border:none;cursor:pointer;font-family:inherit;transition:opacity .2s;white-space:nowrap}
+.btn-sm:hover{opacity:.78}
+.btn-sm:disabled{opacity:.3;cursor:not-allowed}
+.btn-realizar{background:var(--green-dim);color:var(--green);border:1px solid rgba(52,211,153,.25)}
+.btn-pagar{background:var(--blue-dim);color:var(--blue);border:1px solid rgba(78,124,246,.25)}
+.btn-faltou{background:var(--yellow-dim);color:var(--yellow);border:1px solid rgba(251,191,36,.25)}
+.resumo-grid{display:grid;gap:10px}
+.res-row{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:14px 18px;display:grid;grid-template-columns:2fr 1fr 1fr 1fr 1fr;gap:12px;align-items:center}
+.res-nome{font-weight:500;font-size:.88rem}
+.res-num{font-family:'IBM Plex Mono',monospace;font-size:.85rem;text-align:right}
+.res-header{background:transparent;border:none;padding:4px 18px}
+.res-header .res-nome,.res-header .res-num{font-size:.65rem;font-weight:600;text-transform:uppercase;letter-spacing:.1em;color:var(--text3)}
+.toast{position:fixed;bottom:24px;right:24px;background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:12px 18px;font-size:.82rem;color:var(--text);box-shadow:0 8px 32px rgba(0,0,0,.4);z-index:9999;transform:translateY(80px);opacity:0;transition:all .3s;pointer-events:none}
+.toast.show{transform:translateY(0);opacity:1}
+.toast.ok{border-color:rgba(52,211,153,.3);color:var(--green)}
+.toast.err{border-color:rgba(248,113,113,.3);color:var(--red)}
+.empty{padding:48px 24px;text-align:center;color:var(--text3);font-size:.82rem}
+.loading{padding:48px 24px;text-align:center;color:var(--text3);font-size:.78rem;font-family:'IBM Plex Mono',monospace}
+@media(max-width:700px){.kpi-grid{grid-template-columns:1fr 1fr}.res-row{grid-template-columns:1fr 1fr;gap:8px}.filters{gap:8px}main{padding:16px 12px}}
+</style>
+</head>
+<body>
+<div id="login-overlay">
+  <div class="login-box">
+    <h2>ADMIN</h2>
+    <p>Painel financeiro de psicologia · ConsultaJá24h</p>
+    <input id="inp-senha" type="password" placeholder="Senha de administrador" onkeydown="if(event.key==='Enter')autenticar()"/>
+    <button onclick="autenticar()">Entrar</button>
+    <div class="login-err" id="login-err">Senha incorreta.</div>
+  </div>
+</div>
+<nav>
+  <span class="nav-brand">ConsultaJá24h</span>
+  <span class="nav-sep">/</span>
+  <span class="nav-title">Financeiro Psicologia</span>
+  <div class="nav-right">
+    <span class="badge-admin">Admin</span>
+    <button class="btn btn-ghost" style="font-size:.72rem;padding:5px 12px" onclick="sair()">Sair</button>
+  </div>
+</nav>
+<main>
+  <div class="page-header">
+    <div><h1>Controle Financeiro — Psicologia</h1><p id="comissao-label">Comissão: carregando…</p></div>
+    <button class="btn btn-ghost" onclick="recarregar()" style="font-size:.78rem">↻ Atualizar</button>
+  </div>
+  <div class="kpi-grid">
+    <div class="kpi"><div class="kpi-label">Sessões realizadas</div><div class="kpi-val" id="k-realizadas">—</div></div>
+    <div class="kpi"><div class="kpi-label">A pagar (pendente)</div><div class="kpi-val yellow" id="k-pendente">—</div></div>
+    <div class="kpi"><div class="kpi-label">Total pago</div><div class="kpi-val green" id="k-pago">—</div></div>
+    <div class="kpi"><div class="kpi-label">Comissão acumulada</div><div class="kpi-val blue" id="k-comissao">—</div></div>
+  </div>
+  <div class="tabs">
+    <button class="tab active" onclick="mudarAba('sessoes',this)">Sessões</button>
+    <button class="tab" onclick="mudarAba('resumo',this)">Resumo por Psicólogo</button>
+  </div>
+  <div id="aba-sessoes">
+    <div class="filters">
+      <div class="f-group"><label>Psicólogo</label><select id="f-psicologo"><option value="">Todos</option></select></div>
+      <div class="f-group"><label>Mês</label><input type="month" id="f-mes"/></div>
+      <div class="f-group"><label>Status sessão</label>
+        <select id="f-status">
+          <option value="">Todos</option>
+          <option value="agendado">Agendado</option>
+          <option value="pago">Pago (aguardando sessão)</option>
+          <option value="realizado">Realizado</option>
+          <option value="faltou">Faltou</option>
+          <option value="cancelado">Cancelado</option>
+        </select>
+      </div>
+      <button class="btn btn-primary" onclick="buscarSessoes()">Filtrar</button>
+      <button class="btn btn-ghost" onclick="limparFiltros()">Limpar</button>
+    </div>
+    <div class="table-wrap" id="tabela-wrap"><div class="loading">Carregando</div></div>
+  </div>
+  <div id="aba-resumo" style="display:none">
+    <div id="resumo-wrap" class="resumo-grid"><div class="loading">Carregando</div></div>
+  </div>
+</main>
+<div class="toast" id="toast"></div>
+<script>
+const API='https://triagem-api.onrender.com';
+let SENHA='',COMISSAO_PCT=20;
+function autenticar(){
+  const s=document.getElementById('inp-senha').value.trim();
+  if(!s)return;SENHA=s;
+  fetch(API+'/api/admin/psicologia/resumo',{headers:{'x-admin-password':SENHA}})
+    .then(r=>{
+      if(r.status===403){document.getElementById('login-err').style.display='block';SENHA='';return;}
+      sessionStorage.setItem('adm_pw',SENHA);
+      document.getElementById('login-overlay').style.display='none';
+      iniciar();
+    }).catch(()=>{document.getElementById('login-err').style.display='block';SENHA='';});
+}
+function sair(){sessionStorage.removeItem('adm_pw');location.reload();}
+function hdr(){return{'Content-Type':'application/json','x-admin-password':SENHA};}
+function iniciar(){
+  document.getElementById('f-mes').value=new Date().toISOString().slice(0,7);
+  carregarPsicologos();buscarSessoes();buscarResumo();
+}
+async function carregarPsicologos(){
+  try{const r=await fetch(API+'/api/admin/psicologia/psicologos-lista',{headers:hdr()});
+  const d=await r.json();if(!d.ok)return;
+  const sel=document.getElementById('f-psicologo');
+  d.psicologos.forEach(p=>{const o=document.createElement('option');o.value=p.id;o.textContent=p.nome;sel.appendChild(o);});}
+  catch(_){}
+}
+function recarregar(){buscarSessoes();buscarResumo();}
+async function buscarSessoes(){
+  document.getElementById('tabela-wrap').innerHTML='<div class="loading">Carregando</div>';
+  const psi=document.getElementById('f-psicologo').value;
+  const mes=document.getElementById('f-mes').value;
+  const st=document.getElementById('f-status').value;
+  let url=API+'/api/admin/psicologia/financeiro?';
+  if(psi)url+='psicologo_id='+psi+'&';
+  if(mes)url+='mes='+mes+'&';
+  if(st)url+='status_sessao='+st+'&';
+  try{
+    const r=await fetch(url,{headers:hdr()});const d=await r.json();
+    if(!d.ok)throw new Error(d.error);
+    COMISSAO_PCT=d.comissao_pct||20;
+    document.getElementById('comissao-label').textContent='Comissão da plataforma: '+COMISSAO_PCT+'% (var PSI_COMISSAO_PCT)';
+    renderTabela(d.sessoes||[]);atualizarKPIs(d.sessoes||[]);
+  }catch(e){document.getElementById('tabela-wrap').innerHTML='<div class="empty">Erro: '+e.message+'</div>';}
+}
+function limparFiltros(){
+  document.getElementById('f-psicologo').value='';
+  document.getElementById('f-mes').value=new Date().toISOString().slice(0,7);
+  document.getElementById('f-status').value='';buscarSessoes();
+}
+function atualizarKPIs(rows){
+  const realizadas=rows.filter(r=>r.status_sessao==='realizado').length;
+  const pendente=rows.filter(r=>r.status_sessao==='realizado'&&!r.pago_psicologo).reduce((s,r)=>s+parseFloat(r.valor_repasse||0),0);
+  const pago=rows.filter(r=>r.pago_psicologo).reduce((s,r)=>s+parseFloat(r.valor_repasse||0),0);
+  const cobradoReal=rows.filter(r=>r.status_sessao==='realizado').reduce((s,r)=>s+parseFloat(r.valor_cobrado||0),0);
+  const repasseReal=rows.filter(r=>r.status_sessao==='realizado').reduce((s,r)=>s+parseFloat(r.valor_repasse||0),0);
+  document.getElementById('k-realizadas').textContent=realizadas;
+  document.getElementById('k-pendente').textContent=fmtR(pendente);
+  document.getElementById('k-pago').textContent=fmtR(pago);
+  document.getElementById('k-comissao').textContent=fmtR(cobradoReal-repasseReal);
+}
+function renderTabela(rows){
+  if(!rows.length){document.getElementById('tabela-wrap').innerHTML='<div class="empty">Nenhuma sessão encontrada.</div>';return;}
+  let html='<table><thead><tr><th>#</th><th>Psicólogo</th><th>Paciente</th><th>Tipo</th><th>Data/Hora</th><th>Status Sessão</th><th>Valor Consulta</th><th>Valor Repasse</th><th>Pago Psicólogo</th><th>Ações</th></tr></thead><tbody>';
+  rows.forEach(s=>{
+    const stChip=chipStatus(s.status_sessao);
+    const pagoChip=s.pago_psicologo?'<span class="chip chip-pago-sim">✓ Sim</span>':'<span class="chip chip-pago-nao">Não</span>';
+    const repasse=s.valor_repasse?fmtR(s.valor_repasse):'<span style="color:var(--text3)">—</span>';
+    const tipo=s.tipo_consulta==='avaliacao'?'Avaliação':'Psicoterapia';
+    let acoes='';
+    if(s.status_sessao==='pago'||s.status_sessao==='agendado'){
+      acoes='<button class="btn-sm btn-realizar" onclick="realizar('+s.id+',this)">✓ Realizado</button> <button class="btn-sm btn-faltou" onclick="faltou('+s.id+',this)">✗ Faltou</button>';
+    }else if(s.status_sessao==='realizado'&&!s.pago_psicologo){
+      acoes='<button class="btn-sm btn-pagar" onclick="pagar('+s.id+',this)">$ Pagar</button>';
+    }else{acoes='<span style="color:var(--text3);font-size:.7rem">—</span>';}
+    const dataPago=s.data_pagamento_psicologo?'<br><span style="color:var(--text3);font-size:.68rem">'+fmtD(s.data_pagamento_psicologo)+'</span>':'';
+    html+='<tr><td style="color:var(--text3);font-family:\'IBM Plex Mono\',monospace">#'+s.id+'</td><td class="td-wrap">'+esc(s.psicologo_nome)+'</td><td class="td-wrap">'+esc(s.paciente_nome)+'<br><span style="color:var(--text3);font-size:.7rem">'+esc(s.paciente_email)+'</span></td><td>'+tipo+'</td><td style="font-family:\'IBM Plex Mono\',monospace;font-size:.75rem">'+fmtD(s.horario_agendado)+'</td><td>'+stChip+'</td><td style="font-family:\'IBM Plex Mono\',monospace">'+fmtR(s.valor_cobrado)+'</td><td style="font-family:\'IBM Plex Mono\',monospace">'+repasse+'</td><td>'+pagoChip+dataPago+'</td><td>'+acoes+'</td></tr>';
+  });
+  html+='</tbody></table>';
+  document.getElementById('tabela-wrap').innerHTML=html;
+}
+async function buscarResumo(){
+  document.getElementById('resumo-wrap').innerHTML='<div class="loading">Carregando</div>';
+  try{
+    const r=await fetch(API+'/api/admin/psicologia/resumo',{headers:hdr()});
+    const d=await r.json();if(!d.ok)throw new Error(d.error);
+    renderResumo(d.resumo||[]);
+  }catch(e){document.getElementById('resumo-wrap').innerHTML='<div class="empty">Erro: '+e.message+'</div>';}
+}
+function renderResumo(rows){
+  if(!rows.length){document.getElementById('resumo-wrap').innerHTML='<div class="empty">Nenhum dado ainda.</div>';return;}
+  let html='<div class="res-row res-header"><div class="res-nome">Psicólogo</div><div class="res-num">Realizadas</div><div class="res-num">Total Repasse</div><div class="res-num" style="color:var(--yellow)">Pendente</div><div class="res-num" style="color:var(--green)">Pago</div></div>';
+  rows.forEach(r=>{
+    html+='<div class="res-row"><div class="res-nome">'+esc(r.psicologo_nome)+'</div><div class="res-num">'+r.total_realizadas+'</div><div class="res-num">'+fmtR(r.valor_total_repasse)+'</div><div class="res-num" style="color:var(--yellow)">'+fmtR(r.valor_pendente)+'</div><div class="res-num" style="color:var(--green)">'+fmtR(r.valor_pago)+'</div></div>';
+  });
+  document.getElementById('resumo-wrap').innerHTML=html;
+}
+async function realizar(id,btn){
+  btn.disabled=true;btn.textContent='…';
+  try{const r=await fetch(API+'/api/psicologia/'+id+'/realizar',{method:'POST',headers:hdr()});
+  const d=await r.json();if(!d.ok)throw new Error(d.error);
+  toast('Sessão marcada como realizada.','ok');buscarSessoes();buscarResumo();
+  }catch(e){toast('Erro: '+e.message,'err');btn.disabled=false;btn.textContent='✓ Realizado';}
+}
+async function faltou(id,btn){
+  if(!confirm('Marcar paciente como faltou?'))return;
+  btn.disabled=true;btn.textContent='…';
+  try{const r=await fetch(API+'/api/psicologia/'+id+'/faltou',{method:'POST',headers:hdr()});
+  const d=await r.json();if(!d.ok)throw new Error(d.error);
+  toast('Marcado como faltou.','ok');buscarSessoes();
+  }catch(e){toast('Erro: '+e.message,'err');btn.disabled=false;btn.textContent='✗ Faltou';}
+}
+async function pagar(id,btn){
+  if(!confirm('Confirmar pagamento do repasse ao psicólogo?'))return;
+  btn.disabled=true;btn.textContent='…';
+  try{const r=await fetch(API+'/api/psicologia/'+id+'/pagar',{method:'POST',headers:hdr()});
+  const d=await r.json();if(!d.ok)throw new Error(d.error);
+  toast('Repasse registrado como pago.','ok');buscarSessoes();buscarResumo();
+  }catch(e){toast('Erro: '+e.message,'err');btn.disabled=false;btn.textContent='$ Pagar';}
+}
+function mudarAba(aba,el){
+  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));el.classList.add('active');
+  document.getElementById('aba-sessoes').style.display=aba==='sessoes'?'block':'none';
+  document.getElementById('aba-resumo').style.display=aba==='resumo'?'block':'none';
+  if(aba==='resumo')buscarResumo();
+}
+function chipStatus(s){const m={agendado:['chip-agendado','Agendado'],pago:['chip-pago','Pago'],realizado:['chip-realizado','Realizado'],cancelado:['chip-cancelado','Cancelado'],faltou:['chip-faltou','Faltou']};const[cls,label]=m[s]||['chip-agendado',s];return '<span class="chip '+cls+'">'+label+'</span>';}
+function fmtR(v){return 'R$ '+parseFloat(v||0).toFixed(2).replace('.',',');}
+function fmtD(iso){if(!iso)return '—';return new Date(iso).toLocaleString('pt-BR',{timeZone:'America/Fortaleza',day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit'});}
+function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+function toast(msg,tipo){const el=document.getElementById('toast');el.textContent=msg;el.className='toast show '+(tipo||'');clearTimeout(el._t);el._t=setTimeout(()=>el.classList.remove('show'),3200);}
+const saved=sessionStorage.getItem('adm_pw');
+if(saved){SENHA=saved;document.getElementById('login-overlay').style.display='none';iniciar();}
+</script>
+</body>
+</html>`;
+  res.setHeader('Content-Type', 'text/html; charset=utf-8');
+  res.send(html);
+});
 
 const PORT = process.env.PORT || 10000;
 
