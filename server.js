@@ -1432,7 +1432,7 @@ app.get('/api/paciente/agendamentos', authPaciente, async (req, res) => {
 });
 
 // ── FIM PACIENTES ─────────────────────────────────────────────────────────────
-({ nome, email, crp, uf, telefone, abordagem, valor_sessao }) {
+async function enviarEmailNovoCadastroPsicologo({ nome, email, crp, uf, telefone, abordagem, valor_sessao }) {
   const RESEND_KEY = process.env.RESEND_API_KEY;
   if (!RESEND_KEY) { console.warn('[EMAIL-PSICOLOGO] RESEND_API_KEY nao definida.'); return; }
   try {
@@ -1474,7 +1474,7 @@ app.post('/api/psicologo/cadastro', rlGeral, async (req, res) => {
     if (!nome || !email || !senha || !crp || !uf || !telefone || !abordagem || !valor_sessao) {
       return res.status(400).json({ ok: false, error: 'Todos os campos obrigatorios devem ser preenchidos' });
     }
-    if (!/^[^s@]+@[^s@]+.[^s@]+$/.test(String(email))) {
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email))) {
       return res.status(400).json({ ok: false, error: 'Informe um e-mail valido' });
     }
     const dupCrp = await pool.query(
@@ -1622,27 +1622,28 @@ app.get('/api/admin/psicologos', checkAdmin, async (req, res) => {
 
 // ── PSICOLOGIA: criar agendamento (antes do pagamento) ───────────────────────
 // POST /api/psicologia/agendamento/criar
-// Paciente logado envia: psicologoId, horario, tipo_consulta, nome, email, tel, cpf
-// Se Authorization header presente com token de paciente, vincula paciente_id automaticamente
+// Exige paciente autenticado — token JWT com tipo='paciente' obrigatório
 app.post('/api/psicologia/agendamento/criar', rlGeral, async (req, res) => {
   try {
+    // Exige autenticação do paciente
+    const auth = req.headers['authorization'] || '';
+    const tok = auth.replace(/^Bearer\s+/i, '').trim();
+    if (!tok) return res.status(401).json({ ok: false, error: 'Login obrigatório para agendar', code: 'AUTH_REQUIRED' });
+    let pacienteId = null;
+    try {
+      const dec = jwt.verify(tok, JWT_SECRET);
+      if (dec.tipo !== 'paciente') return res.status(401).json({ ok: false, error: 'Token inválido', code: 'AUTH_REQUIRED' });
+      pacienteId = dec.id;
+    } catch(_) {
+      return res.status(401).json({ ok: false, error: 'Sessão expirada. Faça login novamente.', code: 'AUTH_REQUIRED' });
+    }
+
     const { psicologoId, horario_agendado, tipo_consulta,
             paciente_nome, paciente_email, paciente_tel, paciente_cpf } = req.body || {};
 
     if (!psicologoId || !horario_agendado || !paciente_nome || !paciente_email) {
       return res.status(400).json({ ok: false, error: 'psicologoId, horario_agendado, paciente_nome e paciente_email são obrigatórios' });
     }
-
-    // Tenta extrair paciente_id do token se presente (opcional — não obriga login)
-    let pacienteId = null;
-    try {
-      const auth = req.headers['authorization'] || '';
-      const tok = auth.replace(/^Bearer\s+/i, '').trim();
-      if (tok) {
-        const dec = jwt.verify(tok, JWT_SECRET);
-        if (dec.tipo === 'paciente') pacienteId = dec.id;
-      }
-    } catch(_) { /* token ausente ou inválido — continua sem vínculo */ }
 
     // Busca psicólogo e seu valor — feito no BACKEND, nunca confiar no frontend
     const psiRes = await pool.query(
