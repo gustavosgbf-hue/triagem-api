@@ -1436,11 +1436,13 @@ app.get('/api/paciente/me', authPaciente, async (req, res) => {
 app.get('/api/paciente/agendamentos', authPaciente, async (req, res) => {
   try {
     const { rows } = await pool.query(
-      `SELECT id, psicologo_nome, tipo_consulta, horario_agendado,
-              valor_cobrado, pagamento_status, status, criado_em
-         FROM agendamentos_psicologia
-        WHERE paciente_id = $1
-        ORDER BY horario_agendado DESC`,
+      `SELECT ap.id, ap.psicologo_nome, ap.tipo_consulta, ap.horario_agendado,
+              ap.valor_cobrado, ap.pagamento_status, ap.status, ap.criado_em,
+              ps.formulario_url
+         FROM agendamentos_psicologia ap
+         LEFT JOIN psicologos ps ON ps.id = ap.psicologo_id
+        WHERE ap.paciente_id = $1
+        ORDER BY ap.horario_agendado DESC`,
       [req.pacienteId]
     );
     return res.json({ ok: true, agendamentos: rows });
