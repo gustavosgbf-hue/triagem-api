@@ -525,7 +525,7 @@ app.post("/api/pagbank/order", async (req, res) => {
       reference_id: "CJ-" + Date.now() + "-" + Math.random().toString(36).slice(2,6).toUpperCase(),
       customer: {
         name:   nome,
-        email:  email || `paciente+${cpf.replace(/\D/g,"")}@consultaja24h.com.br`,
+        email:  email || `paciente.${cpf.replace(/\D/g,"")}@consultaja24h.com.br`,
         tax_id: cpf.replace(/\D/g, "")
       },
       items: [{ name: "Consulta Médica Online — ConsultaJá24h", quantity: 1, unit_amount: VALOR_CENTAVOS }],
@@ -1448,15 +1448,29 @@ app.get('/api/paciente/agendamentos', authPaciente, async (req, res) => {
 });
 
 // ── FIM PACIENTES ─────────────────────────────────────────────────────────────
+// Mapeamento UF → número do conselho regional CRP (CFP oficial)
+function formatarCRP(crp, uf) {
+  const mapa = {
+    AC:21, AL:15, AM:20, AP:21, BA:3, CE:11, DF:1, ES:16,
+    GO:9,  MA:22, MG:4,  MS:14, MT:10, PA:10, PB:13, PE:2,
+    PI:22, PR:8,  RJ:5,  RN:12, RO:20, RR:20, RS:7,  SC:12,
+    SE:15, SP:6,  TO:9
+  };
+  const regional = mapa[String(uf || '').toUpperCase()];
+  const numero   = String(crp || '').replace(/\D/g, '');
+  if (!numero) return '';
+  return regional ? `CRP ${regional}/${numero}` : `CRP ${numero}/${String(uf || '').toUpperCase()}`;
+}
+
 async function enviarEmailNovoCadastroPsicologo({ nome, email, crp, uf, telefone, abordagem, valor_sessao }) {
   const RESEND_KEY = process.env.RESEND_API_KEY;
   if (!RESEND_KEY) { console.warn('[EMAIL-PSICOLOGO] RESEND_API_KEY nao definida.'); return; }
   try {
-    const html = `<div style="background:#060d0b;padding:32px 20px;font-family:sans-serif"><div style="max-width:520px;margin:0 auto;background:#0d1a14;border:1px solid rgba(255,255,255,.08);border-radius:16px;overflow:hidden"><div style="padding:24px;border-bottom:1px solid rgba(255,255,255,.08)"><span style="font-size:1.1rem;font-weight:700;color:#26508e">ConsultaJá24h</span><span style="font-size:.8rem;color:rgba(255,255,255,.4);margin-left:8px">Novo cadastro pendente de psicólogo</span></div><div style="padding:24px"><p style="color:rgba(255,255,255,.9);font-size:.95rem;margin-bottom:20px">Um novo psicólogo solicitou acesso:</p><table style="width:100%;border-collapse:collapse;font-size:.85rem"><tr><td style="color:rgba(255,255,255,.4);padding:6px 0;width:40%">Nome</td><td style="color:#fff;font-weight:500">${nome}</td></tr><tr><td style="color:rgba(255,255,255,.4);padding:6px 0">E-mail</td><td style="color:#fff">${email}</td></tr><tr><td style="color:rgba(255,255,255,.4);padding:6px 0">CRP</td><td style="color:#fff">${crp}/${uf}</td></tr>${telefone ? `<tr><td style="color:rgba(255,255,255,.4);padding:6px 0">Telefone</td><td style="color:#fff">${telefone}</td></tr>` : ''}${abordagem ? `<tr><td style="color:rgba(255,255,255,.4);padding:6px 0">Abordagem</td><td style="color:#fff">${abordagem}</td></tr>` : ''}${valor_sessao ? `<tr><td style="color:rgba(255,255,255,.4);padding:6px 0">Valor sessão</td><td style="color:#fff">R$ ${valor_sessao}</td></tr>` : ''}</table><p style="margin:20px 0 0;font-size:.78rem;color:rgba(255,255,255,.3)">Acesse o painel admin para aprovar.</p></div></div></div>`;
+    const html = `<div style="background:#060d0b;padding:32px 20px;font-family:sans-serif"><div style="max-width:520px;margin:0 auto;background:#0d1a14;border:1px solid rgba(255,255,255,.08);border-radius:16px;overflow:hidden"><div style="padding:24px;border-bottom:1px solid rgba(255,255,255,.08)"><span style="font-size:1.1rem;font-weight:700;color:#26508e">ConsultaJá24h</span><span style="font-size:.8rem;color:rgba(255,255,255,.4);margin-left:8px">Novo cadastro pendente de psicólogo</span></div><div style="padding:24px"><p style="color:rgba(255,255,255,.9);font-size:.95rem;margin-bottom:20px">Um novo psicólogo solicitou acesso:</p><table style="width:100%;border-collapse:collapse;font-size:.85rem"><tr><td style="color:rgba(255,255,255,.4);padding:6px 0;width:40%">Nome</td><td style="color:#fff;font-weight:500">${nome}</td></tr><tr><td style="color:rgba(255,255,255,.4);padding:6px 0">E-mail</td><td style="color:#fff">${email}</td></tr><tr><td style="color:rgba(255,255,255,.4);padding:6px 0">CRP</td><td style="color:#fff">${formatarCRP(crp, uf)}</td></tr>${telefone ? `<tr><td style="color:rgba(255,255,255,.4);padding:6px 0">Telefone</td><td style="color:#fff">${telefone}</td></tr>` : ''}${abordagem ? `<tr><td style="color:rgba(255,255,255,.4);padding:6px 0">Abordagem</td><td style="color:#fff">${abordagem}</td></tr>` : ''}${valor_sessao ? `<tr><td style="color:rgba(255,255,255,.4);padding:6px 0">Valor sessão</td><td style="color:#fff">R$ ${valor_sessao}</td></tr>` : ''}</table><p style="margin:20px 0 0;font-size:.78rem;color:rgba(255,255,255,.3)">Acesse o painel admin para aprovar.</p></div></div></div>`;
     const r = await fetch('https://api.resend.com/emails', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${RESEND_KEY}` },
-      body: JSON.stringify({ from: 'ConsultaJá24h <contato@consultaja24h.com.br>', to: ['gustavosgbf@gmail.com'], subject: `Novo cadastro de psicólogo: ${nome} (CRP ${crp}/${uf})`, html })
+      body: JSON.stringify({ from: 'ConsultaJá24h <contato@consultaja24h.com.br>', to: ['gustavosgbf@gmail.com'], subject: `Novo cadastro de psicólogo: ${nome} (${formatarCRP(crp, uf)})`, html })
     });
     const d = await r.json();
     if (d.id) console.log('[EMAIL-PSICOLOGO] Enviado | ID:', d.id);
@@ -1798,7 +1812,7 @@ app.post('/api/psicologia/pagbank/order', rlGeral, async (req, res) => {
       reference_id: `CJ-PSI-${agendamentoId}-${Date.now()}`,
       customer: {
         name:   nome,
-        email:  email || `paciente+${cpf.replace(/\D/g,'')}@consultaja24h.com.br`,
+        email:  email || `paciente.${cpf.replace(/\D/g,'')}@consultaja24h.com.br`,
         tax_id: cpf.replace(/\D/g, '')
       },
       items: [{
