@@ -2579,10 +2579,17 @@ app.post("/api/efi/cartao/cobrar", rlGeral, async (req, res) => {
     });
 
   } catch (e) {
-    const efiError = e.response?.data;
-    console.error("[EFI-CARTAO] Erro:", efiError || e.message);
+    // ── DEBUG EFÍ ─────────────────────────────────────────────────────────────
+    console.log("===== ERRO EFI =====");
+    console.log("STATUS:", e.response?.status);
+    console.log("DATA:", JSON.stringify(e.response?.data ?? null));
+    console.log("URL:", e.config?.url);
+    console.log("METHOD:", e.config?.method?.toUpperCase());
+    console.log("MSG:", e.message);
+    console.log("====================");
+    // ─────────────────────────────────────────────────────────────────────────
 
-    // Erros conhecidos da Efí com mensagem legível
+    const efiError = e.response?.data;
     const msg = efiError?.error_description
       || efiError?.message
       || efiError?.error
