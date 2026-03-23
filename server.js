@@ -294,6 +294,21 @@ async function initDB() {
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_ag_psi_pagbank ON agendamentos_psicologia(pagbank_order_id)`).catch(()=>{});
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_ag_psi_efi ON agendamentos_psicologia(efi_charge_id)`).catch(()=>{});
 
+    // ── PACIENTES: tabela e índices ───────────────────────────────────────────
+    await pool.query(`CREATE TABLE IF NOT EXISTS pacientes (
+      id          SERIAL PRIMARY KEY,
+      nome        TEXT NOT NULL,
+      email       TEXT NOT NULL UNIQUE,
+      senha_hash  TEXT NOT NULL,
+      cpf         TEXT,
+      tel         TEXT,
+      created_at  TIMESTAMP DEFAULT NOW()
+    )`).catch(()=>{});
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_pacientes_email ON pacientes(email)`).catch(()=>{});
+    // Vincula paciente logado ao agendamento de psicologia (nullable — compatível com agendamentos antigos)
+    await pool.query(`ALTER TABLE agendamentos_psicologia ADD COLUMN IF NOT EXISTS paciente_id INTEGER REFERENCES pacientes(id)`).catch(()=>{});
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_ag_psi_paciente_id ON agendamentos_psicologia(paciente_id)`).catch(()=>{});
+
     // Índices de performance para queries frequentes
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_mensagens_atendimento ON mensagens(atendimento_id)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_mensagens_atendimento_criado ON mensagens(atendimento_id, criado_em)`);
@@ -1321,7 +1336,103 @@ function authPsicologo(req, res, next) {
   }
 }
 
-async function enviarEmailNovoCadastroPsicologo({ nome, email, crp, uf, telefone, abordagem, valor_sessao }) {
+// ── PACIENTES ─────────────────────────────────────────────────────────────────
+
+function authPaciente(req, res, next) {
+  const auth = req.headers['authorization'] || '';
+  const token = auth.replace(/^Bearer\s+/i, '').trim();
+  if (!token) return res.status(401).json({ ok: false, error: 'Token nao fornecido' });
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    if (decoded.tipo !== 'paciente') return res.status(401).json({ ok: false, error: 'Token invalido' });
+    req.paciente = decoded;
+    req.pacienteId = decoded.id;
+    next();
+  } catch(e) {
+    return res.status(401).json({ ok: false, error: 'Token invalido ou expirado' });
+  }
+}
+
+// POST /api/paciente/cadastro
+app.post('/api/paciente/cadastro', rlGeral, async (req, res) => {
+  try {
+    const { nome, email, senha, cpf, tel } = req.body || {};
+    if (!nome || !email || !senha) {
+      return res.status(400).json({ ok: false, error: 'Nome, e-mail e senha são obrigatórios' });
+    }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email))) {
+      return res.status(400).json({ ok: false, error: 'E-mail inválido' });
+    }
+    if (senha.length < 6) {
+      return res.status(400).json({ ok: false, error: 'Senha deve ter ao menos 6 caracteres' });
+    }
+    const senha_hash = await bcrypt.hash(senha, 10);
+    const result = await pool.query(
+      `INSERT INTO pacientes (nome, email, senha_hash, cpf, tel)
+       VALUES ($1,$2,$3,$4,$5)
+       RETURNING id, nome, email, cpf, tel`,
+      [nome.trim(), email.trim().toLowerCase(), senha_hash, (cpf||'').trim(), (tel||'').trim()]
+    );
+    const pac = result.rows[0];
+    const token = jwt.sign({ id: pac.id, tipo: 'paciente' }, JWT_SECRET, { expiresIn: '7d' });
+    // Sheets — aba separada para pacientes de psicologia
+    const agora = new Date().toLocaleString('pt-BR', { timeZone: 'America/Fortaleza' });
+    appendToSheet('Psicologia_Pacientes', [agora, pac.nome, pac.email, pac.tel || '', pac.cpf || '']).catch(()=>{});
+    return res.json({ ok: true, token, paciente: pac });
+  } catch(err) {
+    if (err.code === '23505') return res.status(400).json({ ok: false, error: 'E-mail já cadastrado' });
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// POST /api/paciente/login
+app.post('/api/paciente/login', rlLogin, async (req, res) => {
+  try {
+    const { email, senha } = req.body || {};
+    if (!email || !senha) return res.status(400).json({ ok: false, error: 'E-mail e senha são obrigatórios' });
+    const result = await pool.query(
+      `SELECT id, nome, email, cpf, tel, senha_hash FROM pacientes WHERE email=$1 LIMIT 1`,
+      [email.trim().toLowerCase()]
+    );
+    if (result.rowCount === 0) return res.status(401).json({ ok: false, error: 'E-mail ou senha incorretos' });
+    const pac = result.rows[0];
+    const senhaOk = await bcrypt.compare(senha, pac.senha_hash);
+    if (!senhaOk) return res.status(401).json({ ok: false, error: 'E-mail ou senha incorretos' });
+    const token = jwt.sign({ id: pac.id, tipo: 'paciente' }, JWT_SECRET, { expiresIn: '7d' });
+    const { senha_hash: _, ...pacPublico } = pac;
+    return res.json({ ok: true, token, paciente: pacPublico });
+  } catch(err) { return res.status(500).json({ ok: false, error: 'Erro interno no login' }); }
+});
+
+// GET /api/paciente/me
+app.get('/api/paciente/me', authPaciente, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, nome, email, cpf, tel FROM pacientes WHERE id=$1 LIMIT 1`,
+      [req.pacienteId]
+    );
+    if (result.rowCount === 0) return res.status(404).json({ ok: false, error: 'Paciente não encontrado' });
+    return res.json({ ok: true, paciente: result.rows[0] });
+  } catch(err) { return res.status(500).json({ ok: false, error: err.message }); }
+});
+
+// GET /api/paciente/agendamentos
+app.get('/api/paciente/agendamentos', authPaciente, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, psicologo_nome, tipo_consulta, horario_agendado,
+              valor_cobrado, pagamento_status, status, criado_em
+         FROM agendamentos_psicologia
+        WHERE paciente_id = $1
+        ORDER BY horario_agendado DESC`,
+      [req.pacienteId]
+    );
+    return res.json({ ok: true, agendamentos: rows });
+  } catch(err) { return res.status(500).json({ ok: false, error: err.message }); }
+});
+
+// ── FIM PACIENTES ─────────────────────────────────────────────────────────────
+({ nome, email, crp, uf, telefone, abordagem, valor_sessao }) {
   const RESEND_KEY = process.env.RESEND_API_KEY;
   if (!RESEND_KEY) { console.warn('[EMAIL-PSICOLOGO] RESEND_API_KEY nao definida.'); return; }
   try {
@@ -1512,6 +1623,7 @@ app.get('/api/admin/psicologos', checkAdmin, async (req, res) => {
 // ── PSICOLOGIA: criar agendamento (antes do pagamento) ───────────────────────
 // POST /api/psicologia/agendamento/criar
 // Paciente logado envia: psicologoId, horario, tipo_consulta, nome, email, tel, cpf
+// Se Authorization header presente com token de paciente, vincula paciente_id automaticamente
 app.post('/api/psicologia/agendamento/criar', rlGeral, async (req, res) => {
   try {
     const { psicologoId, horario_agendado, tipo_consulta,
@@ -1520,6 +1632,17 @@ app.post('/api/psicologia/agendamento/criar', rlGeral, async (req, res) => {
     if (!psicologoId || !horario_agendado || !paciente_nome || !paciente_email) {
       return res.status(400).json({ ok: false, error: 'psicologoId, horario_agendado, paciente_nome e paciente_email são obrigatórios' });
     }
+
+    // Tenta extrair paciente_id do token se presente (opcional — não obriga login)
+    let pacienteId = null;
+    try {
+      const auth = req.headers['authorization'] || '';
+      const tok = auth.replace(/^Bearer\s+/i, '').trim();
+      if (tok) {
+        const dec = jwt.verify(tok, JWT_SECRET);
+        if (dec.tipo === 'paciente') pacienteId = dec.id;
+      }
+    } catch(_) { /* token ausente ou inválido — continua sem vínculo */ }
 
     // Busca psicólogo e seu valor — feito no BACKEND, nunca confiar no frontend
     const psiRes = await pool.query(
@@ -1562,12 +1685,12 @@ app.post('/api/psicologia/agendamento/criar', rlGeral, async (req, res) => {
       `INSERT INTO agendamentos_psicologia
         (psicologo_id, psicologo_nome, paciente_nome, paciente_email,
          paciente_tel, paciente_cpf, tipo_consulta, horario_agendado,
-         valor_cobrado, pagamento_status, status)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pendente','pendente')
+         valor_cobrado, pagamento_status, status, paciente_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pendente','pendente',$10)
        RETURNING id, valor_cobrado`,
       [psicologoId, psi.nome_exibicao, paciente_nome, paciente_email,
        paciente_tel || '', paciente_cpf || '', tipoFinal,
-       slotStart.toISOString(), valor]
+       slotStart.toISOString(), valor, pacienteId]
     );
     const ag = result.rows[0];
     console.log(`[PSI-AGEND] Criado #${ag.id} — psicólogo:${psi.nome_exibicao} valor:R$${ag.valor_cobrado}`);
@@ -2053,6 +2176,10 @@ app.post('/api/psicologia/consent', rlGeral, async (req, res) => {
       psicologo_nome || '', String(agendamento_id || ''),
       aceite_termos ? 'Sim' : 'Não', ip
     ]).catch(e => console.error('[PSI-SHEETS]', e.message));
+    // Aba separada de identificações de pacientes de psicologia
+    appendToSheet('Psicologia_Identificacoes', [
+      agora, nome || '', email || '', tel || '', ip
+    ]).catch(e => console.error('[PSI-SHEETS-IDENT]', e.message));
     return res.json({ ok: true });
   } catch (e) { return res.status(500).json({ ok: false, error: e.message }); }
 });
