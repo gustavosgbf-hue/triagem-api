@@ -525,7 +525,7 @@ app.post("/api/pagbank/order", async (req, res) => {
       reference_id: "CJ-" + Date.now() + "-" + Math.random().toString(36).slice(2,6).toUpperCase(),
       customer: {
         name:   nome,
-        email:  email || `paciente.${cpf.replace(/\D/g,"")}@consultaja24h.com.br`,
+        email:  email || `paciente+${cpf.replace(/\D/g,"")}@consultaja24h.com.br`,
         tax_id: cpf.replace(/\D/g, "")
       },
       items: [{ name: "Consulta Médica Online — ConsultaJá24h", quantity: 1, unit_amount: VALOR_CENTAVOS }],
@@ -1798,7 +1798,7 @@ app.post('/api/psicologia/pagbank/order', rlGeral, async (req, res) => {
       reference_id: `CJ-PSI-${agendamentoId}-${Date.now()}`,
       customer: {
         name:   nome,
-        email:  email || `paciente.${cpf.replace(/\D/g,'')}@consultaja24h.com.br`,
+        email:  email || `paciente+${cpf.replace(/\D/g,'')}@consultaja24h.com.br`,
         tax_id: cpf.replace(/\D/g, '')
       },
       items: [{
@@ -1936,12 +1936,12 @@ app.post('/api/psicologia/efi/cartao/cobrar', rlGeral, async (req, res) => {
     const cpfLimpo = String(cpf).replace(/\D/g, '');
     if (cpfLimpo.length !== 11) return res.status(400).json({ ok: false, error: 'CPF inválido' });
 
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email).trim()))
+      return res.status(400).json({ ok: false, error: 'Informe um e-mail válido para pagamento no cartão' });
+
     const telefoneLimpoPsi = String(telefone || '').replace(/\D/g, '');
     if (telefoneLimpoPsi.length < 10 || telefoneLimpoPsi.length > 11)
       return res.status(400).json({ ok: false, error: 'Telefone com DDD obrigatório para pagamento no cartão' });
-
-    if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email).trim()))
-      return res.status(400).json({ ok: false, error: 'E-mail inválido' });
 
     // Busca valor real — backend determina, jamais o front
     const agRes = await pool.query(
@@ -1994,7 +1994,7 @@ app.post('/api/psicologia/efi/cartao/cobrar', rlGeral, async (req, res) => {
         credit_card: {
           customer: {
             name: nome.trim(), cpf: cpfLimpo,
-            email: email ? email.trim() : `paciente.${cpfLimpo}@consultaja24h.com.br`,
+            email: String(email).trim(),
             phone_number: telefoneLimpoPsi,
             ...(nascimento ? { birth: nascimento } : {})
           },
@@ -3429,12 +3429,12 @@ app.post("/api/efi/cartao/cobrar", rlGeral, async (req, res) => {
     if (cpfLimpo.length !== 11)
       return res.status(400).json({ ok: false, error: "CPF inválido (precisa ter 11 dígitos)" });
 
+    if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email).trim()))
+      return res.status(400).json({ ok: false, error: "Informe um e-mail válido para pagamento no cartão" });
+
     const telefoneLimpoEfi = String(telefone || "").replace(/\D/g, "");
     if (telefoneLimpoEfi.length < 10 || telefoneLimpoEfi.length > 11)
       return res.status(400).json({ ok: false, error: "Telefone com DDD obrigatório para pagamento no cartão" });
-
-    if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email).trim()))
-      return res.status(400).json({ ok: false, error: "E-mail inválido" });
 
     // ── Auth Efí ─────────────────────────────────────────────────────────────
     const efiToken  = await efiGetToken();
@@ -3474,7 +3474,7 @@ app.post("/api/efi/cartao/cobrar", rlGeral, async (req, res) => {
     const customer = {
       name:         nome.trim(),
       cpf:          cpfLimpo,
-      email:        email ? email.trim() : `paciente.${cpfLimpo}@consultaja24h.com.br`,
+      email:        String(email).trim(),
       phone_number: telefoneLimpoEfi
     };
     if (nascimento) customer.birth = nascimento; // "YYYY-MM-DD"
