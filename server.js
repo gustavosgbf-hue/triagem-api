@@ -265,6 +265,7 @@ async function initDB() {
     await pool.query(`ALTER TABLE psicologos ADD COLUMN IF NOT EXISTS foto_url TEXT`).catch(()=>{});
     await pool.query(`ALTER TABLE psicologos ADD COLUMN IF NOT EXISTS formulario_url TEXT`).catch(()=>{});
     await pool.query(`ALTER TABLE psicologos ADD COLUMN IF NOT EXISTS valor_atualizado_em TIMESTAMP`).catch(()=>{});
+    await pool.query(`ALTER TABLE psicologos ADD COLUMN IF NOT EXISTS visivel BOOLEAN NOT NULL DEFAULT true`).catch(()=>{});
 
     // Tabela de agendamentos de psicologia — fluxo separado dos médicos
     await pool.query(`CREATE TABLE IF NOT EXISTS agendamentos_psicologia (
@@ -1560,7 +1561,7 @@ app.get('/api/psicologo/me', authPsicologo, async (req, res) => {
       `SELECT id, nome, nome_exibicao, email, crp, uf, telefone,
               abordagem, focos, valor_sessao, atende_online,
               tem_avaliacao, valor_avaliacao, apresentacao, disponibilidade,
-              status, ativo
+              status, ativo, visivel
          FROM psicologos WHERE id=$1 LIMIT 1`,
       [req.psicologoId]
     );
@@ -2165,6 +2166,25 @@ app.patch('/api/psicologo/perfil', authPsicologo, async (req, res) => {
   }
 });
 
+// PATCH /api/psicologo/visibilidade
+app.patch('/api/psicologo/visibilidade', authPsicologo, async (req, res) => {
+  try {
+    const { visivel } = req.body || {};
+    if (typeof visivel !== 'boolean') {
+      return res.status(400).json({ ok: false, error: 'Campo visivel deve ser boolean' });
+    }
+    await pool.query(
+      `UPDATE psicologos SET visivel = $1 WHERE id = $2`,
+      [visivel, req.psicologoId]
+    );
+    console.log(`[PSI-VISIB] Psicólogo #${req.psicologoId} visivel=${visivel}`);
+    return res.json({ ok: true, visivel });
+  } catch (e) {
+    console.error('[PSI-VISIB] Erro:', e.message);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── PSICOLOGIA: Google Sheets — salvar dados do paciente aba Psicologia ───────
 app.post('/api/psicologia/consent', rlGeral, async (req, res) => {
   try {
@@ -2194,7 +2214,7 @@ app.get('/api/psicologos', rlGeral, async (req, res) => {
               apresentacao, disponibilidade, foto_url, formulario_url,
               atende_online
          FROM psicologos
-        WHERE ativo = true AND status = 'aprovado'
+        WHERE ativo = true AND status = 'aprovado' AND visivel = true
         ORDER BY id ASC`
     );
     return res.json({ ok: true, psicologos: result.rows });
