@@ -31,6 +31,7 @@ const r2 = new S3Client({
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 
 const app = express();
+app.set("trust proxy", 1); // Render passa IP real via X-Forwarded-For
 app.use(cors({
   origin: [
     'https://consultaja24h.com.br',
@@ -2519,7 +2520,7 @@ app.post("/api/efi/cartao/cobrar", rlGeral, async (req, res) => {
     // "paid" pode ocorrer em sandbox ou pagamentos pré-aprovados.
     // Em ambos os casos: salva o charge_id e retorna ok:true ao frontend.
     // A confirmação final (pagamento_status='confirmado') sempre vem via webhook.
-    if (status === "paid" || status === "waiting") {
+    if (status === "paid" || status === "waiting" || status === "approved") {
       // Sempre salva o efi_charge_id para o webhook conseguir achar o atendimento depois
       if (atendimentoId) {
         await pool.query(
