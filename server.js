@@ -42,10 +42,6 @@ app.use(cors({
 }));
 app.use(express.json({ limit: "1mb" }));
 
-// Render (e proxies em geral) passam o IP real via X-Forwarded-For
-// Sem isso, express-rate-limit loga aviso e pode usar IP errado
-app.set('trust proxy', 1);
-
 // ── RATE LIMITING ─────────────────────────────────────────────────────────────
 const rlLogin = rateLimit({ windowMs: 60*1000, max: 10, standardHeaders: true, legacyHeaders: false,
   message: { ok: false, error: "Muitas tentativas de login. Tente novamente em 1 minuto." }});
@@ -2447,23 +2443,17 @@ app.post("/api/efi/cartao/cobrar", rlGeral, async (req, res) => {
     // ── PASSO 1: Criar a transação ────────────────────────────────────────────
     // Endpoint: POST /v1/charge
     // Retorna charge_id que será usado no passo 2
-    // Payload mínimo exigido pela API Cobranças Efí para POST /v1/charge
-    // Ref: https://dev.efipay.com.br/docs/API-Cobrancas/cobranca-por-cartao
-    // IMPORTANTE: notification_url removido daqui — a Efí valida a URL no momento
-    // da criação e rejeita (401) se o endpoint não responder 200 imediatamente.
-    // A notificação é configurada via painel Efí ou adicionada só após os testes.
     const chargePayload = {
       items: [{
-        name:   "Consulta Medica Online",   // sem caracteres especiais/acentos
+        name:   "Consulta Médica Online — ConsultaJá24h",
         value:  EFI_VALOR_CENTAVOS,
         amount: 1
-      }]
-      // metadata omitido em homologação — adicionar notification_url só em produção
-      // após confirmar que o webhook responde 200 corretamente
+      }],
+      metadata: {
+        custom_id:        `CJ-CARTAO-${Date.now()}`,
+        notification_url: `${process.env.API_URL || "https://triagem-api.onrender.com"}/api/efi/cartao/webhook`
+      }
     };
-
-    console.log("[EFI-CARTAO] Passo 1 payload:", JSON.stringify(chargePayload));
-    console.log("[EFI-CARTAO] Passo 1 URL:", `${EFI_BASE_URL}/v1/charge`);
 
     const chargeRes = await axios.post(
       `${EFI_BASE_URL}/v1/charge`,
@@ -2481,10 +2471,10 @@ app.post("/api/efi/cartao/cobrar", rlGeral, async (req, res) => {
     // ── PASSO 2: Associar o payment_token ao charge_id ────────────────────────
     // Endpoint: POST /v1/charge/:id/pay
     const customer = {
-      name: nome.trim(),
-      cpf:  cpfLimpo
+      name:  nome.trim(),
+      cpf:   cpfLimpo,
+      email: email ? email.trim() : `paciente+${cpfLimpo}@consultaja24h.com.br`
     };
-    if (email)     customer.email        = email.trim();
     if (telefone)  customer.phone_number = String(telefone).replace(/\D/g, "");
     if (nascimento) customer.birth       = nascimento; // "YYYY-MM-DD"
 
@@ -2589,17 +2579,10 @@ app.post("/api/efi/cartao/cobrar", rlGeral, async (req, res) => {
     });
 
   } catch (e) {
-    // ── DEBUG EFÍ ─────────────────────────────────────────────────────────────
-    console.log("===== ERRO EFI =====");
-    console.log("STATUS:", e.response?.status);
-    console.log("DATA:", JSON.stringify(e.response?.data ?? null));
-    console.log("URL:", e.config?.url);
-    console.log("METHOD:", e.config?.method?.toUpperCase());
-    console.log("MSG:", e.message);
-    console.log("====================");
-    // ─────────────────────────────────────────────────────────────────────────
-
     const efiError = e.response?.data;
+    console.error("[EFI-CARTAO] Erro:", efiError || e.message);
+
+    // Erros conhecidos da Efí com mensagem legível
     const msg = efiError?.error_description
       || efiError?.message
       || efiError?.error
