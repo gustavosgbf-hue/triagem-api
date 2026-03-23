@@ -2470,13 +2470,16 @@ app.post("/api/efi/cartao/cobrar", rlGeral, async (req, res) => {
 
     // ── PASSO 2: Associar o payment_token ao charge_id ────────────────────────
     // Endpoint: POST /v1/charge/:id/pay
+    const telefoneLimpo = String(telefone || "").replace(/\D/g, "");
+    const telefoneFinal = telefoneLimpo.length >= 10 ? telefoneLimpo : "11999999999";
+
     const customer = {
-      name:  nome.trim(),
-      cpf:   cpfLimpo,
-      email: email ? email.trim() : `paciente+${cpfLimpo}@consultaja24h.com.br`
+      name:         nome.trim(),
+      cpf:          cpfLimpo,
+      email:        email ? email.trim() : `paciente+${cpfLimpo}@consultaja24h.com.br`,
+      phone_number: telefoneFinal
     };
-    if (telefone)  customer.phone_number = String(telefone).replace(/\D/g, "");
-    if (nascimento) customer.birth       = nascimento; // "YYYY-MM-DD"
+    if (nascimento) customer.birth = nascimento; // "YYYY-MM-DD"
 
     const payPayload = {
       payment: {
