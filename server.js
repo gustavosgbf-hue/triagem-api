@@ -1457,7 +1457,9 @@ function formatarCRP(crp, uf) {
     SE:15, SP:6,  TO:9
   };
   const regional = mapa[String(uf || '').toUpperCase()];
-  const numero   = String(crp || '').replace(/\D/g, '');
+  // Se o CRP vier com barra (ex: "22/2206760"), pega só o que vem depois da barra
+  const crpStr = String(crp || '');
+  const numero = crpStr.includes('/') ? crpStr.split('/').pop().replace(/\D/g, '') : crpStr.replace(/\D/g, '');
   if (!numero) return '';
   return regional ? `CRP ${regional}/${numero}` : `CRP ${numero}/${String(uf || '').toUpperCase()}`;
 }
@@ -3876,9 +3878,6 @@ app.get('/admin/psicologia', (req, res) => {
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>Financeiro Psicologia · Admin · ConsultaJá24h</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{
@@ -3891,7 +3890,7 @@ app.get('/admin/psicologia', (req, res) => {
   --purple:#a78bfa;--purple-dim:rgba(167,139,250,.12);
   --radius:10px;
 }
-
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@300;400;500;600&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap');
 body{background:var(--bg);color:var(--text);font-family:'IBM Plex Sans',sans-serif;font-size:14px;min-height:100vh;line-height:1.5}
 nav{background:var(--surface);border-bottom:1px solid var(--border);padding:0 28px;height:52px;display:flex;align-items:center;gap:16px;position:sticky;top:0;z-index:100}
 .nav-brand{font-family:'IBM Plex Mono',monospace;font-size:.8rem;font-weight:600;color:var(--blue);letter-spacing:.08em;text-transform:uppercase}
@@ -4100,7 +4099,7 @@ function renderTabela(rows){
       acoes='<button class="btn-sm btn-pagar" onclick="pagar('+s.id+',this)">$ Pagar</button>';
     }else{acoes='<span style="color:var(--text3);font-size:.7rem">—</span>';}
     const dataPago=s.data_pagamento_psicologo?'<br><span style="color:var(--text3);font-size:.68rem">'+fmtD(s.data_pagamento_psicologo)+'</span>':'';
-    html+='<tr><td style="color:var(--text3);font-family:monospace">#'+s.id+'</td><td class="td-wrap">'+esc(s.psicologo_nome)+'</td><td class="td-wrap">'+esc(s.paciente_nome)+'<br><span style="color:var(--text3);font-size:.7rem">'+esc(s.paciente_email)+'</span></td><td>'+tipo+'</td><td style="font-family:monospace;font-size:.75rem">'+fmtD(s.horario_agendado)+'</td><td>'+stChip+'</td><td style="font-family:monospace">'+fmtR(s.valor_cobrado)+'</td><td style="font-family:monospace">'+repasse+'</td><td>'+pagoChip+dataPago+'</td><td>'+acoes+'</td></tr>';
+    html+='<tr><td style="color:var(--text3);font-family:\'IBM Plex Mono\',monospace">#'+s.id+'</td><td class="td-wrap">'+esc(s.psicologo_nome)+'</td><td class="td-wrap">'+esc(s.paciente_nome)+'<br><span style="color:var(--text3);font-size:.7rem">'+esc(s.paciente_email)+'</span></td><td>'+tipo+'</td><td style="font-family:\'IBM Plex Mono\',monospace;font-size:.75rem">'+fmtD(s.horario_agendado)+'</td><td>'+stChip+'</td><td style="font-family:\'IBM Plex Mono\',monospace">'+fmtR(s.valor_cobrado)+'</td><td style="font-family:\'IBM Plex Mono\',monospace">'+repasse+'</td><td>'+pagoChip+dataPago+'</td><td>'+acoes+'</td></tr>';
   });
   html+='</tbody></table>';
   document.getElementById('tabela-wrap').innerHTML=html;
