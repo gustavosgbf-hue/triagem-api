@@ -1885,10 +1885,13 @@ app.post('/api/psicologia/pagbank/webhook', async (req, res) => {
     }
     const ag = rows[0];
     console.log(`[PSI-PAGBANK-WH] Agendamento #${ag.id} confirmado — ${ag.paciente_nome} → ${ag.psicologo_nome}`);
-    // Envia email admin com psicólogo + valor real pago
+    // Busca email do psicólogo
+    const psiRes1 = await pool.query(`SELECT email FROM psicologos WHERE nome_exibicao=$1 OR nome=$1 LIMIT 1`, [ag.psicologo_nome]);
+    ag.psicologo_email = psiRes1.rows[0]?.email || null;
+    // Envia emails
     enviarEmailAdminPsicologia(ag).catch(() => {});
-    // Envia email de confirmação ao paciente
     enviarEmailConfirmacaoPacientePsi(ag).catch(() => {});
+    enviarEmailNotificacaoPsicologo(ag).catch(() => {});
   } catch (e) {
     console.error('[PSI-PAGBANK-WH] Erro:', e.message);
   }
@@ -2038,8 +2041,11 @@ app.post('/api/psicologia/efi/cartao/cobrar', rlGeral, async (req, res) => {
           [agendamentoId, PSI_COMISSAO_PCT]
         );
         if (rows[0]) {
+          const psiRes2 = await pool.query(`SELECT email FROM psicologos WHERE nome_exibicao=$1 OR nome=$1 LIMIT 1`, [rows[0].psicologo_nome]);
+          rows[0].psicologo_email = psiRes2.rows[0]?.email || null;
           enviarEmailAdminPsicologia(rows[0]).catch(() => {});
           enviarEmailConfirmacaoPacientePsi(rows[0]).catch(() => {});
+          enviarEmailNotificacaoPsicologo(rows[0]).catch(() => {});
         }
       }
       return res.json({ ok: true, charge_id: chargeId, status });
@@ -2079,8 +2085,11 @@ app.post('/api/psicologia/efi/cartao/webhook', async (req, res) => {
       );
       if (rows[0]) {
         console.log(`[PSI-EFI-WH] Agendamento #${rows[0].id} confirmado via webhook`);
+        const psiRes3 = await pool.query(`SELECT email FROM psicologos WHERE nome_exibicao=$1 OR nome=$1 LIMIT 1`, [rows[0].psicologo_nome]);
+        rows[0].psicologo_email = psiRes3.rows[0]?.email || null;
         enviarEmailAdminPsicologia(rows[0]).catch(() => {});
         enviarEmailConfirmacaoPacientePsi(rows[0]).catch(() => {});
+        enviarEmailNotificacaoPsicologo(rows[0]).catch(() => {});
       }
     }
   } catch (e) {
@@ -2233,6 +2242,53 @@ async function enviarEmailConfirmacaoPacientePsi({ id, paciente_nome, paciente_e
     if (d.id) console.log(`[PSI-EMAIL-CONFIRM] Enviado para ${paciente_email} | Agendamento #${id}`);
     else console.error('[PSI-EMAIL-CONFIRM] Resend recusou:', JSON.stringify(d));
   } catch (e) { console.error('[PSI-EMAIL-CONFIRM] Erro:', e.message); }
+}
+
+// ── PSICOLOGIA: e-mail de notificação ao psicólogo ──────────────────────────
+async function enviarEmailNotificacaoPsicologo({ id, psicologo_email, psicologo_nome, paciente_nome, paciente_email, horario_agendado, valor_cobrado, tipo_consulta }) {
+  const RESEND_KEY = process.env.RESEND_API_KEY;
+  if (!RESEND_KEY || !psicologo_email) return;
+  const horarioFmt = new Date(horario_agendado).toLocaleString('pt-BR', {
+    timeZone: 'America/Fortaleza', weekday: 'long', day: '2-digit',
+    month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit'
+  });
+  const valorFmt  = `R$ ${parseFloat(valor_cobrado).toFixed(2).replace('.', ',')}`;
+  const tipoLabel = tipo_consulta === 'avaliacao' ? 'Avaliação Psicológica' : 'Psicoterapia';
+  const html = `<div style="background:#f2f0ec;padding:32px 20px;font-family:sans-serif">
+    <div style="max-width:540px;margin:0 auto;background:#fff;border:1px solid rgba(22,18,14,.1);border-radius:16px;overflow:hidden">
+      <div style="padding:20px 28px;background:linear-gradient(135deg,#e8eef7,#d0ddef)">
+        <span style="font-size:1.1rem;font-weight:600;color:#26508e">ConsultaJá24h</span>
+        <span style="font-size:.8rem;color:rgba(22,18,14,.5);margin-left:8px">Psicologia Online</span>
+      </div>
+      <div style="padding:28px">
+        <h2 style="margin:0 0 16px;font-size:1.1rem;color:#16120e;font-weight:600">🧠 Novo agendamento confirmado!</h2>
+        <p style="color:#443e38;font-size:.9rem;margin-bottom:20px">Olá, <strong>${psicologo_nome}</strong>. Um paciente acabou de agendar uma sessão com você.</p>
+        <table style="width:100%;border-collapse:collapse;font-size:.875rem;margin-bottom:20px">
+          <tr style="border-bottom:1px solid rgba(22,18,14,.07)"><td style="padding:9px 0;color:#8c857d;width:42%">Agendamento #</td><td style="padding:9px 0;font-weight:600;color:#16120e">${id}</td></tr>
+          <tr style="border-bottom:1px solid rgba(22,18,14,.07)"><td style="padding:9px 0;color:#8c857d">Paciente</td><td style="padding:9px 0;font-weight:600;color:#16120e">${paciente_nome}</td></tr>
+          <tr style="border-bottom:1px solid rgba(22,18,14,.07)"><td style="padding:9px 0;color:#8c857d">E-mail</td><td style="padding:9px 0;color:#16120e">${paciente_email || '—'}</td></tr>
+          <tr style="border-bottom:1px solid rgba(22,18,14,.07)"><td style="padding:9px 0;color:#8c857d">Tipo</td><td style="padding:9px 0;color:#16120e">${tipoLabel}</td></tr>
+          <tr><td style="padding:9px 0;color:#8c857d">📅 Data e hora</td><td style="padding:9px 0;font-weight:700;color:#26508e">${horarioFmt}</td></tr>
+        </table>
+        <p style="font-size:.78rem;color:rgba(22,18,14,.4);line-height:1.55">Acesse seu painel para ver todos os agendamentos. — ConsultaJá24h Psicologia</p>
+      </div>
+    </div>
+  </div>`;
+  try {
+    const r = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${RESEND_KEY}` },
+      body: JSON.stringify({
+        from: 'ConsultaJá24h <contato@consultaja24h.com.br>',
+        to: [psicologo_email],
+        subject: `🗓️ Novo agendamento: ${paciente_nome} — ${horarioFmt}`,
+        html
+      })
+    });
+    const d = await r.json();
+    if (d.id) console.log(`[PSI-EMAIL-PSICOLOGO] Enviado para ${psicologo_email} | Agendamento #${id}`);
+    else console.error('[PSI-EMAIL-PSICOLOGO] Resend recusou:', JSON.stringify(d));
+  } catch (e) { console.error('[PSI-EMAIL-PSICOLOGO] Erro:', e.message); }
 }
 
 // ── PSICOLOGIA: e-mail de lembrete ao paciente ───────────────────────────────
