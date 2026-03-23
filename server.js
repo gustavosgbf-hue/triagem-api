@@ -37,7 +37,9 @@ app.use(cors({
     'https://consultaja24h.com.br',
     'https://www.consultaja24h.com.br',
     'https://painel.consultaja24h.com.br',
+    'https://psicologia.consultaja24h.com.br',
     'https://triagem-api.onrender.com',
+    /^https:\/\/.*\.pages\.dev$/,  // Cloudflare Pages previews
   ],
   credentials: true,
 }));
@@ -258,6 +260,39 @@ async function initDB() {
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_psicologos_status ON psicologos(status)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_psicologos_email  ON psicologos(email)`);
     await pool.query(`CREATE UNIQUE INDEX IF NOT EXISTS idx_psicologos_crp_uf ON psicologos(crp, uf)`);
+
+    // ── PSICÓLOGOS: colunas extras e tabela de agendamentos separada ──────────
+    await pool.query(`ALTER TABLE psicologos ADD COLUMN IF NOT EXISTS foto_url TEXT`).catch(()=>{});
+    await pool.query(`ALTER TABLE psicologos ADD COLUMN IF NOT EXISTS formulario_url TEXT`).catch(()=>{});
+    await pool.query(`ALTER TABLE psicologos ADD COLUMN IF NOT EXISTS valor_atualizado_em TIMESTAMP`).catch(()=>{});
+
+    // Tabela de agendamentos de psicologia — fluxo separado dos médicos
+    await pool.query(`CREATE TABLE IF NOT EXISTS agendamentos_psicologia (
+      id                SERIAL PRIMARY KEY,
+      psicologo_id      INTEGER NOT NULL REFERENCES psicologos(id),
+      psicologo_nome    TEXT NOT NULL,
+      paciente_nome     TEXT NOT NULL,
+      paciente_email    TEXT NOT NULL,
+      paciente_tel      TEXT,
+      paciente_cpf      TEXT,
+      tipo_consulta     TEXT NOT NULL DEFAULT 'psicoterapia',
+      horario_agendado  TIMESTAMP NOT NULL,
+      valor_cobrado     NUMERIC(10,2) NOT NULL,
+      pagamento_metodo  TEXT,
+      pagamento_status  TEXT NOT NULL DEFAULT 'pendente',
+      pagbank_order_id  TEXT,
+      efi_charge_id     TEXT,
+      pagamento_confirmado_em TIMESTAMPTZ,
+      formulario_enviado BOOLEAN DEFAULT false,
+      status            TEXT NOT NULL DEFAULT 'pendente',
+      observacoes       TEXT,
+      criado_em         TIMESTAMP DEFAULT NOW()
+    )`).catch(()=>{});
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_ag_psi_psicologo ON agendamentos_psicologia(psicologo_id)`).catch(()=>{});
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_ag_psi_paciente_email ON agendamentos_psicologia(paciente_email)`).catch(()=>{});
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_ag_psi_status ON agendamentos_psicologia(pagamento_status)`).catch(()=>{});
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_ag_psi_pagbank ON agendamentos_psicologia(pagbank_order_id)`).catch(()=>{});
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_ag_psi_efi ON agendamentos_psicologia(efi_charge_id)`).catch(()=>{});
 
     // Índices de performance para queries frequentes
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_mensagens_atendimento ON mensagens(atendimento_id)`);
@@ -1273,7 +1308,7 @@ app.post("/api/medico/cadastro", async (req, res) => {
 
 function authPsicologo(req, res, next) {
   const auth = req.headers['authorization'] || '';
-  const token = auth.replace(/^Bearers+/i, '').trim();
+  const token = auth.replace(/^Bearer\s+/i, '').trim();
   if (!token) return res.status(401).json({ ok: false, error: 'Token nao fornecido' });
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
@@ -1341,7 +1376,14 @@ app.post('/api/psicologo/cadastro', rlGeral, async (req, res) => {
     if (senha.length < 6) {
       return res.status(400).json({ ok: false, error: 'Senha deve ter ao menos 6 caracteres' });
     }
-    const normalizarValor = v => String(v || '').trim().replace(/[^d,.]/g, '');
+    // FIX: regex corrigida — \d precisa de flag no construtor ou literal /[^\d,.]/
+    const normalizarValor = v => String(v || '').trim().replace(/[^\d,.]/g, '');
+
+    // Validação de valor mínimo R$130,00 — obrigatório no backend (não confiar só no front)
+    const valorNumerico = parseFloat(normalizarValor(valor_sessao).replace(',', '.'));
+    if (isNaN(valorNumerico) || valorNumerico < 130) {
+      return res.status(400).json({ ok: false, error: 'O valor mínimo da sessão é R$ 130,00' });
+    }
     const senha_hash = await bcrypt.hash(senha, 10);
     const result = await pool.query(
       `INSERT INTO psicologos
@@ -1394,7 +1436,7 @@ app.post('/api/psicologo/login', rlLogin, async (req, res) => {
     if (psi.status === 'rejeitado' || !psi.ativo) return res.status(403).json({ ok: false, error: 'Seu cadastro nao foi aprovado. Entre em contato com a equipe.' });
     const senhaOk = await bcrypt.compare(senha, psi.senha_hash);
     if (!senhaOk) return res.status(401).json({ ok: false, error: 'E-mail ou senha incorretos' });
-    const token = jwt.sign({ id: psi.id, tipo: 'psicologo' }, JWT_SECRET, { expiresIn: '8h' });
+    const token = jwt.sign({ id: psi.id, tipo: 'psicologo' }, JWT_SECRET, { expiresIn: '1h' });
     const { senha_hash: _, ...psicologoPublico } = psi;
     psicologoPublico.nome_exibicao = psicologoPublico.nome_exibicao || psicologoPublico.nome;
     return res.json({ ok: true, token, psicologo: psicologoPublico });
@@ -1466,6 +1508,523 @@ app.get('/api/admin/psicologos', checkAdmin, async (req, res) => {
 });
 
 // ── FIM PSICÓLOGOS ────────────────────────────────────────────────────────────
+
+// ── PSICOLOGIA: criar agendamento (antes do pagamento) ───────────────────────
+// POST /api/psicologia/agendamento/criar
+// Paciente logado envia: psicologoId, horario, tipo_consulta, nome, email, tel, cpf
+app.post('/api/psicologia/agendamento/criar', rlGeral, async (req, res) => {
+  try {
+    const { psicologoId, horario_agendado, tipo_consulta,
+            paciente_nome, paciente_email, paciente_tel, paciente_cpf } = req.body || {};
+
+    if (!psicologoId || !horario_agendado || !paciente_nome || !paciente_email) {
+      return res.status(400).json({ ok: false, error: 'psicologoId, horario_agendado, paciente_nome e paciente_email são obrigatórios' });
+    }
+
+    // Busca psicólogo e seu valor — feito no BACKEND, nunca confiar no frontend
+    const psiRes = await pool.query(
+      `SELECT id, nome_exibicao, valor_sessao, valor_avaliacao, tem_avaliacao, ativo, status
+         FROM psicologos WHERE id = $1 LIMIT 1`,
+      [psicologoId]
+    );
+    if (psiRes.rowCount === 0 || !psiRes.rows[0].ativo || psiRes.rows[0].status !== 'aprovado') {
+      return res.status(404).json({ ok: false, error: 'Psicólogo não encontrado ou inativo' });
+    }
+    const psi = psiRes.rows[0];
+
+    // Determina qual valor usar conforme tipo_consulta
+    const tipoFinal = tipo_consulta === 'avaliacao' && psi.tem_avaliacao ? 'avaliacao' : 'psicoterapia';
+    const valorRaw = tipoFinal === 'avaliacao' ? psi.valor_avaliacao : psi.valor_sessao;
+    const valor = parseFloat(String(valorRaw || '').replace(',', '.'));
+    if (!valor || valor < 130) {
+      return res.status(400).json({ ok: false, error: 'Valor da sessão inválido para este profissional' });
+    }
+
+    // Verifica conflito de horário para este psicólogo
+    const slotStart = new Date(horario_agendado);
+    if (isNaN(slotStart.getTime())) {
+      return res.status(400).json({ ok: false, error: 'horario_agendado inválido' });
+    }
+    const slotEnd = new Date(slotStart.getTime() + 60 * 60 * 1000); // sessão de 1h
+    const conflito = await pool.query(
+      `SELECT id FROM agendamentos_psicologia
+        WHERE psicologo_id = $1
+          AND horario_agendado >= $2 AND horario_agendado < $3
+          AND status NOT IN ('cancelado')
+        LIMIT 1`,
+      [psicologoId, slotStart.toISOString(), slotEnd.toISOString()]
+    );
+    if (conflito.rowCount > 0) {
+      return res.status(409).json({ ok: false, error: 'Horário indisponível. Escolha outro.' });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO agendamentos_psicologia
+        (psicologo_id, psicologo_nome, paciente_nome, paciente_email,
+         paciente_tel, paciente_cpf, tipo_consulta, horario_agendado,
+         valor_cobrado, pagamento_status, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pendente','pendente')
+       RETURNING id, valor_cobrado`,
+      [psicologoId, psi.nome_exibicao, paciente_nome, paciente_email,
+       paciente_tel || '', paciente_cpf || '', tipoFinal,
+       slotStart.toISOString(), valor]
+    );
+    const ag = result.rows[0];
+    console.log(`[PSI-AGEND] Criado #${ag.id} — psicólogo:${psi.nome_exibicao} valor:R$${ag.valor_cobrado}`);
+    return res.json({ ok: true, agendamentoId: ag.id, valor: ag.valor_cobrado });
+  } catch (err) {
+    console.error('[PSI-AGEND] Erro:', err.message);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ── PSICOLOGIA: horários ocupados de um psicólogo ────────────────────────────
+// GET /api/psicologia/horarios-ocupados/:psicologoId?dias=14
+// Retorna array de ISO strings com horários já reservados (não cancelados)
+app.get('/api/psicologia/horarios-ocupados/:psicologoId', rlGeral, async (req, res) => {
+  try {
+    const psicologoId = parseInt(req.params.psicologoId, 10);
+    if (!psicologoId) return res.status(400).json({ ok: false, error: 'psicologoId inválido' });
+    const dias = Math.min(parseInt(req.query.dias || '14', 10), 60);
+    const { rows } = await pool.query(
+      `SELECT horario_agendado
+         FROM agendamentos_psicologia
+        WHERE psicologo_id = $1
+          AND status NOT IN ('cancelado')
+          AND horario_agendado >= NOW()
+          AND horario_agendado <= NOW() + ($2 || ' days')::interval
+        ORDER BY horario_agendado`,
+      [psicologoId, dias]
+    );
+    const ocupados = rows.map(r => new Date(r.horario_agendado).toISOString());
+    return res.json({ ok: true, ocupados });
+  } catch (e) {
+    console.error('[PSI-HORARIOS] Erro:', e.message);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── PSICOLOGIA: PIX via PagBank com valor dinâmico ───────────────────────────
+// POST /api/psicologia/pagbank/order
+// Reutiliza a mesma integração PagBank existente, porém busca o valor do agendamento
+app.post('/api/psicologia/pagbank/order', rlGeral, async (req, res) => {
+  try {
+    const { agendamentoId, nome, email, cpf } = req.body || {};
+    if (!agendamentoId || !nome || !cpf) {
+      return res.status(400).json({ ok: false, error: 'agendamentoId, nome e cpf são obrigatórios' });
+    }
+    if (!PAGBANK_TOKEN) return res.status(503).json({ ok: false, error: 'Gateway de pagamento indisponível' });
+
+    // Busca valor real do agendamento — nunca aceita valor do front
+    const agRes = await pool.query(
+      `SELECT id, valor_cobrado, pagamento_status, psicologo_nome, paciente_nome, horario_agendado
+         FROM agendamentos_psicologia WHERE id = $1 LIMIT 1`,
+      [agendamentoId]
+    );
+    if (agRes.rowCount === 0) return res.status(404).json({ ok: false, error: 'Agendamento não encontrado' });
+    const ag = agRes.rows[0];
+    if (ag.pagamento_status === 'confirmado') {
+      return res.status(409).json({ ok: false, error: 'Este agendamento já foi pago' });
+    }
+
+    // Re-valida conflito de horário antes de gerar o PIX (race condition: outro paciente pode ter agendado entre /criar e /pagbank/order)
+    const slotStart = new Date(ag.horario_agendado);
+    const slotEnd   = new Date(slotStart.getTime() + 60 * 60 * 1000);
+    const conflitoP = await pool.query(
+      `SELECT id FROM agendamentos_psicologia
+        WHERE psicologo_id = (SELECT psicologo_id FROM agendamentos_psicologia WHERE id = $1)
+          AND horario_agendado >= $2 AND horario_agendado < $3
+          AND id <> $1
+          AND status NOT IN ('cancelado')
+        LIMIT 1`,
+      [agendamentoId, slotStart.toISOString(), slotEnd.toISOString()]
+    );
+    if (conflitoP.rowCount > 0) {
+      // Cancela o agendamento atual pois o horário foi tomado
+      await pool.query(`UPDATE agendamentos_psicologia SET status='cancelado' WHERE id=$1`, [agendamentoId]);
+      return res.status(409).json({ ok: false, error: 'Horário indisponível. Por favor, escolha outro horário.' });
+    }
+    const expiracao = new Date(Date.now() + 30 * 60 * 1000);
+    const expiracaoISO = expiracao.toISOString().replace('Z', '-03:00');
+
+    const orderBody = {
+      reference_id: `CJ-PSI-${agendamentoId}-${Date.now()}`,
+      customer: {
+        name:   nome,
+        email:  email || `paciente+${cpf.replace(/\D/g,'')}@consultaja24h.com.br`,
+        tax_id: cpf.replace(/\D/g, '')
+      },
+      items: [{
+        name:        `Sessão de Psicologia — ${ag.psicologo_nome}`,
+        quantity:    1,
+        unit_amount: valorCentavos
+      }],
+      qr_codes: [{ amount: { value: valorCentavos }, expiration_date: expiracaoISO }],
+      notification_urls: [
+        `${process.env.API_URL || 'https://triagem-api.onrender.com'}/api/psicologia/pagbank/webhook`
+      ]
+    };
+
+    const response = await fetch(`${PAGBANK_URL}/orders`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${PAGBANK_TOKEN}`, 'Content-Type': 'application/json', 'accept': 'application/json' },
+      body: JSON.stringify(orderBody)
+    });
+    const data = await response.json();
+
+    if (!response.ok) {
+      console.error('[PSI-PAGBANK] Erro:', JSON.stringify(data));
+      return res.status(400).json({ ok: false, error: data.error_messages || 'Erro ao criar cobrança PIX' });
+    }
+    const qrCode = data.qr_codes?.[0];
+    if (!qrCode?.text) {
+      return res.status(502).json({ ok: false, error: 'PagBank não retornou QR Code' });
+    }
+
+    // Salva order_id no agendamento para o webhook conseguir identificar
+    await pool.query(
+      `UPDATE agendamentos_psicologia SET pagbank_order_id = $1, pagamento_metodo = 'pix' WHERE id = $2`,
+      [data.id, agendamentoId]
+    );
+
+    console.log(`[PSI-PAGBANK] Order criada — agendamento #${agendamentoId} valor:R$${ag.valor_cobrado} order:${data.id}`);
+    return res.json({ ok: true, order_id: data.id, qr_code_text: qrCode.text, valor: ag.valor_cobrado });
+  } catch (e) {
+    console.error('[PSI-PAGBANK] Erro:', e.message);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── PSICOLOGIA: webhook PagBank ───────────────────────────────────────────────
+app.post('/api/psicologia/pagbank/webhook', async (req, res) => {
+  const event = req.body;
+  res.sendStatus(200); // responde imediatamente
+
+  if (!event || typeof event !== 'object') return;
+  const orderId = String(event?.data?.id || event?.id || '');
+  const charges = event?.data?.charges || event?.charges || [];
+  const pago    = charges.some(c => c.status === 'PAID');
+
+  console.log('[PSI-PAGBANK-WH] orderId:', orderId, 'pago:', pago);
+  if (!pago || !orderId) return;
+
+  try {
+    const { rows } = await pool.query(
+      `UPDATE agendamentos_psicologia
+          SET pagamento_status = 'confirmado', pagamento_confirmado_em = NOW(), status = 'confirmado'
+        WHERE pagbank_order_id = $1 AND pagamento_status = 'pendente'
+        RETURNING id, paciente_nome, psicologo_nome, horario_agendado, valor_cobrado, paciente_email`,
+      [orderId]
+    );
+    if (rows.length === 0) {
+      console.log('[PSI-PAGBANK-WH] Order não encontrada ou já processada:', orderId);
+      return;
+    }
+    const ag = rows[0];
+    console.log(`[PSI-PAGBANK-WH] Agendamento #${ag.id} confirmado — ${ag.paciente_nome} → ${ag.psicologo_nome}`);
+    // Envia email admin com psicólogo + valor real pago
+    enviarEmailAdminPsicologia(ag).catch(() => {});
+  } catch (e) {
+    console.error('[PSI-PAGBANK-WH] Erro:', e.message);
+  }
+});
+
+// ── PSICOLOGIA: polling status de pagamento ───────────────────────────────────
+app.get('/api/psicologia/agendamento/:id/status', rlGeral, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, pagamento_status, status, valor_cobrado, psicologo_nome,
+              horario_agendado, tipo_consulta, formulario_url
+         FROM agendamentos_psicologia WHERE id = $1 LIMIT 1`,
+      [req.params.id]
+    );
+    if (rows.length === 0) return res.status(404).json({ ok: false, error: 'Agendamento não encontrado' });
+    const ag = rows[0];
+
+    // Fallback: consulta PagBank diretamente se ainda pendente (webhook pode ter atrasado)
+    if (ag.pagamento_status === 'pendente' && ag.pagbank_order_id && PAGBANK_TOKEN) {
+      try {
+        const pbRes = await fetch(`${PAGBANK_URL}/orders/${ag.pagbank_order_id}`, {
+          headers: { 'Authorization': `Bearer ${PAGBANK_TOKEN}`, 'accept': 'application/json' }
+        });
+        const pbData = await pbRes.json();
+        const pagoNaPagBank = pbData.charges?.some(c => c.status === 'PAID') || false;
+        if (pagoNaPagBank) {
+          await pool.query(
+            `UPDATE agendamentos_psicologia
+                SET pagamento_status = 'confirmado', pagamento_confirmado_em = NOW(), status = 'confirmado'
+              WHERE id = $1`,
+            [ag.id]
+          );
+          ag.pagamento_status = 'confirmado';
+          ag.status = 'confirmado';
+        }
+      } catch (e) {
+        console.warn('[PSI-STATUS] Falha ao consultar PagBank:', e.message);
+      }
+    }
+
+    return res.json({ ok: true, agendamento: ag });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── PSICOLOGIA: cartão EFI com valor dinâmico ─────────────────────────────────
+// POST /api/psicologia/efi/cartao/cobrar
+// Mesma estrutura do /api/efi/cartao/cobrar existente, mas busca valor do agendamento
+app.post('/api/psicologia/efi/cartao/cobrar', rlGeral, async (req, res) => {
+  try {
+    const { payment_token, nome, cpf, email, telefone, nascimento, parcelas = 1, agendamentoId } = req.body || {};
+
+    if (!payment_token) return res.status(400).json({ ok: false, error: 'payment_token obrigatório' });
+    if (!nome)          return res.status(400).json({ ok: false, error: 'nome obrigatório' });
+    if (!cpf)           return res.status(400).json({ ok: false, error: 'cpf obrigatório' });
+    if (!agendamentoId) return res.status(400).json({ ok: false, error: 'agendamentoId obrigatório' });
+
+    const cpfLimpo = String(cpf).replace(/\D/g, '');
+    if (cpfLimpo.length !== 11) return res.status(400).json({ ok: false, error: 'CPF inválido' });
+
+    // Busca valor real — backend determina, jamais o front
+    const agRes = await pool.query(
+      `SELECT id, valor_cobrado, pagamento_status, psicologo_nome, horario_agendado
+         FROM agendamentos_psicologia WHERE id = $1 LIMIT 1`,
+      [agendamentoId]
+    );
+    if (agRes.rowCount === 0) return res.status(404).json({ ok: false, error: 'Agendamento não encontrado' });
+    const ag = agRes.rows[0];
+    if (ag.pagamento_status === 'confirmado') return res.status(409).json({ ok: false, error: 'Já pago' });
+
+    // Re-valida conflito de horário antes de cobrar no cartão (race condition)
+    const slotStartE = new Date(ag.horario_agendado);
+    const slotEndE   = new Date(slotStartE.getTime() + 60 * 60 * 1000);
+    const conflitoE  = await pool.query(
+      `SELECT id FROM agendamentos_psicologia
+        WHERE psicologo_id = (SELECT psicologo_id FROM agendamentos_psicologia WHERE id = $1)
+          AND horario_agendado >= $2 AND horario_agendado < $3
+          AND id <> $1
+          AND status NOT IN ('cancelado')
+        LIMIT 1`,
+      [agendamentoId, slotStartE.toISOString(), slotEndE.toISOString()]
+    );
+    if (conflitoE.rowCount > 0) {
+      await pool.query(`UPDATE agendamentos_psicologia SET status='cancelado' WHERE id=$1`, [agendamentoId]);
+      return res.status(409).json({ ok: false, error: 'Horário indisponível. Por favor, escolha outro horário.' });
+    }
+
+    const valorCentavos = Math.round(parseFloat(ag.valor_cobrado) * 100);
+
+    const efiToken   = await efiGetToken();
+    const headers    = { Authorization: `Bearer ${efiToken}`, 'Content-Type': 'application/json' };
+    const httpsAgent = getEfiAgent();
+
+    // Passo 1: criar charge com valor dinâmico
+    const chargePayload = {
+      items: [{ name: `Sessão de Psicologia — ${ag.psicologo_nome}`, value: valorCentavos, amount: 1 }],
+      metadata: {
+        custom_id:        `CJ-PSI-CARTAO-${agendamentoId}-${Date.now()}`,
+        notification_url: `${process.env.API_URL || 'https://triagem-api.onrender.com'}/api/psicologia/efi/cartao/webhook`
+      }
+    };
+    const chargeRes = await axios.post(`${EFI_BASE_URL}/v1/charge`, chargePayload, { httpsAgent, headers });
+    const chargeId  = chargeRes.data?.data?.charge_id;
+    if (!chargeId) return res.status(502).json({ ok: false, error: 'Efí não retornou charge_id' });
+
+    // Passo 2: associar payment_token
+    const telefoneLimpo = String(telefone || '').replace(/\D/g, '');
+    const payPayload = {
+      payment: {
+        credit_card: {
+          customer: {
+            name: nome.trim(), cpf: cpfLimpo,
+            email: email ? email.trim() : `paciente+${cpfLimpo}@consultaja24h.com.br`,
+            phone_number: telefoneLimpo.length >= 10 ? telefoneLimpo : '11999999999',
+            ...(nascimento ? { birth: nascimento } : {})
+          },
+          installments:  Math.max(1, parseInt(parcelas) || 1),
+          payment_token: payment_token.trim(),
+          billing_address: { street: 'Rua da Consulta', number: '1', neighborhood: 'Centro', zipcode: '65000000', city: 'São Luís', complement: '', state: 'MA' }
+        }
+      }
+    };
+    const payRes = await axios.post(`${EFI_BASE_URL}/v1/charge/${chargeId}/pay`, payPayload, { httpsAgent, headers });
+    const status = payRes.data?.data?.status;
+    const reason = payRes.data?.data?.reason || '';
+
+    if (status === 'paid' || status === 'waiting' || status === 'approved') {
+      await pool.query(
+        `UPDATE agendamentos_psicologia SET efi_charge_id = $1, pagamento_metodo = 'cartao' WHERE id = $2`,
+        [String(chargeId), agendamentoId]
+      );
+      if (status === 'paid' || status === 'approved') {
+        const { rows } = await pool.query(
+          `UPDATE agendamentos_psicologia
+              SET pagamento_status = 'confirmado', pagamento_confirmado_em = NOW(), status = 'confirmado'
+            WHERE id = $1 AND pagamento_status = 'pendente'
+            RETURNING id, paciente_nome, psicologo_nome, horario_agendado, valor_cobrado, paciente_email`,
+          [agendamentoId]
+        );
+        if (rows[0]) enviarEmailAdminPsicologia(rows[0]).catch(() => {});
+      }
+      return res.json({ ok: true, charge_id: chargeId, status });
+    }
+    return res.status(402).json({ ok: false, charge_id: chargeId, status: status || 'unpaid', error: reason || 'Pagamento não aprovado' });
+  } catch (e) {
+    const msg = e.response?.data?.error_description || e.response?.data?.message || e.message || 'Erro ao processar cartão';
+    console.error('[PSI-EFI-CARTAO] Erro:', msg);
+    return res.status(500).json({ ok: false, error: msg });
+  }
+});
+
+// ── PSICOLOGIA: webhook cartão EFI ───────────────────────────────────────────
+app.post('/api/psicologia/efi/cartao/webhook', async (req, res) => {
+  res.sendStatus(200);
+  try {
+    const notificationToken = req.body?.notification;
+    if (!notificationToken) return;
+    const efiToken = await efiGetToken();
+    const notifRes = await axios.get(`${EFI_BASE_URL}/v1/notification/${notificationToken}`, {
+      httpsAgent: getEfiAgent(),
+      headers: { Authorization: `Bearer ${efiToken}`, 'Content-Type': 'application/json' }
+    });
+    const charges = notifRes.data?.data || [];
+    for (const charge of charges) {
+      if (charge.status !== 'paid') continue;
+      const chargeId = String(charge.charge_id || charge.id || '');
+      if (!chargeId) continue;
+      const { rows } = await pool.query(
+        `UPDATE agendamentos_psicologia
+            SET pagamento_status = 'confirmado', pagamento_confirmado_em = NOW(), status = 'confirmado'
+          WHERE efi_charge_id = $1 AND pagamento_status = 'pendente'
+          RETURNING id, paciente_nome, psicologo_nome, horario_agendado, valor_cobrado, paciente_email`,
+        [chargeId]
+      );
+      if (rows[0]) {
+        console.log(`[PSI-EFI-WH] Agendamento #${rows[0].id} confirmado via webhook`);
+        enviarEmailAdminPsicologia(rows[0]).catch(() => {});
+      }
+    }
+  } catch (e) {
+    console.error('[PSI-EFI-WH] Erro:', e.message);
+  }
+});
+
+// ── PSICOLOGIA: email admin com todos os dados relevantes ────────────────────
+async function enviarEmailAdminPsicologia({ id, paciente_nome, psicologo_nome, horario_agendado, valor_cobrado, paciente_email }) {
+  const RESEND_KEY = process.env.RESEND_API_KEY;
+  if (!RESEND_KEY) return;
+  const horarioFmt = new Date(horario_agendado).toLocaleString('pt-BR', {
+    timeZone: 'America/Fortaleza', day: '2-digit', month: '2-digit',
+    year: 'numeric', hour: '2-digit', minute: '2-digit'
+  });
+  const valorFmt = `R$ ${parseFloat(valor_cobrado).toFixed(2).replace('.', ',')}`;
+  const html = `<div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;background:#060d0b;color:#fff;border-radius:12px;overflow:hidden">
+    <div style="background:linear-gradient(135deg,#8aa4c8,#26508e);padding:20px 28px"><h2 style="margin:0;color:#fff;font-size:17px">✅ Novo agendamento de Psicologia — ConsultaJá24h</h2></div>
+    <div style="padding:28px">
+      <table style="width:100%;border-collapse:collapse">
+        <tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px;width:150px">Agendamento #</td><td style="padding:8px 0;font-weight:600">${id}</td></tr>
+        <tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">Paciente</td><td style="padding:8px 0;font-weight:600">${paciente_nome}</td></tr>
+        <tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">E-mail paciente</td><td style="padding:8px 0">${paciente_email || '—'}</td></tr>
+        <tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">Psicólogo(a)</td><td style="padding:8px 0;font-weight:600;color:#93c5fd">${psicologo_nome}</td></tr>
+        <tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">📅 Horário</td><td style="padding:8px 0;font-weight:700;color:#8aa4c8;font-size:15px">${horarioFmt}</td></tr>
+        <tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">💰 Valor pago</td><td style="padding:8px 0;font-weight:700;color:#4ade80;font-size:15px">${valorFmt}</td></tr>
+      </table>
+      <p style="margin:20px 0 0;font-size:11px;color:rgba(255,255,255,.25)">Enviado automaticamente — ConsultaJá24h Psicologia</p>
+    </div>
+  </div>`;
+  try {
+    await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${RESEND_KEY}` },
+      body: JSON.stringify({
+        from: 'ConsultaJá24h <contato@consultaja24h.com.br>',
+        to: ['gustavosgbf@gmail.com'],
+        subject: `🧠 Psicologia: ${paciente_nome} → ${psicologo_nome} — ${horarioFmt} — ${valorFmt}`,
+        html
+      })
+    });
+  } catch (e) { console.error('[PSI-EMAIL-ADMIN] Erro:', e.message); }
+}
+
+// ── PSICOLOGIA: painel do psicólogo — lista de pacientes ─────────────────────
+app.get('/api/psicologo/agendamentos', authPsicologo, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, paciente_nome, paciente_email, paciente_tel,
+              tipo_consulta, horario_agendado, valor_cobrado,
+              pagamento_status, status, formulario_enviado, criado_em
+         FROM agendamentos_psicologia
+        WHERE psicologo_id = $1
+        ORDER BY horario_agendado DESC`,
+      [req.psicologoId]
+    );
+    return res.json({ ok: true, agendamentos: rows });
+  } catch (e) { return res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// ── PSICOLOGIA: painel — editar disponibilidade ───────────────────────────────
+app.patch('/api/psicologo/disponibilidade', authPsicologo, async (req, res) => {
+  try {
+    const { disponibilidade } = req.body || {};
+    if (typeof disponibilidade !== 'string') {
+      return res.status(400).json({ ok: false, error: 'disponibilidade deve ser texto' });
+    }
+    await pool.query(
+      `UPDATE psicologos SET disponibilidade = $1 WHERE id = $2`,
+      [disponibilidade.trim(), req.psicologoId]
+    );
+    console.log(`[PSI-DISP] Psicólogo #${req.psicologoId} atualizou disponibilidade`);
+    return res.json({ ok: true });
+  } catch (e) { return res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// ── PSICOLOGIA: Google Sheets — salvar dados do paciente aba Psicologia ───────
+app.post('/api/psicologia/consent', rlGeral, async (req, res) => {
+  try {
+    const { nome, email, tel, psicologo_nome, agendamento_id, aceite_termos } = req.body || {};
+    const agora = new Date().toLocaleString('pt-BR', { timeZone: 'America/Fortaleza' });
+    const ip = req.headers['x-forwarded-for'] || req.socket?.remoteAddress || '-';
+    // Salva em aba separada "Psicologia" no Sheets — não mistura com médicos
+    appendToSheet('Psicologia', [
+      agora, nome || '', email || '', tel || '',
+      psicologo_nome || '', String(agendamento_id || ''),
+      aceite_termos ? 'Sim' : 'Não', ip
+    ]).catch(e => console.error('[PSI-SHEETS]', e.message));
+    return res.json({ ok: true });
+  } catch (e) { return res.status(500).json({ ok: false, error: e.message }); }
+});
+// GET /api/psicologos
+// Não expõe email, senha_hash, telefone — apenas dados de perfil público
+app.get('/api/psicologos', rlGeral, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, nome_exibicao, crp, uf, abordagem, focos,
+              valor_sessao, tem_avaliacao, valor_avaliacao,
+              apresentacao, disponibilidade, foto_url, formulario_url,
+              atende_online
+         FROM psicologos
+        WHERE ativo = true AND status = 'aprovado'
+        ORDER BY id ASC`
+    );
+    return res.json({ ok: true, psicologos: result.rows });
+  } catch (err) { return res.status(500).json({ ok: false, error: err.message }); }
+});
+
+// ── ROTA: buscar dados de um psicólogo por ID (público) ──────────────────────
+app.get('/api/psicologo/:id', rlGeral, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, nome_exibicao, crp, uf, abordagem, focos,
+              valor_sessao, tem_avaliacao, valor_avaliacao,
+              apresentacao, disponibilidade, foto_url, formulario_url,
+              atende_online
+         FROM psicologos WHERE id = $1 AND ativo = true AND status = 'aprovado' LIMIT 1`,
+      [req.params.id]
+    );
+    if (result.rowCount === 0) return res.status(404).json({ ok: false, error: 'Psicólogo não encontrado' });
+    return res.json({ ok: true, psicologo: result.rows[0] });
+  } catch (err) { return res.status(500).json({ ok: false, error: err.message }); }
+});
 
 app.patch("/api/admin/medico/:id/aprovar", checkAdmin, async (req, res) => {
   try {
