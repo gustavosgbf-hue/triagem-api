@@ -3961,6 +3961,17 @@ td{padding:10px 14px;vertical-align:middle;white-space:nowrap}
 .toast.ok{border-color:rgba(52,211,153,.3);color:var(--green)}
 .toast.err{border-color:rgba(248,113,113,.3);color:var(--red)}
 .empty{padding:48px 24px;text-align:center;color:var(--text3);font-size:.82rem}
+.psi-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius);padding:20px 22px;display:flex;flex-wrap:wrap;gap:16px;align-items:flex-start;justify-content:space-between}
+.psi-card+.psi-card{margin-top:10px}
+.psi-info{flex:1;min-width:220px}
+.psi-nome{font-size:.95rem;font-weight:600;margin-bottom:4px}
+.psi-detalhe{font-size:.78rem;color:var(--text2);line-height:1.7}
+.psi-detalhe strong{color:var(--text);font-weight:500}
+.psi-actions{display:flex;gap:8px;flex-shrink:0;align-items:center}
+.btn-aprovar{background:var(--green-dim);color:var(--green);border:1px solid rgba(52,211,153,.25)}
+.btn-rejeitar{background:var(--red-dim);color:var(--red);border:1px solid rgba(248,113,113,.25)}
+.badge-pendente{background:var(--yellow-dim);color:var(--yellow);border:1px solid rgba(251,191,36,.2);font-size:.65rem;font-weight:600;padding:2px 9px;border-radius:999px;letter-spacing:.05em;text-transform:uppercase;margin-left:8px}
+#badge-pendentes{display:none;background:var(--red);color:#fff;font-size:.65rem;font-weight:700;padding:1px 7px;border-radius:999px;margin-left:6px;vertical-align:middle}
 .loading{padding:48px 24px;text-align:center;color:var(--text3);font-size:.78rem;font-family:'IBM Plex Mono',monospace}
 @media(max-width:700px){.kpi-grid{grid-template-columns:1fr 1fr}.res-row{grid-template-columns:1fr 1fr;gap:8px}.filters{gap:8px}main{padding:16px 12px}}
 </style>
@@ -3998,6 +4009,7 @@ td{padding:10px 14px;vertical-align:middle;white-space:nowrap}
   <div class="tabs">
     <button class="tab active" onclick="mudarAba('sessoes',this)">Sessões</button>
     <button class="tab" onclick="mudarAba('resumo',this)">Resumo por Psicólogo</button>
+    <button class="tab" id="tab-cadastros" onclick="mudarAba('cadastros',this)">Cadastros<span id="badge-pendentes"></span></button>
   </div>
   <div id="aba-sessoes">
     <div class="filters">
@@ -4021,6 +4033,13 @@ td{padding:10px 14px;vertical-align:middle;white-space:nowrap}
   <div id="aba-resumo" style="display:none">
     <div id="resumo-wrap" class="resumo-grid"><div class="loading">Carregando</div></div>
   </div>
+  <div id="aba-cadastros" style="display:none">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;flex-wrap:wrap;gap:10px">
+      <p style="font-size:.78rem;color:var(--text2)">Psicólogos aguardando aprovação de cadastro.</p>
+      <button class="btn btn-ghost" onclick="buscarPendentes()" style="font-size:.72rem;padding:5px 12px">↻ Atualizar</button>
+    </div>
+    <div id="pendentes-wrap"><div class="loading">Carregando</div></div>
+  </div>
 </main>
 <div class="toast" id="toast"></div>
 <script>
@@ -4041,7 +4060,7 @@ function sair(){sessionStorage.removeItem('adm_pw');location.reload();}
 function hdr(){return{'Content-Type':'application/json','x-admin-password':SENHA};}
 function iniciar(){
   document.getElementById('f-mes').value=new Date().toISOString().slice(0,7);
-  carregarPsicologos();buscarSessoes();buscarResumo();
+  carregarPsicologos();buscarSessoes();buscarResumo();buscarPendentes();
 }
 async function carregarPsicologos(){
   try{const r=await fetch(API+'/api/admin/psicologia/psicologos-lista',{headers:hdr()});
@@ -4147,13 +4166,77 @@ function mudarAba(aba,el){
   document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));el.classList.add('active');
   document.getElementById('aba-sessoes').style.display=aba==='sessoes'?'block':'none';
   document.getElementById('aba-resumo').style.display=aba==='resumo'?'block':'none';
+  document.getElementById('aba-cadastros').style.display=aba==='cadastros'?'block':'none';
   if(aba==='resumo')buscarResumo();
+  if(aba==='cadastros')buscarPendentes();
 }
 function chipStatus(s){const m={agendado:['chip-agendado','Agendado'],pago:['chip-pago','Pago'],realizado:['chip-realizado','Realizado'],cancelado:['chip-cancelado','Cancelado'],faltou:['chip-faltou','Faltou']};const[cls,label]=m[s]||['chip-agendado',s];return '<span class="chip '+cls+'">'+label+'</span>';}
 function fmtR(v){return 'R$ '+parseFloat(v||0).toFixed(2).replace('.',',');}
 function fmtD(iso){if(!iso)return '—';return new Date(iso).toLocaleString('pt-BR',{timeZone:'America/Fortaleza',day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit'});}
 function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 function toast(msg,tipo){const el=document.getElementById('toast');el.textContent=msg;el.className='toast show '+(tipo||'');clearTimeout(el._t);el._t=setTimeout(()=>el.classList.remove('show'),3200);}
+async function buscarPendentes(){
+  const wrap=document.getElementById('pendentes-wrap');
+  wrap.innerHTML='<div class="loading">Carregando</div>';
+  try{
+    const r=await fetch(API+'/api/admin/psicologos/pendentes',{headers:hdr()});
+    const d=await r.json();
+    if(!d.ok)throw new Error(d.error||'Erro');
+    const lista=d.psicologos||[];
+    const badge=document.getElementById('badge-pendentes');
+    if(lista.length){badge.style.display='inline';badge.textContent=lista.length;}
+    else{badge.style.display='none';}
+    renderPendentes(lista);
+  }catch(e){wrap.innerHTML='<div class="empty">Erro: '+e.message+'</div>';}
+}
+function renderPendentes(lista){
+  const wrap=document.getElementById('pendentes-wrap');
+  if(!lista.length){wrap.innerHTML='<div class="empty">Nenhum cadastro pendente. ✓</div>';return;}
+  wrap.innerHTML=lista.map(p=>{
+    const crp=p.crp?(p.uf?'CRP '+p.uf+'/'+p.crp:'CRP '+p.crp):'—';
+    const dt=p.created_at?new Date(p.created_at).toLocaleDateString('pt-BR'):'—';
+    return '<div class="psi-card" id="psi-card-'+p.id+'">'+
+      '<div class="psi-info">'+
+        '<div class="psi-nome">'+esc(p.nome_exibicao||p.nome)+'<span class="badge-pendente">Pendente</span></div>'+
+        '<div class="psi-detalhe">'+
+          '<strong>E-mail:</strong> '+esc(p.email)+'<br>'+
+          '<strong>CRP:</strong> '+esc(crp)+'  &nbsp;·&nbsp;  <strong>UF:</strong> '+esc(p.uf||'—')+'<br>'+
+          (p.abordagem?'<strong>Abordagem:</strong> '+esc(p.abordagem)+'<br>':'')+
+          (p.telefone?'<strong>Tel:</strong> '+esc(p.telefone)+'<br>':'')+
+          '<strong>Cadastro em:</strong> '+dt+
+        '</div>'+
+      '</div>'+
+      '<div class="psi-actions">'+
+        '<button class="btn-sm btn-aprovar" onclick="aprovarPsi('+p.id+',this)">✓ Aprovar</button>'+
+        '<button class="btn-sm btn-rejeitar" onclick="rejeitarPsi('+p.id+',this)">✗ Rejeitar</button>'+
+      '</div>'+
+    '</div>';
+  }).join('');
+}
+async function aprovarPsi(id,btn){
+  if(!confirm('Aprovar este psicólogo?'))return;
+  btn.disabled=true;btn.textContent='…';
+  try{
+    const r=await fetch(API+'/api/admin/psicologo/'+id+'/aprovar',{method:'PATCH',headers:hdr()});
+    const d=await r.json();
+    if(!d.ok)throw new Error(d.error||'Erro');
+    toast('Psicólogo aprovado com sucesso!','ok');
+    document.getElementById('psi-card-'+id)?.remove();
+    buscarPendentes();
+  }catch(e){toast('Erro: '+e.message,'err');btn.disabled=false;btn.textContent='✓ Aprovar';}
+}
+async function rejeitarPsi(id,btn){
+  if(!confirm('Rejeitar este cadastro? Esta ação não pode ser desfeita.'))return;
+  btn.disabled=true;btn.textContent='…';
+  try{
+    const r=await fetch(API+'/api/admin/psicologo/'+id+'/rejeitar',{method:'PATCH',headers:hdr()});
+    const d=await r.json();
+    if(!d.ok)throw new Error(d.error||'Erro');
+    toast('Cadastro rejeitado.','ok');
+    document.getElementById('psi-card-'+id)?.remove();
+    buscarPendentes();
+  }catch(e){toast('Erro: '+e.message,'err');btn.disabled=false;btn.textContent='✗ Rejeitar';}
+}
 const saved=sessionStorage.getItem('adm_pw');
 if(saved){SENHA=saved;document.getElementById('login-overlay').style.display='none';iniciar();}
 </script>
