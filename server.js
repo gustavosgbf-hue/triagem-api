@@ -222,6 +222,7 @@ async function initDB() {
       ['pagamento_status','TEXT NOT NULL DEFAULT \'pendente\''],
       ['pagbank_order_id','TEXT'],
       ['pagamento_confirmado_em','TIMESTAMPTZ'],
+      ['efi_charge_id','TEXT'],
     ];
     // Coluna para controle de lembrete de agendamento
     await pool.query(`ALTER TABLE agendamentos ADD COLUMN IF NOT EXISTS lembrete_enviado BOOLEAN DEFAULT false`).catch(()=>{});
@@ -266,6 +267,7 @@ async function initDB() {
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_agendamentos_status ON agendamentos(status)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_agendamentos_horario ON agendamentos(horario_agendado)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_fila_pagbank_order ON fila_atendimentos(pagbank_order_id)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_fila_efi_charge ON fila_atendimentos(efi_charge_id)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_fila_pagamento_status ON fila_atendimentos(pagamento_status)`);
     console.log("[DB] Tabelas, colunas e índices verificados com sucesso");
   } catch (e) {
@@ -2304,6 +2306,9 @@ app.get("/api/test-db", async (req, res) => {
 
 
 // URL base: homologação. Troque EFI_ENV=producao quando for ao ar.
+// API de Cobranças Efí — domínio oficial atual (efipay.com.br, não gerencianet)
+// Homologação: cobrancas-h.api.efipay.com.br
+// Produção:    cobrancas.api.efipay.com.br
 const EFI_BASE_URL = process.env.EFI_ENV === "producao"
   ? "https://cobrancas.api.efipay.com.br"
   : "https://cobrancas-h.api.efipay.com.br";
@@ -2372,10 +2377,226 @@ app.get("/api/efi/test", checkAdmin, async (req, res) => {
   }
 });
 
-// ── EFÍ: webhook de cartão (estrutura pronta para produção) ───────────────────
+// ── EFÍ: cobrança por cartão de crédito ──────────────────────────────────────
+// POST /api/efi/cartao/cobrar
+//
+// FLUXO (2 passos obrigatórios na API Efí):
+//   1. POST /v1/charge          → cria a transação, retorna charge_id
+//   2. POST /v1/charge/:id/pay  → associa o payment_token + dados do cliente
+//
+// O payment_token DEVE ser gerado pelo SDK JS da Efí no frontend (nunca envie
+// dados brutos do cartão ao backend em produção).
+//
+// SIMULAÇÃO EM HOMOLOGAÇÃO (por último dígito do número do cartão):
+//   final 1 → "Dados do cartão inválidos"
+//   final 2 → "Não autorizado por segurança"
+//   final 3 → "Tente novamente mais tarde"
+//   demais  → aprovado ✓
+//
+// Payload esperado (JSON):
+// {
+//   "payment_token": "...",         // obrigatório — SDK Efí no frontend
+//   "nome":          "João Silva",  // obrigatório
+//   "cpf":           "12345678909", // obrigatório (só números)
+//   "email":         "...",         // opcional
+//   "telefone":      "62999999999", // opcional (só números, com DDD)
+//   "nascimento":    "1990-01-15",  // opcional (YYYY-MM-DD)
+//   "parcelas":      1,             // opcional — padrão 1
+//   "atendimentoId": 123            // opcional — confirma pagamento na fila
+// }
+//
+// Resposta aprovado:  { ok: true,  charge_id: 123456, status: "paid" }
+// Resposta recusado:  { ok: false, error: "Motivo...", status: "unpaid" }
+
+const EFI_VALOR_CENTAVOS = 4990; // R$ 49,90 — fixo no backend, igual ao PagBank
+
+app.post("/api/efi/cartao/cobrar", rlGeral, async (req, res) => {
+  try {
+    const {
+      payment_token,
+      nome,
+      cpf,
+      email,
+      telefone,
+      nascimento,
+      parcelas = 1,
+      atendimentoId
+    } = req.body || {};
+
+    // ── Validação ────────────────────────────────────────────────────────────
+    if (!payment_token)
+      return res.status(400).json({ ok: false, error: "payment_token obrigatório (gerado pelo SDK Efí no frontend)" });
+    if (!nome)
+      return res.status(400).json({ ok: false, error: "nome obrigatório" });
+    if (!cpf)
+      return res.status(400).json({ ok: false, error: "cpf obrigatório" });
+
+    const cpfLimpo = String(cpf).replace(/\D/g, "");
+    if (cpfLimpo.length !== 11)
+      return res.status(400).json({ ok: false, error: "CPF inválido (precisa ter 11 dígitos)" });
+
+    // ── Auth Efí ─────────────────────────────────────────────────────────────
+    const efiToken  = await efiGetToken();
+    const headers   = { Authorization: `Bearer ${efiToken}`, "Content-Type": "application/json" };
+    const httpsAgent = getEfiAgent();
+
+    // ── PASSO 1: Criar a transação ────────────────────────────────────────────
+    // Endpoint: POST /v1/charge
+    // Retorna charge_id que será usado no passo 2
+    const chargePayload = {
+      items: [{
+        name:   "Consulta Médica Online — ConsultaJá24h",
+        value:  EFI_VALOR_CENTAVOS,
+        amount: 1
+      }],
+      metadata: {
+        custom_id:        `CJ-CARTAO-${Date.now()}`,
+        notification_url: `${process.env.API_URL || "https://triagem-api.onrender.com"}/api/efi/cartao/webhook`
+      }
+    };
+
+    const chargeRes = await axios.post(
+      `${EFI_BASE_URL}/v1/charge`,
+      chargePayload,
+      { httpsAgent, headers }
+    );
+
+    const chargeId = chargeRes.data?.data?.charge_id;
+    if (!chargeId) {
+      console.error("[EFI-CARTAO] Passo 1 falhou — sem charge_id:", JSON.stringify(chargeRes.data));
+      return res.status(502).json({ ok: false, error: "Efí não retornou charge_id" });
+    }
+    console.log(`[EFI-CARTAO] Passo 1 OK — charge_id: ${chargeId}`);
+
+    // ── PASSO 2: Associar o payment_token ao charge_id ────────────────────────
+    // Endpoint: POST /v1/charge/:id/pay
+    const customer = {
+      name: nome.trim(),
+      cpf:  cpfLimpo
+    };
+    if (email)     customer.email        = email.trim();
+    if (telefone)  customer.phone_number = String(telefone).replace(/\D/g, "");
+    if (nascimento) customer.birth       = nascimento; // "YYYY-MM-DD"
+
+    const payPayload = {
+      payment: {
+        credit_card: {
+          customer,
+          installments:  Math.max(1, parseInt(parcelas) || 1),
+          payment_token: payment_token.trim(),
+          billing_address: {
+            // Endereço de cobrança — mínimo exigido pela Efí
+            // Em produção, colete do paciente; em homologação qualquer valor serve
+            street:       "Rua da Consulta",
+            number:       "1",
+            neighborhood: "Centro",
+            zipcode:      "65000000",
+            city:         "São Luís",
+            complement:   "",
+            state:        "MA"
+          }
+        }
+      }
+    };
+
+    const payRes = await axios.post(
+      `${EFI_BASE_URL}/v1/charge/${chargeId}/pay`,
+      payPayload,
+      { httpsAgent, headers }
+    );
+
+    const status    = payRes.data?.data?.status;      // "paid", "unpaid", "waiting"
+    const reason    = payRes.data?.data?.reason || ""; // motivo de recusa
+    const chargeData = payRes.data?.data || {};
+
+    console.log(`[EFI-CARTAO] Passo 2 — charge_id: ${chargeId} status: ${status} reason: ${reason}`);
+
+    // ── Pagamento aprovado imediatamente (raro) OU aguardando análise (esperado) ──
+    // A doc Efí mostra que /pay responde "waiting" na maioria dos casos aprovados.
+    // "paid" pode ocorrer em sandbox ou pagamentos pré-aprovados.
+    // Em ambos os casos: salva o charge_id e retorna ok:true ao frontend.
+    // A confirmação final (pagamento_status='confirmado') sempre vem via webhook.
+    if (status === "paid" || status === "waiting") {
+      // Sempre salva o efi_charge_id para o webhook conseguir achar o atendimento depois
+      if (atendimentoId) {
+        await pool.query(
+          `UPDATE fila_atendimentos SET efi_charge_id = $2
+            WHERE id = $1 AND (efi_charge_id IS NULL OR efi_charge_id = '')`,
+          [atendimentoId, String(chargeId)]
+        ).catch(e => console.warn("[EFI-CARTAO] Salvar charge_id falhou:", e.message));
+      }
+
+      // Se já veio "paid" (ex: sandbox), confirma na hora igual ao webhook faria
+      if (status === "paid" && atendimentoId) {
+        const { rows: atRows } = await pool.query(
+          `UPDATE fila_atendimentos
+              SET pagamento_status        = 'confirmado',
+                  pagamento_confirmado_em = NOW(),
+                  status = CASE
+                    WHEN status = 'pagamento_pendente' THEN 'triagem'
+                    WHEN status = 'triagem' THEN
+                      CASE
+                        WHEN LOWER(TRIM(triagem)) NOT IN (
+                          '(aguardando pagamento)',
+                          '(pagamento confirmado — aguardando triagem)',
+                          '(triagem em andamento)',
+                          '(aguardando triagem de agendamento)',
+                          '(aguardando resposta)'
+                        ) THEN 'aguardando'
+                        ELSE 'triagem'
+                      END
+                    ELSE 'aguardando'
+                  END
+            WHERE id = $1
+              AND pagamento_status = 'pendente'
+            RETURNING id, nome, tel, cpf, tipo, triagem, status`,
+          [atendimentoId]
+        ).catch(e => { console.warn("[EFI-CARTAO] Update fila falhou:", e.message); return { rows: [] }; });
+
+        const at = atRows[0];
+        if (at) {
+          console.log(`[EFI-CARTAO] Atendimento #${at.id} — paid síncrono, status: ${at.status}`);
+          if (at.status === "aguardando" && !isTriagemPlaceholder(at.triagem)) {
+            await notificarMedicos(at);
+          }
+        }
+      }
+
+      console.log(`[EFI-CARTAO] charge_id ${chargeId} — status: ${status} — aguardando webhook para confirmação final`);
+      return res.json({
+        ok:        true,
+        charge_id: chargeId,
+        status     // "paid" ou "waiting" — frontend trata os dois como sucesso
+      });
+    }
+
+    // ── Pagamento recusado ────────────────────────────────────────────────────
+    return res.status(402).json({
+      ok:        false,
+      charge_id: chargeId,
+      status:    status || "unpaid",
+      error:     reason || "Pagamento não aprovado. Verifique os dados do cartão."
+    });
+
+  } catch (e) {
+    const efiError = e.response?.data;
+    console.error("[EFI-CARTAO] Erro:", efiError || e.message);
+
+    // Erros conhecidos da Efí com mensagem legível
+    const msg = efiError?.error_description
+      || efiError?.message
+      || efiError?.error
+      || e.message
+      || "Erro ao processar pagamento com cartão";
+
+    return res.status(500).json({ ok: false, error: msg });
+  }
+});
+
+// ── EFÍ: webhook de cartão ────────────────────────────────────────────────────
 // POST /api/efi/cartao/webhook
-// A Efí envia notificação aqui quando o status de uma cobrança muda.
-// Quando implementar cobrança de cartão, processe o evento aqui.
+// Efí notifica aqui quando o status de uma cobrança muda (paid, unpaid, etc.)
+// Idempotente: só processa se pagamento_status ainda for 'pendente'
 app.post("/api/efi/cartao/webhook", async (req, res) => {
   // Responde 200 imediatamente — Efí não aguarda processamento
   res.sendStatus(200);
@@ -2384,14 +2605,78 @@ app.post("/api/efi/cartao/webhook", async (req, res) => {
     const evento = req.body;
     if (!evento || typeof evento !== "object") return;
 
-    console.log("[EFI-WEBHOOK] Evento recebido:", JSON.stringify(evento).slice(0, 300));
+    // Estrutura do webhook Efí Cobranças: { "notification": "<token>" }
+    // Para obter o status real: GET /v1/notification/:token
+    const notificationToken = evento?.notification;
+    if (!notificationToken) {
+      console.log("[EFI-WEBHOOK] Evento sem notification token — ignorando");
+      return;
+    }
 
-    // Quando implementar cobrança de cartão, o evento terá estrutura similar a:
-    // { type: "charge.status.changed", data: { charge_id, status, ... } }
-    // Adicione o processamento aqui nessa etapa.
+    console.log("[EFI-WEBHOOK] Token recebido:", notificationToken);
+
+    const efiToken = await efiGetToken();
+    const notifRes = await axios.get(
+      `${EFI_BASE_URL}/v1/notification/${notificationToken}`,
+      {
+        httpsAgent: getEfiAgent(),
+        headers: { Authorization: `Bearer ${efiToken}`, "Content-Type": "application/json" }
+      }
+    );
+
+    const charges = notifRes.data?.data || [];
+    console.log("[EFI-WEBHOOK] Cobranças notificadas:", charges.length);
+
+    for (const charge of charges) {
+      const chargeId = String(charge.charge_id || charge.id || "");
+      const status   = charge.status;
+
+      console.log(`[EFI-WEBHOOK] charge_id: ${chargeId} status: ${status}`);
+
+      if (status !== "paid" || !chargeId) continue;
+
+      // Busca o atendimento vinculado a este charge_id — idempotente
+      const { rows: atRows } = await pool.query(
+        `UPDATE fila_atendimentos
+            SET pagamento_status        = 'confirmado',
+                pagamento_confirmado_em = NOW(),
+                status = CASE
+                  WHEN status = 'pagamento_pendente' THEN 'triagem'
+                  WHEN status = 'triagem' THEN
+                    CASE
+                      WHEN LOWER(TRIM(triagem)) NOT IN (
+                        '(aguardando pagamento)',
+                        '(pagamento confirmado — aguardando triagem)',
+                        '(triagem em andamento)',
+                        '(aguardando triagem de agendamento)',
+                        '(aguardando resposta)'
+                      ) THEN 'aguardando'
+                      ELSE 'triagem'
+                    END
+                  ELSE 'aguardando'
+                END
+          WHERE efi_charge_id = $1
+            AND pagamento_status = 'pendente'
+          RETURNING id, nome, tel, cpf, tipo, triagem, status`,
+        [chargeId]
+      );
+
+      if (atRows.length === 0) {
+        console.log(`[EFI-WEBHOOK] charge_id ${chargeId} — atendimento não encontrado ou já processado`);
+        continue;
+      }
+
+      const at = atRows[0];
+      console.log(`[EFI-WEBHOOK] Atendimento #${at.id} confirmado via webhook — status: ${at.status}`);
+
+      // Notifica médicos se triagem real já estava preenchida
+      if (at.status === "aguardando" && !isTriagemPlaceholder(at.triagem)) {
+        await notificarMedicos(at);
+      }
+    }
 
   } catch (e) {
-    console.error("[EFI-WEBHOOK] Erro no processamento:", e.message);
+    console.error("[EFI-WEBHOOK] Erro:", e.response?.data || e.message);
   }
 });
 // ── FIM EFÍ ───────────────────────────────────────────────────────────────────
