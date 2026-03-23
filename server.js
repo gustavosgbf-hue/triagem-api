@@ -309,6 +309,7 @@ async function initDB() {
     // Vincula paciente logado ao agendamento de psicologia (nullable — compatível com agendamentos antigos)
     await pool.query(`ALTER TABLE agendamentos_psicologia ADD COLUMN IF NOT EXISTS paciente_id INTEGER REFERENCES pacientes(id)`).catch(()=>{});
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_ag_psi_paciente_id ON agendamentos_psicologia(paciente_id)`).catch(()=>{});
+    await pool.query(`ALTER TABLE agendamentos_psicologia ADD COLUMN IF NOT EXISTS lembrete_psi_enviado BOOLEAN DEFAULT false`).catch(()=>{});
 
     // Índices de performance para queries frequentes
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_mensagens_atendimento ON mensagens(atendimento_id)`);
@@ -1379,6 +1380,8 @@ app.post('/api/paciente/cadastro', rlGeral, async (req, res) => {
     // Sheets — aba separada para pacientes de psicologia
     const agora = new Date().toLocaleString('pt-BR', { timeZone: 'America/Fortaleza' });
     appendToSheet('Psicologia_Pacientes', [agora, pac.nome, pac.email, pac.tel || '', pac.cpf || '']).catch(()=>{});
+    // E-mail de boas-vindas
+    enviarEmailBoasVindasPaciente({ nome: pac.nome, email: pac.email }).catch(()=>{});
     return res.json({ ok: true, token, paciente: pac });
   } catch(err) {
     if (err.code === '23505') return res.status(400).json({ ok: false, error: 'E-mail já cadastrado' });
@@ -1856,6 +1859,8 @@ app.post('/api/psicologia/pagbank/webhook', async (req, res) => {
     console.log(`[PSI-PAGBANK-WH] Agendamento #${ag.id} confirmado — ${ag.paciente_nome} → ${ag.psicologo_nome}`);
     // Envia email admin com psicólogo + valor real pago
     enviarEmailAdminPsicologia(ag).catch(() => {});
+    // Envia email de confirmação ao paciente
+    enviarEmailConfirmacaoPacientePsi(ag).catch(() => {});
   } catch (e) {
     console.error('[PSI-PAGBANK-WH] Erro:', e.message);
   }
@@ -1996,7 +2001,10 @@ app.post('/api/psicologia/efi/cartao/cobrar', rlGeral, async (req, res) => {
             RETURNING id, paciente_nome, psicologo_nome, horario_agendado, valor_cobrado, paciente_email`,
           [agendamentoId]
         );
-        if (rows[0]) enviarEmailAdminPsicologia(rows[0]).catch(() => {});
+        if (rows[0]) {
+          enviarEmailAdminPsicologia(rows[0]).catch(() => {});
+          enviarEmailConfirmacaoPacientePsi(rows[0]).catch(() => {});
+        }
       }
       return res.json({ ok: true, charge_id: chargeId, status });
     }
@@ -2034,6 +2042,7 @@ app.post('/api/psicologia/efi/cartao/webhook', async (req, res) => {
       if (rows[0]) {
         console.log(`[PSI-EFI-WH] Agendamento #${rows[0].id} confirmado via webhook`);
         enviarEmailAdminPsicologia(rows[0]).catch(() => {});
+        enviarEmailConfirmacaoPacientePsi(rows[0]).catch(() => {});
       }
     }
   } catch (e) {
@@ -2077,6 +2086,196 @@ async function enviarEmailAdminPsicologia({ id, paciente_nome, psicologo_nome, h
     });
   } catch (e) { console.error('[PSI-EMAIL-ADMIN] Erro:', e.message); }
 }
+
+// ── PSICOLOGIA: e-mail de boas-vindas ao paciente ────────────────────────────
+async function enviarEmailBoasVindasPaciente({ nome, email }) {
+  const RESEND_KEY = process.env.RESEND_API_KEY;
+  if (!RESEND_KEY) return;
+  const PAINEL_URL = 'https://painel.consultaja24h.com.br/paciente';
+  const html = `<div style="background:#f2f0ec;padding:32px 20px;font-family:sans-serif">
+    <div style="max-width:520px;margin:0 auto;background:#fff;border:1px solid rgba(22,18,14,.1);border-radius:16px;overflow:hidden">
+      <div style="padding:24px;border-bottom:1px solid rgba(22,18,14,.08)">
+        <span style="font-size:1.1rem;font-weight:600;color:#26508e">ConsultaJá24h</span>
+        <span style="font-size:.8rem;color:rgba(22,18,14,.4);margin-left:8px">Psicologia Online</span>
+      </div>
+      <div style="padding:28px">
+        <p style="color:#16120e;font-size:.95rem;margin-bottom:12px">Olá, <strong>${nome}</strong>!</p>
+        <p style="color:#443e38;font-size:.9rem;line-height:1.65;margin-bottom:20px">
+          Sua conta foi criada com sucesso. Agora você pode agendar sessões com nossos psicólogos de forma simples e segura.
+        </p>
+        <a href="${PAINEL_URL}" style="display:inline-block;padding:12px 28px;border-radius:12px;background:#26508e;color:#fff;font-weight:600;font-size:.9rem;text-decoration:none">
+          Acessar minha conta
+        </a>
+        <p style="margin-top:24px;font-size:.78rem;color:rgba(22,18,14,.4);line-height:1.55">
+          Se você não criou esta conta, ignore este e-mail.
+        </p>
+      </div>
+    </div>
+  </div>`;
+  try {
+    const r = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${RESEND_KEY}` },
+      body: JSON.stringify({
+        from: 'ConsultaJá24h <contato@consultaja24h.com.br>',
+        to: [email],
+        subject: 'Bem-vindo(a) à ConsultaJá24h Psicologia',
+        html
+      })
+    });
+    const d = await r.json();
+    if (d.id) console.log('[PSI-EMAIL-BOASVINDAS] Enviado para', email);
+    else console.error('[PSI-EMAIL-BOASVINDAS] Resend recusou:', JSON.stringify(d));
+  } catch (e) { console.error('[PSI-EMAIL-BOASVINDAS] Erro:', e.message); }
+}
+
+// ── PSICOLOGIA: e-mail de confirmação do agendamento ao paciente ─────────────
+async function enviarEmailConfirmacaoPacientePsi({ id, paciente_nome, paciente_email, psicologo_nome, horario_agendado, valor_cobrado, tipo_consulta, formulario_url }) {
+  const RESEND_KEY = process.env.RESEND_API_KEY;
+  if (!RESEND_KEY || !paciente_email) return;
+  // Busca formulario_url do psicólogo se não vier no objeto
+  if (!formulario_url) {
+    try {
+      const r = await pool.query(
+        `SELECT ps.formulario_url FROM agendamentos_psicologia ap
+           JOIN psicologos ps ON ps.id = ap.psicologo_id
+          WHERE ap.id = $1 LIMIT 1`, [id]
+      );
+      formulario_url = r.rows[0]?.formulario_url || null;
+    } catch(_) {}
+  }
+  const horarioFmt = new Date(horario_agendado).toLocaleString('pt-BR', {
+    timeZone: 'America/Fortaleza', weekday: 'long', day: '2-digit',
+    month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit'
+  });
+  const valorFmt   = `R$ ${parseFloat(valor_cobrado).toFixed(2).replace('.', ',')}`;
+  const tipoLabel  = tipo_consulta === 'avaliacao' ? 'Avaliação Psicológica' : 'Psicoterapia';
+  const formularioBloco = formulario_url
+    ? `<div style="margin:24px 0">
+        <a href="${formulario_url}" style="display:inline-block;padding:11px 24px;border-radius:10px;background:#26508e;color:#fff;font-weight:600;font-size:.88rem;text-decoration:none">
+          Preencher formulário do psicólogo
+        </a>
+        <p style="margin-top:8px;font-size:.75rem;color:#443e38">Preencha antes da sua sessão para ajudar o profissional a se preparar.</p>
+      </div>`
+    : `<p style="color:#443e38;font-size:.88rem;line-height:1.65;margin:16px 0">
+        Você receberá as próximas orientações no e-mail cadastrado. Fique atento(a) à sua caixa de entrada.
+      </p>`;
+  const html = `<div style="background:#f2f0ec;padding:32px 20px;font-family:sans-serif">
+    <div style="max-width:540px;margin:0 auto;background:#fff;border:1px solid rgba(22,18,14,.1);border-radius:16px;overflow:hidden">
+      <div style="padding:20px 28px;background:linear-gradient(135deg,#e8eef7,#d0ddef)">
+        <span style="font-size:1.1rem;font-weight:600;color:#26508e">ConsultaJá24h</span>
+        <span style="font-size:.8rem;color:rgba(22,18,14,.5);margin-left:8px">Psicologia Online</span>
+      </div>
+      <div style="padding:28px">
+        <h2 style="margin:0 0 16px;font-size:1.1rem;color:#16120e;font-weight:600">✅ Agendamento confirmado!</h2>
+        <p style="color:#443e38;font-size:.9rem;margin-bottom:20px">Olá, <strong>${paciente_nome}</strong>. Seu pagamento foi confirmado e a sessão está agendada.</p>
+        <table style="width:100%;border-collapse:collapse;font-size:.875rem;margin-bottom:4px">
+          <tr style="border-bottom:1px solid rgba(22,18,14,.07)"><td style="padding:9px 0;color:#8c857d;width:42%">Psicólogo(a)</td><td style="padding:9px 0;font-weight:600;color:#16120e">${psicologo_nome}</td></tr>
+          <tr style="border-bottom:1px solid rgba(22,18,14,.07)"><td style="padding:9px 0;color:#8c857d">Tipo</td><td style="padding:9px 0;color:#16120e">${tipoLabel}</td></tr>
+          <tr style="border-bottom:1px solid rgba(22,18,14,.07)"><td style="padding:9px 0;color:#8c857d">📅 Data e hora</td><td style="padding:9px 0;font-weight:700;color:#26508e">${horarioFmt}</td></tr>
+          <tr><td style="padding:9px 0;color:#8c857d">💰 Valor pago</td><td style="padding:9px 0;font-weight:600;color:#16120e">${valorFmt}</td></tr>
+        </table>
+        ${formularioBloco}
+        <p style="margin-top:20px;font-size:.75rem;color:rgba(22,18,14,.35);line-height:1.55">Em caso de dúvidas, entre em contato pelo WhatsApp da plataforma. — ConsultaJá24h Psicologia</p>
+      </div>
+    </div>
+  </div>`;
+  try {
+    const r = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${RESEND_KEY}` },
+      body: JSON.stringify({
+        from: 'ConsultaJá24h <contato@consultaja24h.com.br>',
+        to: [paciente_email],
+        subject: `Sessão confirmada com ${psicologo_nome} — ${horarioFmt}`,
+        html
+      })
+    });
+    const d = await r.json();
+    if (d.id) console.log(`[PSI-EMAIL-CONFIRM] Enviado para ${paciente_email} | Agendamento #${id}`);
+    else console.error('[PSI-EMAIL-CONFIRM] Resend recusou:', JSON.stringify(d));
+  } catch (e) { console.error('[PSI-EMAIL-CONFIRM] Erro:', e.message); }
+}
+
+// ── PSICOLOGIA: e-mail de lembrete ao paciente ───────────────────────────────
+async function enviarEmailLembretePacientePsi({ paciente_nome, paciente_email, psicologo_nome, horario_agendado, tipo_consulta, formulario_url, id }) {
+  const RESEND_KEY = process.env.RESEND_API_KEY;
+  if (!RESEND_KEY || !paciente_email) return;
+  // formulario_url já vem do JOIN no job — mas garante fallback
+  formulario_url = formulario_url || null;
+  const horarioFmt = new Date(horario_agendado).toLocaleString('pt-BR', {
+    timeZone: 'America/Fortaleza', weekday: 'long', day: '2-digit',
+    month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit'
+  });
+  const tipoLabel = tipo_consulta === 'avaliacao' ? 'Avaliação Psicológica' : 'Psicoterapia';
+  const formularioBloco = formulario_url
+    ? `<div style="margin:20px 0">
+        <a href="${formulario_url}" style="display:inline-block;padding:11px 24px;border-radius:10px;background:#26508e;color:#fff;font-weight:600;font-size:.88rem;text-decoration:none">
+          Preencher formulário do psicólogo
+        </a>
+        <p style="margin-top:8px;font-size:.75rem;color:#443e38">Se ainda não preencheu, faça antes da sessão.</p>
+      </div>`
+    : '';
+  const html = `<div style="background:#f2f0ec;padding:32px 20px;font-family:sans-serif">
+    <div style="max-width:540px;margin:0 auto;background:#fff;border:1px solid rgba(22,18,14,.1);border-radius:16px;overflow:hidden">
+      <div style="padding:20px 28px;background:linear-gradient(135deg,#e8eef7,#d0ddef)">
+        <span style="font-size:1.1rem;font-weight:600;color:#26508e">ConsultaJá24h</span>
+        <span style="font-size:.8rem;color:rgba(22,18,14,.5);margin-left:8px">Psicologia Online</span>
+      </div>
+      <div style="padding:28px">
+        <h2 style="margin:0 0 12px;font-size:1.05rem;color:#16120e;font-weight:600">🔔 Lembrete: sua sessão começa em 1 hora</h2>
+        <p style="color:#443e38;font-size:.9rem;margin-bottom:20px">Olá, <strong>${paciente_nome}</strong>. Este é um lembrete da sua sessão de hoje.</p>
+        <table style="width:100%;border-collapse:collapse;font-size:.875rem">
+          <tr style="border-bottom:1px solid rgba(22,18,14,.07)"><td style="padding:9px 0;color:#8c857d;width:42%">Psicólogo(a)</td><td style="padding:9px 0;font-weight:600;color:#16120e">${psicologo_nome}</td></tr>
+          <tr style="border-bottom:1px solid rgba(22,18,14,.07)"><td style="padding:9px 0;color:#8c857d">Tipo</td><td style="padding:9px 0;color:#16120e">${tipoLabel}</td></tr>
+          <tr><td style="padding:9px 0;color:#8c857d">📅 Horário</td><td style="padding:9px 0;font-weight:700;color:#26508e">${horarioFmt}</td></tr>
+        </table>
+        ${formularioBloco}
+        <p style="margin-top:20px;font-size:.75rem;color:rgba(22,18,14,.35);line-height:1.55">Em caso de dúvidas, entre em contato pelo WhatsApp da plataforma. — ConsultaJá24h Psicologia</p>
+      </div>
+    </div>
+  </div>`;
+  try {
+    const r = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${RESEND_KEY}` },
+      body: JSON.stringify({
+        from: 'ConsultaJá24h <contato@consultaja24h.com.br>',
+        to: [paciente_email],
+        subject: `🔔 Lembrete: sessão com ${psicologo_nome} em 1 hora`,
+        html
+      })
+    });
+    const d = await r.json();
+    if (d.id) console.log(`[PSI-EMAIL-LEMBRETE] Enviado para ${paciente_email}`);
+    else console.error('[PSI-EMAIL-LEMBRETE] Resend recusou:', JSON.stringify(d));
+  } catch (e) { console.error('[PSI-EMAIL-LEMBRETE] Erro:', e.message); }
+}
+
+// ── JOB: lembrete de sessão de psicologia 1h antes ───────────────────────────
+setInterval(async () => {
+  try {
+    const lock = await pool.query('SELECT pg_try_advisory_lock(10004)');
+    if (!lock.rows[0].pg_try_advisory_lock) return;
+    const RESEND_KEY = process.env.RESEND_API_KEY;
+    if (!RESEND_KEY) return;
+    const { rows } = await pool.query(
+      `SELECT ap.id, ap.paciente_nome, ap.paciente_email, ap.psicologo_nome,
+              ap.horario_agendado, ap.tipo_consulta, ps.formulario_url
+         FROM agendamentos_psicologia ap
+         LEFT JOIN psicologos ps ON ps.id = ap.psicologo_id
+        WHERE ap.status = 'confirmado'
+          AND ap.horario_agendado BETWEEN NOW() + INTERVAL '55 minutes' AND NOW() + INTERVAL '65 minutes'
+          AND ap.lembrete_psi_enviado IS NOT DISTINCT FROM false`
+    );
+    for (const ag of rows) {
+      // Marca antes de enviar para evitar reprocessamento
+      await pool.query(`UPDATE agendamentos_psicologia SET lembrete_psi_enviado = true WHERE id = $1`, [ag.id]);
+      await enviarEmailLembretePacientePsi(ag).catch(e => console.error('[PSI-LEMBRETE-JOB] Erro email:', e.message));
+      console.log(`[PSI-LEMBRETE-JOB] Lembrete enviado | Agendamento #${ag.id} → ${ag.paciente_email}`);
+    }
+  } catch (e) { console.error('[PSI-LEMBRETE-JOB] Erro:', e.message); }
+}, 10 * 60 * 1000); // roda a cada 10 minutos
 
 // ── PSICOLOGIA: painel do psicólogo — lista de pacientes ─────────────────────
 app.get('/api/psicologo/agendamentos', authPsicologo, async (req, res) => {
