@@ -87,7 +87,7 @@ setInterval(async () => {
 // JOB: Expirar agendamentos de psicologia sem pagamento após 30 minutos
 setInterval(async () => {
   try {
-    const lock3 = await pool.query('SELECT pg_try_advisory_lock(10003)');
+    const lock3 = await pool.query('SELECT pg_try_advisory_lock(10006)');
     if (!lock3.rows[0].pg_try_advisory_lock) return;
     const result = await pool.query(
       `UPDATE agendamentos_psicologia
@@ -628,7 +628,7 @@ app.post("/api/pagbank/webhook", async (req, res) => {
                     ) THEN 'aguardando'
                     ELSE 'triagem'
                   END
-                ELSE 'aguardando'
+                ELSE status
               END
         WHERE pagbank_order_id = $1
           AND pagamento_status  = 'pendente'
@@ -658,7 +658,7 @@ app.post("/api/pagbank/webhook", async (req, res) => {
                       ) THEN 'aguardando'
                       ELSE 'triagem'
                     END
-                  ELSE 'aguardando'
+                  ELSE status
                 END
           WHERE pagbank_order_id IS NULL
             AND pagamento_status  = 'pendente'
@@ -678,22 +678,7 @@ app.post("/api/pagbank/webhook", async (req, res) => {
         return;
       }
 
-      // Fallback 2: agendamentos legados sem pagbank_order_id
-      await pool.query(
-        `WITH alvo AS (
-           SELECT id FROM agendamentos
-           WHERE payment_id IS NULL
-             AND status = 'pendente'
-             AND criado_em > NOW() - INTERVAL '2 hours'
-           ORDER BY criado_em DESC
-           LIMIT 1
-         )
-         UPDATE agendamentos a
-            SET status = 'confirmado', payment_id = $1
-           FROM alvo
-          WHERE a.id = alvo.id`,
-        [orderId]
-      ).catch(e => console.warn("[PAGBANK-WEBHOOK] Fallback agendamento:", e.message));
+      console.warn("[PAGBANK-WEBHOOK] Order " + orderId + " nao encontrada em nenhum atendimento — ignorando.");
       return;
     }
 
@@ -1066,11 +1051,15 @@ app.post("/api/atendimento/atualizar-triagem", async (req, res) => {
         await pool.query(`UPDATE fila_atendimentos SET horario_agendado=$1, agendamento_id=$2 WHERE id=$3`,[horarioAgendadoRaw, agendamentoId, atendimentoId]);
       }
       appendToSheet("Atendimentos",[agora,at.nome||"",at.tel||"",at.cpf||"","Aguardando","",triagem,at.tipo||"","",String(at.id)]).catch(e=>console.error("[Sheets]",e));
-      await enviarEmailMedicos({
-        nome: at.nome, tel: at.tel, tipo: at.tipo, triagem, linkRetorno,
-        atendimentoId: at.id, horarioAgendado, horarioAgendadoRaw,
-        subject: "Agendamento - " + (at.nome||"Paciente") + " (" + tipoLabel + ") - " + horarioAgendado
-      });
+      if (!isTriagemPlaceholder(triagem)) {
+        await enviarEmailMedicos({
+          nome: at.nome, tel: at.tel, tipo: at.tipo, triagem, linkRetorno,
+          atendimentoId: at.id, horarioAgendado, horarioAgendadoRaw,
+          subject: "Agendamento - " + (at.nome||"Paciente") + " (" + tipoLabel + ") - " + horarioAgendado
+        });
+      } else {
+        console.warn(`[TRIAGEM-AGEND] triagem placeholder detectada em agendamento #${at.id} — e-mail suprimido`);
+      }
       return res.json({ ok: true, atendimentoId: at.id });
     }
 
@@ -1304,9 +1293,16 @@ app.get("/api/atendimento/assumir-email", async (req, res) => {
       [medicoId, medicoNome, atendimentoId]
     );
     if (result.rowCount === 0) {
-      // Verifica quem assumiu
-      const ja = await pool.query(`SELECT medico_nome FROM fila_atendimentos WHERE id=$1`,[atendimentoId]);
-      const quem = ja.rows[0]?.medico_nome || "outro médico";
+      // Verifica o status atual para dar feedback correto
+      const ja = await pool.query(`SELECT status, medico_nome FROM fila_atendimentos WHERE id=$1`,[atendimentoId]);
+      const row = ja.rows[0];
+      if (!row) {
+        return res.send(`<html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#060d0b;color:#fff"><h2 style="color:#ff8080">❌ Atendimento não encontrado</h2><p>Este atendimento não existe ou foi removido.</p><a href="${PAINEL_URL}" style="color:#b4e05a">Ir para o painel</a></body></html>`);
+      }
+      if (row.status === 'triagem' || row.status === 'pagamento_pendente') {
+        return res.send(`<html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#060d0b;color:#fff"><h2 style="color:#ffbd2e">⏳ Paciente ainda em triagem</h2><p>O paciente ainda não concluiu a triagem.<br>Você receberá uma nova notificação quando estiver pronto para atendimento.</p><a href="${PAINEL_URL}" style="color:#b4e05a">Ir para o painel</a></body></html>`);
+      }
+      const quem = row.medico_nome || "outro médico";
       return res.send(`<html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#060d0b;color:#fff"><h2 style="color:#ffbd2e">⚠️ Atendimento já assumido</h2><p>Este atendimento já foi assumido por <strong>${quem}</strong>.</p><a href="${PAINEL_URL}" style="color:#b4e05a">Ir para o painel</a></body></html>`);
     }
     const paciente = result.rows[0];
@@ -3888,7 +3884,7 @@ app.post("/api/efi/cartao/cobrar", rlGeral, async (req, res) => {
                         ) THEN 'aguardando'
                         ELSE 'triagem'
                       END
-                    ELSE 'aguardando'
+                    ELSE status
                   END
             WHERE id = $1
               AND pagamento_status = 'pendente'
@@ -3996,7 +3992,7 @@ app.post("/api/efi/cartao/webhook", async (req, res) => {
                       ) THEN 'aguardando'
                       ELSE 'triagem'
                     END
-                  ELSE 'aguardando'
+                  ELSE status
                 END
           WHERE efi_charge_id = $1
             AND pagamento_status = 'pendente'
