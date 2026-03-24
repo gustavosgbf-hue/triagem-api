@@ -2389,6 +2389,60 @@ app.get('/api/psicologo/agendamentos', authPsicologo, async (req, res) => {
   } catch (e) { return res.status(500).json({ ok: false, error: e.message }); }
 });
 
+// ══════════════════════════════════════════════════════════════════════════════
+// PATCH: adicionar esta rota no server.js
+// ONDE: logo após a rota GET /api/psicologo/agendamentos (linha ~2390)
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── PSICOLOGIA: painel — saldo financeiro do psicólogo ────────────────────────
+// GET /api/psicologo/saldo
+// Retorna: total bruto recebido, repasse líquido (após comissão), e lista
+// dos agendamentos confirmados com valor_cobrado e valor_repasse
+app.get('/api/psicologo/saldo', authPsicologo, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT
+         id,
+         paciente_nome,
+         tipo_consulta,
+         horario_agendado,
+         pagamento_metodo,
+         valor_cobrado,
+         valor_repasse,
+         pagamento_status,
+         status_sessao,
+         pago_psicologo,
+         pagamento_confirmado_em
+       FROM agendamentos_psicologia
+       WHERE psicologo_id = $1
+         AND pagamento_status = 'confirmado'
+       ORDER BY horario_agendado DESC`,
+      [req.psicologoId]
+    );
+
+    const totalBruto   = rows.reduce((s, r) => s + parseFloat(r.valor_cobrado  || 0), 0);
+    const totalRepasse = rows.reduce((s, r) => s + parseFloat(r.valor_repasse  || 0), 0);
+    const totalPago    = rows.filter(r => r.pago_psicologo).reduce((s, r) => s + parseFloat(r.valor_repasse || 0), 0);
+    const totalPendente = totalRepasse - totalPago;
+
+    return res.json({
+      ok: true,
+      comissao_pct: PSI_COMISSAO_PCT,
+      resumo: {
+        total_sessoes:    rows.length,
+        total_bruto:      totalBruto.toFixed(2),
+        total_repasse:    totalRepasse.toFixed(2),
+        total_pago:       totalPago.toFixed(2),
+        total_pendente:   totalPendente.toFixed(2),
+      },
+      sessoes: rows
+    });
+  } catch (e) {
+    console.error('[PSI-SALDO] Erro:', e.message);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // ── PSICOLOGIA: painel — editar disponibilidade ───────────────────────────────
 app.patch('/api/psicologo/disponibilidade', authPsicologo, async (req, res) => {
   try {
