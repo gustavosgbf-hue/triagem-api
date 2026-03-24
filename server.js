@@ -3451,8 +3451,7 @@ app.get("/consentimentos", checkAdmin, async (req, res) => {
 app.get("/api/disponibilidade", async (req, res) => {
   try {
     const agora = new Date();
-    const HORA_INICIO=8, HORA_FIM=23;       // atendimento imediato: 14h-23h
-    const HORA_AGEND_INICIO=8, HORA_AGEND_FIM=23; // agendamento: dia todo 8h-23h
+    const HORA_INICIO=8, HORA_FIM=23;
     const hora = parseInt(new Intl.DateTimeFormat("en-US",{timeZone:"America/Fortaleza",hour:"2-digit",hour12:false}).formatToParts(agora).find(p=>p.type==="hour").value);
     const dentroDoHorario = hora>=HORA_INICIO && hora<HORA_FIM;
     const [medRes,filaRes] = await Promise.all([
@@ -3480,29 +3479,11 @@ app.get("/api/disponibilidade", async (req, res) => {
       horarioRetorno=diaRetorno.toLocaleString("pt-BR",{timeZone:"America/Fortaleza",hour:"2-digit",minute:"2-digit",day:"2-digit",month:"2-digit"});
       mensagem=`Atendimento disponivel das ${HORA_INICIO}h as ${HORA_FIM}h`;
     }
-    const horariosAgendamento=[];
-    // Agendamentos sempre disponíveis (dia todo), mesmo quando atendimento imediato está fechado
-    {
-      const diaBase = new Date(agoraFtz);
-      if (hora >= HORA_AGEND_FIM) diaBase.setUTCDate(diaBase.getUTCDate() + 1);
-      let count = 0;
-      for (let h = HORA_AGEND_INICIO; h < HORA_AGEND_FIM && count < 16; h++) {
-        for (const m of [0, 20, 40]) {
-          if (count >= 16) break;
-          const slot = new Date(Date.UTC(
-            diaBase.getUTCFullYear(), diaBase.getUTCMonth(), diaBase.getUTCDate(),
-            h + 3, m, 0, 0
-          ));
-          if (slot.getTime() < agora.getTime() + 10*60*1000) continue;
-          horariosAgendamento.push({
-            label: slot.toLocaleTimeString("pt-BR", {hour:"2-digit", minute:"2-digit", timeZone:"America/Fortaleza"}),
-            iso: slot.toISOString()
-          });
-          count++;
-        }
-      }
-    }
-    res.json({ok:true,disponivel,medicosOnline,pacientesAguardando,tempoEstimado,status,mensagem,horarioRetorno,horariosAgendamento,horaAtual:hora,horaInicio:HORA_INICIO,horaFim:HORA_FIM,horaAgendInicio:HORA_AGEND_INICIO,horaAgendFim:HORA_AGEND_FIM});
+    // Agendamento removido — fluxo 100% sob demanda imediata
+    const horariosAgendamento = [];
+    // Aviso de baixa demanda: período noturno 23h–7h
+    const avisoHorario = hora >= 23 || hora < 7;
+    res.json({ok:true,disponivel,medicosOnline,pacientesAguardando,tempoEstimado,status,mensagem,horarioRetorno,horariosAgendamento,avisoHorario,horaAtual:hora,horaInicio:HORA_INICIO,horaFim:HORA_FIM});
   } catch(e) {
     console.error("Erro em /api/disponibilidade:", e);
     res.json({ok:false,disponivel:true,medicosOnline:0,tempoEstimado:5,status:'verde',mensagem:'Verificando...',horariosAgendamento:[]});
