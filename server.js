@@ -84,6 +84,28 @@ setInterval(async () => {
   }
 }, 60 * 60 * 1000);
 
+// JOB: Expirar agendamentos de psicologia sem pagamento após 30 minutos
+setInterval(async () => {
+  try {
+    const lock3 = await pool.query('SELECT pg_try_advisory_lock(10003)');
+    if (!lock3.rows[0].pg_try_advisory_lock) return;
+    const result = await pool.query(
+      `UPDATE agendamentos_psicologia
+          SET status = 'cancelado'
+        WHERE status = 'pendente'
+          AND pagamento_status = 'pendente'
+          AND criado_em < NOW() - INTERVAL '30 minutes'
+        RETURNING id, paciente_nome`
+    );
+    if (result.rowCount > 0) {
+      console.log(`[PSI-EXPIRY] ${result.rowCount} agendamento(s) expirado(s) por falta de pagamento:`,
+        result.rows.map(r => `#${r.id} ${r.paciente_nome}`).join(', '));
+    }
+  } catch(e) {
+    console.error('[PSI-EXPIRY] Erro:', e.message);
+  }
+}, 5 * 60 * 1000); // roda a cada 5 minutos
+
 // JOB: Reenviar e-mail de agendamento 1h antes do horário marcado
 setInterval(async () => {
   try {
@@ -1447,6 +1469,74 @@ app.get('/api/paciente/agendamentos', authPaciente, async (req, res) => {
     );
     return res.json({ ok: true, agendamentos: rows });
   } catch(err) { return res.status(500).json({ ok: false, error: err.message }); }
+});
+
+// DELETE /api/paciente/agendamento/:id — cancela agendamento (paciente)
+app.delete('/api/paciente/agendamento/:id', authPaciente, async (req, res) => {
+  try {
+    const agId = parseInt(req.params.id, 10);
+    if (!agId) return res.status(400).json({ ok: false, error: 'ID inválido' });
+
+    // Busca e valida posse + regra de negócio
+    const { rows } = await pool.query(
+      `SELECT id, status, pagamento_status, horario_agendado
+         FROM agendamentos_psicologia
+        WHERE id = $1 AND paciente_id = $2 LIMIT 1`,
+      [agId, req.pacienteId]
+    );
+    if (rows.length === 0)
+      return res.status(404).json({ ok: false, error: 'Agendamento não encontrado' });
+
+    const ag = rows[0];
+    if (ag.status === 'cancelado')
+      return res.status(400).json({ ok: false, error: 'Agendamento já cancelado' });
+    if (ag.pagamento_status === 'confirmado')
+      return res.status(400).json({ ok: false, error: 'Sessão já paga não pode ser cancelada por aqui. Entre em contato com o suporte.' });
+
+    await pool.query(
+      `UPDATE agendamentos_psicologia SET status = 'cancelado' WHERE id = $1`,
+      [agId]
+    );
+    console.log(`[PSI-CANCEL] Agendamento #${agId} cancelado pelo paciente ${req.pacienteId}`);
+    return res.json({ ok: true });
+  } catch(e) {
+    console.error('[PSI-CANCEL-PAC] Erro:', e.message);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// DELETE /api/psicologo/agendamento/:id — cancela agendamento (psicólogo)
+app.delete('/api/psicologo/agendamento/:id', authPsicologo, async (req, res) => {
+  try {
+    const agId = parseInt(req.params.id, 10);
+    if (!agId) return res.status(400).json({ ok: false, error: 'ID inválido' });
+
+    // Busca e valida posse + regra de negócio
+    const { rows } = await pool.query(
+      `SELECT id, status, pagamento_status, horario_agendado, paciente_nome
+         FROM agendamentos_psicologia
+        WHERE id = $1 AND psicologo_id = $2 LIMIT 1`,
+      [agId, req.psicologoId]
+    );
+    if (rows.length === 0)
+      return res.status(404).json({ ok: false, error: 'Agendamento não encontrado' });
+
+    const ag = rows[0];
+    if (ag.status === 'cancelado')
+      return res.status(400).json({ ok: false, error: 'Agendamento já cancelado' });
+    if (ag.pagamento_status === 'confirmado')
+      return res.status(400).json({ ok: false, error: 'Sessão já paga não pode ser cancelada por aqui. Entre em contato com o suporte.' });
+
+    await pool.query(
+      `UPDATE agendamentos_psicologia SET status = 'cancelado' WHERE id = $1`,
+      [agId]
+    );
+    console.log(`[PSI-CANCEL] Agendamento #${agId} (${ag.paciente_nome}) cancelado pelo psicólogo ${req.psicologoId}`);
+    return res.json({ ok: true });
+  } catch(e) {
+    console.error('[PSI-CANCEL-PSI] Erro:', e.message);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
 });
 
 // ── FIM PACIENTES ─────────────────────────────────────────────────────────────
