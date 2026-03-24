@@ -4501,20 +4501,20 @@ async function carregarCadastros(){
           ?'<span style="background:#d1e7dd;color:#0f5132;padding:2px 8px;border-radius:12px;font-size:.78rem">Aprovado</span>'
           :'<span style="background:#f8d7da;color:#842029;padding:2px 8px;border-radius:12px;font-size:.78rem">Rejeitado</span>';
       const acoes=p.status==='pendente'
-        ?`<button onclick="aprovarPsi(${p.id})" style="background:#0f5132;color:#fff;border:none;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:.78rem;margin-right:4px">Aprovar</button>
-           <button onclick="rejeitarPsi(${p.id})" style="background:#842029;color:#fff;border:none;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:.78rem">Rejeitar</button>`
+        ?'<button onclick="aprovarPsi('+p.id+')" style="background:#0f5132;color:#fff;border:none;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:.78rem;margin-right:4px">Aprovar</button>'
+         +'<button onclick="rejeitarPsi('+p.id+')" style="background:#842029;color:#fff;border:none;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:.78rem">Rejeitar</button>'
         :p.status==='aprovado'
-          ?`<button onclick="toggleVisivel(${p.id},${!p.visivel})" style="background:${p.visivel?'#6c757d':'#26508e'};color:#fff;border:none;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:.78rem">${p.visivel?'Ocultar do site':'Mostrar no site'}</button>`
+          ?'<button onclick="toggleVisivel('+p.id+','+((!p.visivel)+'')+')" style="background:'+(p.visivel?'#6c757d':'#26508e')+';color:#fff;border:none;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:.78rem">'+(p.visivel?'Ocultar do site':'Mostrar no site')+'</button>'
           :'—';
-      return `<tr style="border-bottom:1px solid #eee">
-        <td style="padding:8px 10px">${p.id}</td>
-        <td style="padding:8px 10px">${esc(p.nome)}</td>
-        <td style="padding:8px 10px">${esc(p.email)}</td>
-        <td style="padding:8px 10px">${esc(p.crp||'—')}</td>
-        <td style="padding:8px 10px">${statusChip}</td>
-        <td style="padding:8px 10px">${p.visivel?'✅':'⬜'}</td>
-        <td style="padding:8px 10px">${acoes}</td>
-      </tr>`;
+      return '<tr style="border-bottom:1px solid #eee">'
+        +'<td style="padding:8px 10px">'+p.id+'</td>'
+        +'<td style="padding:8px 10px">'+esc(p.nome)+'</td>'
+        +'<td style="padding:8px 10px">'+esc(p.email)+'</td>'
+        +'<td style="padding:8px 10px">'+esc(p.crp||'—')+'</td>'
+        +'<td style="padding:8px 10px">'+statusChip+'</td>'
+        +'<td style="padding:8px 10px">'+(p.visivel?'✅':'⬜')+'</td>'
+        +'<td style="padding:8px 10px">'+acoes+'</td>'
+        +'</tr>';
     }).join('');
   }catch(e){tbody.innerHTML='<tr><td colspan="7" style="padding:16px;text-align:center;color:red">Erro ao carregar.</td></tr>';}
 }
