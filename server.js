@@ -4510,7 +4510,7 @@ async function carregarCadastros(){
         :p.status==='aprovado'
           ?'<span style="background:#d1e7dd;color:#0f5132;padding:2px 8px;border-radius:12px;font-size:.78rem">Aprovado</span>'
           :'<span style="background:#f8d7da;color:#842029;padding:2px 8px;border-radius:12px;font-size:.78rem">Rejeitado</span>';
-      const acoes=p.status==='pendente'
+      const acoesAdmin=p.status==='pendente'
         ?'<button onclick="aprovarPsi('+p.id+')" style="background:#0f5132;color:#fff;border:none;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:.78rem;margin-right:4px">Aprovar</button>'
          +'<button onclick="rejeitarPsi('+p.id+')" style="background:#842029;color:#fff;border:none;border-radius:6px;padding:4px 10px;cursor:pointer;font-size:.78rem">Rejeitar</button>'
         :p.status==='aprovado'
@@ -4523,7 +4523,7 @@ async function carregarCadastros(){
         +'<td style="padding:8px 10px">'+esc(p.crp||'—')+'</td>'
         +'<td style="padding:8px 10px">'+statusChip+'</td>'
         +'<td style="padding:8px 10px">'+(p.visivel?'✅':'⬜')+'</td>'
-        +'<td style="padding:8px 10px">'+acoes+'</td>'
+        +'<td style="padding:8px 10px">'+acoesAdmin+'</td>'
         +'</tr>';
     }).join('');
   }catch(e){tbody.innerHTML='<tr><td colspan="7" style="padding:16px;text-align:center;color:red">Erro ao carregar.</td></tr>';}
