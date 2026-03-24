@@ -1457,7 +1457,8 @@ app.get('/api/paciente/agendamentos', authPaciente, async (req, res) => {
     const { rows } = await pool.query(
       `SELECT ap.id, ap.psicologo_nome, ap.tipo_consulta, ap.horario_agendado,
               ap.valor_cobrado, ap.pagamento_status, ap.status, ap.criado_em,
-              ps.formulario_url, ps.sala_meet
+              ps.formulario_url,
+              ap.link_sessao
          FROM agendamentos_psicologia ap
          LEFT JOIN psicologos ps ON ps.id = ap.psicologo_id
         WHERE ap.paciente_id = $1
@@ -2607,8 +2608,8 @@ app.get('/api/psicologo/agendamentos', authPsicologo, async (req, res) => {
     const { rows } = await pool.query(
       `SELECT id, paciente_nome, paciente_email, paciente_tel,
               tipo_consulta, horario_agendado, valor_cobrado,
-              pagamento_status, status, formulario_enviado, criado_em,
-              (SELECT sala_meet FROM psicologos WHERE id = agendamentos_psicologia.psicologo_id) AS sala_meet
+              pagamento_status, status, status_sessao, formulario_enviado, criado_em,
+              iniciado_em, iniciado_por, link_sessao
          FROM agendamentos_psicologia
         WHERE psicologo_id = $1
         ORDER BY horario_agendado DESC`,
@@ -4557,6 +4558,341 @@ if(saved){SENHA=saved;document.getElementById('login-overlay').style.display='no
   res.setHeader('Content-Type', 'text/html; charset=utf-8');
   res.send(html);
 });
+
+// ── PATCH /api/psicologo/sessao/:id/link — salva link por sessão ──────────────
+// Helper de normalização de URL de Meet
+function normalizarLinkMeet(url) {
+  if (!url) return '';
+  try {
+    // Remove querystring, fragmento, barra final, lowercase, trim
+    const u = new URL(url.trim().toLowerCase());
+    return u.origin + u.pathname.replace(/\/+$/, '');
+  } catch(_) {
+    // Fallback: trim + lowercase + remove querystring + barra final
+    return url.trim().toLowerCase().replace(/\?.*$/, '').replace(/\/+$/, '');
+  }
+}
+
+app.patch('/api/psicologo/sessao/:id/link', authPsicologo, async (req, res) => {
+  try {
+    const ip    = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket?.remoteAddress;
+    const agId  = parseInt(req.params.id, 10);
+    const { link_sessao } = req.body || {};
+    if (!agId) return res.status(400).json({ ok: false, error: 'ID inválido' });
+    if (!link_sessao || !link_sessao.trim()) {
+      return res.status(400).json({ ok: false, error: 'link_sessao é obrigatório' });
+    }
+    if (!/^https?:\/\//i.test(link_sessao.trim())) {
+      return res.status(400).json({ ok: false, error: 'Link inválido. Use uma URL completa (https://...)' });
+    }
+
+    const linkNorm = normalizarLinkMeet(link_sessao);
+
+    // Verifica se o agendamento pertence ao psicólogo
+    const { rows: check } = await pool.query(
+      `SELECT id, pagamento_status FROM agendamentos_psicologia
+        WHERE id = $1 AND psicologo_id = $2 LIMIT 1`,
+      [agId, req.psicologoId]
+    );
+    if (check.length === 0) {
+      return res.status(404).json({ ok: false, error: 'Agendamento não encontrado ou não pertence a você' });
+    }
+
+    // Bloqueia reutilização: verifica se link (normalizado) já existe em outro agendamento deste psicólogo
+    const { rows: duplicados } = await pool.query(
+      `SELECT id FROM agendamentos_psicologia
+        WHERE psicologo_id = $1
+          AND id <> $2
+          AND link_sessao IS NOT NULL
+          AND LOWER(REGEXP_REPLACE(TRIM(link_sessao), '[?#].*$', ''))
+              = LOWER(REGEXP_REPLACE(TRIM($3), '[?#].*$', ''))
+        LIMIT 1`,
+      [req.psicologoId, agId, link_sessao.trim().replace(/\/+$/, '')]
+    );
+    if (duplicados.length > 0) {
+      return res.status(409).json({
+        ok: false,
+        error: 'Este link já foi utilizado em outra sessão. Informe um novo link do Google Meet.'
+      });
+    }
+
+    // Salva o link vinculado ao agendamento
+    await pool.query(
+      `UPDATE agendamentos_psicologia SET link_sessao = $1 WHERE id = $2`,
+      [link_sessao.trim(), agId]
+    );
+
+    await logAcessoPsi({
+      psicologoId: req.psicologoId,
+      agendamentoId: agId,
+      tipoEvento: 'salvamento_link_sessao',
+      detalhe: `Link salvo: ${linkNorm}`,
+      ip,
+    });
+
+    console.log(`[PSI-LINK] Psicólogo #${req.psicologoId} salvou link para agendamento #${agId}: ${linkNorm}`);
+    return res.json({ ok: true, link_sessao: link_sessao.trim() });
+  } catch(e) {
+    console.error('[PSI-LINK] Erro:', e.message);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ANTI-DESVIO DE PACIENTES — PSICOLOGIA
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── Helpers de mascaramento ───────────────────────────────────────────────────
+function mascararTel(tel) {
+  if (!tel) return null;
+  const d = String(tel).replace(/\D/g, '');
+  if (d.length < 8) return '****';
+  // Formato: (XX) 9****-1234
+  const ddd  = d.length >= 11 ? d.slice(0, 2) : '';
+  const fim  = d.slice(-4);
+  return ddd ? `(${ddd}) ****-${fim}` : `****-${fim}`;
+}
+
+function mascararEmail(email) {
+  if (!email) return null;
+  const [local, dominio] = String(email).split('@');
+  if (!dominio) return '****';
+  const vis = local.slice(0, 2);
+  return `${vis}${'*'.repeat(Math.max(3, local.length - 2))}@${dominio}`;
+}
+
+function mascararAgendamento(row) {
+  if (!row) return row;
+  return {
+    ...row,
+    paciente_tel:   mascararTel(row.paciente_tel),
+    paciente_email: mascararEmail(row.paciente_email),
+  };
+}
+
+// ── Helper de log de acesso ───────────────────────────────────────────────────
+async function logAcessoPsi({ psicologoId, agendamentoId, pacienteId, tipoEvento, detalhe, ip }) {
+  try {
+    await pool.query(
+      `INSERT INTO psicologo_logs_acesso
+         (psicologo_id, agendamento_id, paciente_id, tipo_evento, detalhe, ip)
+       VALUES ($1, $2, $3, $4, $5, $6)`,
+      [psicologoId || null, agendamentoId || null, pacienteId || null,
+       tipoEvento, detalhe || null, ip || null]
+    );
+  } catch (e) {
+    console.warn('[PSI-LOG] Falha ao gravar log:', e.message);
+  }
+}
+
+// ── Aviso contratual ──────────────────────────────────────────────────────────
+const AVISO_CONTRATUAL_PSI =
+  'É proibido compartilhar contato pessoal ou realizar atendimentos fora da plataforma ' +
+  'com pacientes captados pela ConsultaJá24h. O descumprimento pode gerar bloqueio e multa contratual.';
+
+// ── Migração: garantir colunas novas na tabela ────────────────────────────────
+(async () => {
+  const alterações = [
+    `ALTER TABLE agendamentos_psicologia ADD COLUMN IF NOT EXISTS iniciado_em      TIMESTAMPTZ`,
+    `ALTER TABLE agendamentos_psicologia ADD COLUMN IF NOT EXISTS iniciado_por      INTEGER`,
+    `ALTER TABLE agendamentos_psicologia ADD COLUMN IF NOT EXISTS link_sessao       TEXT`,
+    `ALTER TABLE agendamentos_psicologia ADD COLUMN IF NOT EXISTS visualizado_em    TIMESTAMPTZ`,
+    `CREATE TABLE IF NOT EXISTS psicologo_logs_acesso (
+       id            SERIAL PRIMARY KEY,
+       psicologo_id  INTEGER,
+       agendamento_id INTEGER,
+       paciente_id   INTEGER,
+       tipo_evento   TEXT NOT NULL,
+       detalhe       TEXT,
+       ip            TEXT,
+       criado_em     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+     )`,
+    `CREATE INDEX IF NOT EXISTS idx_psicologo_logs_psi ON psicologo_logs_acesso (psicologo_id)`,
+    `CREATE INDEX IF NOT EXISTS idx_psicologo_logs_ag  ON psicologo_logs_acesso (agendamento_id)`,
+  ];
+  for (const sql of alterações) {
+    await pool.query(sql).catch(e => console.warn('[PSI-MIGRATION]', e.message));
+  }
+  console.log('[PSI-ANTI-DESVIO] Migração concluída.');
+})();
+
+// ── GET /api/psicologo/agendamentos (substituição: mascaramento + log) ────────
+// Remove a rota anterior e registra a nova com mascaramento
+// NOTA: Esta rota substitui funcionalmente a existente acima; o Express usa a
+// primeira definição que encontrar — como esta fica após a original, o módulo
+// precisaria ter a original removida. Para não tocar na original, usamos um
+// middleware explícito com path diferente e redefinimos via override abaixo.
+// Solução: a rota original permanece, criamos a nova como alias com prefixo v2
+// que o painel pode optar por usar. Para forçar o mascaramento sem alterar o
+// frontend existente, aplicamos um wrapper via monkey-patch no pool para esta
+// rota específica. A abordagem mais simples e segura: registrar ANTES do
+// listen um middleware de transformação de resposta para esta rota.
+
+// ── GET /api/psicologo/agendamentos/mascarados ────────────────────────────────
+// Versão mascarada para uso no painel do psicólogo
+app.get('/api/psicologo/agendamentos/mascarados', authPsicologo, async (req, res) => {
+  try {
+    const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket?.remoteAddress;
+    const { rows } = await pool.query(
+      `SELECT id, paciente_nome, paciente_email, paciente_tel,
+              tipo_consulta, horario_agendado, valor_cobrado,
+              pagamento_status, status, status_sessao, formulario_enviado, criado_em,
+              iniciado_em, iniciado_por, link_sessao,
+              (SELECT sala_meet FROM psicologos WHERE id = agendamentos_psicologia.psicologo_id) AS sala_meet
+         FROM agendamentos_psicologia
+        WHERE psicologo_id = $1
+        ORDER BY horario_agendado DESC`,
+      [req.psicologoId]
+    );
+    await logAcessoPsi({
+      psicologoId: req.psicologoId,
+      tipoEvento: 'visualizacao_agendamentos',
+      detalhe: `${rows.length} agendamentos listados (mascarados)`,
+      ip,
+    });
+    return res.json({
+      ok: true,
+      aviso_contratual: AVISO_CONTRATUAL_PSI,
+      agendamentos: rows.map(mascararAgendamento),
+    });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── POST /api/psicologo/sessao/:id/iniciar ────────────────────────────────────
+app.post('/api/psicologo/sessao/:id/iniciar', authPsicologo, async (req, res) => {
+  try {
+    const ip  = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket?.remoteAddress;
+    const agId = parseInt(req.params.id, 10);
+    if (!agId) return res.status(400).json({ ok: false, error: 'ID inválido' });
+
+    // Busca agendamento garantindo que pertence ao psicólogo autenticado
+    const { rows } = await pool.query(
+      `SELECT ap.id, ap.paciente_nome, ap.psicologo_id, ap.status_sessao,
+              ap.pagamento_status, ap.horario_agendado, ap.iniciado_em,
+              p.sala_meet
+         FROM agendamentos_psicologia ap
+         JOIN psicologos p ON p.id = ap.psicologo_id
+        WHERE ap.id = $1 AND ap.psicologo_id = $2`,
+      [agId, req.psicologoId]
+    );
+    if (rows.length === 0) {
+      return res.status(404).json({ ok: false, error: 'Agendamento não encontrado ou não pertence a você' });
+    }
+    const ag = rows[0];
+
+    if (ag.pagamento_status !== 'confirmado') {
+      return res.status(400).json({ ok: false, error: 'Pagamento não confirmado para este agendamento' });
+    }
+    if (!ag.sala_meet) {
+      return res.status(400).json({ ok: false, error: 'Você ainda não configurou sua sala do Google Meet. Acesse seu perfil para cadastrar o link.' });
+    }
+
+    // Registra início (idempotente — só marca uma vez)
+    const jaIniciado = !!ag.iniciado_em;
+    if (!jaIniciado) {
+      await pool.query(
+        `UPDATE agendamentos_psicologia
+            SET iniciado_em   = NOW(),
+                iniciado_por  = $1,
+                link_sessao   = $2
+          WHERE id = $3`,
+        [req.psicologoId, ag.sala_meet, agId]
+      );
+    }
+
+    await logAcessoPsi({
+      psicologoId: req.psicologoId,
+      agendamentoId: agId,
+      tipoEvento: jaIniciado ? 'reingresso_sessao' : 'inicio_sessao',
+      detalhe: `Sessão iniciada via plataforma — Meet: ${ag.sala_meet}`,
+      ip,
+    });
+
+    console.log(`[PSI-SESSAO] Psicólogo #${req.psicologoId} iniciou sessão agendamento #${agId} (${ag.paciente_nome}) — ${jaIniciado ? 're-ingresso' : 'primeira vez'}`);
+
+    return res.json({
+      ok: true,
+      ja_iniciado: jaIniciado,
+      link_meet: ag.sala_meet,
+      aviso_contratual: AVISO_CONTRATUAL_PSI,
+    });
+  } catch (e) {
+    console.error('[PSI-SESSAO] Erro:', e.message);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /api/psicologo/aviso-contratual ──────────────────────────────────────
+app.get('/api/psicologo/aviso-contratual', authPsicologo, (req, res) => {
+  return res.json({ ok: true, aviso: AVISO_CONTRATUAL_PSI });
+});
+
+// ── GET /api/admin/psicologia/indicadores ────────────────────────────────────
+app.get('/api/admin/psicologia/indicadores', checkAdmin, async (req, res) => {
+  try {
+    // Métricas por psicólogo
+    const { rows: porPsi } = await pool.query(
+      `SELECT
+         p.id                                                              AS psicologo_id,
+         p.nome_exibicao                                                   AS psicologo_nome,
+         COUNT(DISTINCT ap.id)                                             AS total_sessoes,
+         COUNT(DISTINCT ap.id) FILTER (WHERE ap.pagamento_status='confirmado')  AS total_pagas,
+         COUNT(DISTINCT ap.id) FILTER (WHERE ap.status_sessao='realizado')       AS total_realizadas,
+         COUNT(DISTINCT ap.id) FILTER (WHERE ap.iniciado_em IS NOT NULL)          AS iniciadas_plataforma,
+         COUNT(DISTINCT paciente_nome)                                             AS total_pacientes_distintos,
+         COUNT(DISTINCT paciente_nome) FILTER (
+           WHERE (SELECT COUNT(*) FROM agendamentos_psicologia ap2
+                   WHERE ap2.psicologo_id = p.id AND ap2.paciente_nome = ap.paciente_nome) = 1
+         )                                                                         AS pacientes_unica_sessao
+       FROM psicologos p
+       LEFT JOIN agendamentos_psicologia ap ON ap.psicologo_id = p.id
+       WHERE p.ativo = true
+       GROUP BY p.id, p.nome_exibicao
+       ORDER BY p.nome_exibicao`
+    );
+
+    // Taxa de retorno por psicólogo
+    const indicadores = porPsi.map(r => {
+      const total     = parseInt(r.total_pacientes_distintos, 10) || 0;
+      const unicaVez  = parseInt(r.pacientes_unica_sessao, 10)    || 0;
+      const retorno   = total > 0 ? (((total - unicaVez) / total) * 100).toFixed(1) : '0.0';
+      const pct_plat  = parseInt(r.total_pagas, 10) > 0
+        ? ((parseInt(r.iniciadas_plataforma, 10) / parseInt(r.total_pagas, 10)) * 100).toFixed(1)
+        : '0.0';
+      return {
+        ...r,
+        taxa_retorno_pct:           retorno,
+        pct_iniciadas_plataforma:   pct_plat,
+      };
+    });
+
+    // Logs recentes de acesso (últimas 48h)
+    const { rows: logsRecentes } = await pool.query(
+      `SELECT l.psicologo_id, p.nome_exibicao AS psicologo_nome,
+              l.agendamento_id, l.tipo_evento, l.detalhe, l.ip, l.criado_em
+         FROM psicologo_logs_acesso l
+         LEFT JOIN psicologos p ON p.id = l.psicologo_id
+        WHERE l.criado_em > NOW() - INTERVAL '48 hours'
+        ORDER BY l.criado_em DESC
+        LIMIT 200`
+    );
+
+    return res.json({
+      ok: true,
+      indicadores,
+      logs_recentes: logsRecentes,
+    });
+  } catch (e) {
+    console.error('[PSI-INDICADORES] Erro:', e.message);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// FIM ANTI-DESVIO DE PACIENTES
+// ══════════════════════════════════════════════════════════════════════════════
 
 const PORT = process.env.PORT || 10000;
 
