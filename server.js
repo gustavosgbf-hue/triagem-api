@@ -1330,7 +1330,7 @@ app.post("/api/medico/cadastro", async (req, res) => {
   try {
     const { nome, nome_exibicao, email, senha, crm, uf, telefone, especialidade,
             cnpj, tem_assinatura_digital, provedor_assinatura, tem_memed, memed_email } = req.body || {};
-    if (!nome||!email||!senha||!crm||!uf||!telefone) return res.status(400).json({ ok: false, error: "Todos os campos obrigatorios devem ser preenchidos" });
+    if (!nome||!email||!senha||!crm||!uf) return res.status(400).json({ ok: false, error: "Todos os campos obrigatorios devem ser preenchidos" });
     if (senha.length<6) return res.status(400).json({ ok: false, error: "Senha deve ter ao menos 6 caracteres" });
     const senha_hash = await bcrypt.hash(senha, 10);
     const result = await pool.query(
