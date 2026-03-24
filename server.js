@@ -288,6 +288,7 @@ async function initDB() {
     await pool.query(`ALTER TABLE psicologos ADD COLUMN IF NOT EXISTS formulario_url TEXT`).catch(()=>{});
     await pool.query(`ALTER TABLE psicologos ADD COLUMN IF NOT EXISTS valor_atualizado_em TIMESTAMP`).catch(()=>{});
     await pool.query(`ALTER TABLE psicologos ADD COLUMN IF NOT EXISTS visivel BOOLEAN NOT NULL DEFAULT true`).catch(()=>{});
+    await pool.query(`ALTER TABLE psicologos ADD COLUMN IF NOT EXISTS sala_meet TEXT`).catch(()=>{});
 
     // Tabela de agendamentos de psicologia — fluxo separado dos médicos
     await pool.query(`CREATE TABLE IF NOT EXISTS agendamentos_psicologia (
@@ -1460,7 +1461,7 @@ app.get('/api/paciente/agendamentos', authPaciente, async (req, res) => {
     const { rows } = await pool.query(
       `SELECT ap.id, ap.psicologo_nome, ap.tipo_consulta, ap.horario_agendado,
               ap.valor_cobrado, ap.pagamento_status, ap.status, ap.criado_em,
-              ps.formulario_url
+              ps.formulario_url, ps.sala_meet
          FROM agendamentos_psicologia ap
          LEFT JOIN psicologos ps ON ps.id = ap.psicologo_id
         WHERE ap.paciente_id = $1
@@ -1786,7 +1787,7 @@ app.get('/api/psicologo/me', authPsicologo, async (req, res) => {
       `SELECT id, nome, nome_exibicao, email, crp, uf, telefone,
               abordagem, focos, valor_sessao, atende_online,
               tem_avaliacao, valor_avaliacao, apresentacao, disponibilidade,
-              status, ativo, visivel
+              status, ativo, visivel, sala_meet
          FROM psicologos WHERE id=$1 LIMIT 1`,
       [req.psicologoId]
     );
@@ -1794,6 +1795,20 @@ app.get('/api/psicologo/me', authPsicologo, async (req, res) => {
     const psi = result.rows[0];
     psi.nome_exibicao = psi.nome_exibicao || psi.nome;
     return res.json({ ok: true, psicologo: psi });
+  } catch (err) { return res.status(500).json({ ok: false, error: err.message }); }
+});
+
+
+// PATCH /api/psicologo/sala-meet — salva link da sala permanente do Google Meet
+app.patch('/api/psicologo/sala-meet', authPsicologo, async (req, res) => {
+  try {
+    const { sala_meet } = req.body || {};
+    if (typeof sala_meet !== 'string') return res.status(400).json({ ok: false, error: 'sala_meet deve ser string' });
+    const link = sala_meet.trim();
+    if (link && !/^https?:\/\//.test(link)) return res.status(400).json({ ok: false, error: 'Link inválido. Use uma URL completa.' });
+    await pool.query('UPDATE psicologos SET sala_meet=$1 WHERE id=$2', [link || null, req.psicologoId]);
+    console.log(`[PSI-MEET] Psicólogo #${req.psicologoId} atualizou sala_meet=${link||'(removido)'}`);
+    return res.json({ ok: true, sala_meet: link || null });
   } catch (err) { return res.status(500).json({ ok: false, error: err.message }); }
 });
 
@@ -2573,7 +2588,8 @@ app.get('/api/psicologo/agendamentos', authPsicologo, async (req, res) => {
     const { rows } = await pool.query(
       `SELECT id, paciente_nome, paciente_email, paciente_tel,
               tipo_consulta, horario_agendado, valor_cobrado,
-              pagamento_status, status, formulario_enviado, criado_em
+              pagamento_status, status, formulario_enviado, criado_em,
+              (SELECT sala_meet FROM psicologos WHERE id = agendamentos_psicologia.psicologo_id) AS sala_meet
          FROM agendamentos_psicologia
         WHERE psicologo_id = $1
         ORDER BY horario_agendado DESC`,
