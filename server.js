@@ -1865,7 +1865,7 @@ app.get('/api/admin/psicologos/pendentes', checkAdmin, async (req, res) => {
 app.get('/api/admin/psicologos', checkAdmin, async (req, res) => {
   try {
     const result = await pool.query(
-      SELECT id,
+      `SELECT id,
        COALESCE(nome_exibicao, nome) AS nome,
        email,
        crp,
@@ -1876,7 +1876,7 @@ app.get('/api/admin/psicologos', checkAdmin, async (req, res) => {
        visivel,
        created_at
 FROM psicologos
-ORDER BY id DESC
+ORDER BY id DESC`
     );
     return res.json({ ok: true, psicologos: result.rows });
   } catch (err) { return res.status(500).json({ ok: false, error: err.message }); }
