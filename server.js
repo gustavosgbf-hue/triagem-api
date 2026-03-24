@@ -1836,6 +1836,19 @@ app.patch('/api/admin/psicologo/:id/rejeitar', checkAdmin, async (req, res) => {
   } catch (err) { return res.status(500).json({ ok: false, error: err.message }); }
 });
 
+app.patch('/api/admin/psicologo/:id/visivel', checkAdmin, async (req, res) => {
+  try {
+    const { visivel } = req.body || {};
+    if (typeof visivel !== 'boolean') return res.status(400).json({ ok: false, error: 'Campo visivel deve ser boolean' });
+    const result = await pool.query(
+      'UPDATE psicologos SET visivel=$1 WHERE id=$2 RETURNING id, nome, visivel',
+      [visivel, req.params.id]
+    );
+    if (result.rowCount === 0) return res.status(404).json({ ok: false, error: 'Psicologo nao encontrado' });
+    return res.json({ ok: true, psicologo: result.rows[0] });
+  } catch (err) { return res.status(500).json({ ok: false, error: err.message }); }
+});
+
 app.get('/api/admin/psicologos/pendentes', checkAdmin, async (req, res) => {
   try {
     const result = await pool.query(
@@ -4304,6 +4317,7 @@ td{padding:10px 14px;vertical-align:middle;white-space:nowrap}
   <div class="tabs">
     <button class="tab active" onclick="mudarAba('sessoes',this)">Sessões</button>
     <button class="tab" onclick="mudarAba('resumo',this)">Resumo por Psicólogo</button>
+    <button class="tab" onclick="mudarAba('cadastros',this)">Cadastros</button>
   </div>
   <div id="aba-sessoes">
     <div class="filters">
@@ -4323,6 +4337,9 @@ td{padding:10px 14px;vertical-align:middle;white-space:nowrap}
       <button class="btn btn-ghost" onclick="limparFiltros()">Limpar</button>
     </div>
     <div class="table-wrap" id="tabela-wrap"><div class="loading">Carregando</div></div>
+  </div>
+  <div id="aba-cadastros" style="display:none">
+    <div id="cadastros-wrap"><div class="loading">Carregando…</div></div>
   </div>
   <div id="aba-resumo" style="display:none">
     <div id="resumo-wrap" class="resumo-grid"><div class="loading">Carregando</div></div>
@@ -4453,7 +4470,66 @@ function mudarAba(aba,el){
   document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));el.classList.add('active');
   document.getElementById('aba-sessoes').style.display=aba==='sessoes'?'block':'none';
   document.getElementById('aba-resumo').style.display=aba==='resumo'?'block':'none';
+  document.getElementById('aba-cadastros').style.display=aba==='cadastros'?'block':'none';
   if(aba==='resumo')buscarResumo();
+  if(aba==='cadastros')carregarCadastros();
+}
+async function carregarCadastros(){
+  const wrap=document.getElementById('cadastros-wrap');
+  wrap.innerHTML='<div class="loading">Carregando…</div>';
+  try{
+    const r=await fetch(API+'/api/admin/psicologos',{headers:hdr()});
+    const d=await r.json();
+    if(!d.ok)throw new Error(d.error||'Erro');
+    renderCadastros(d.psicologos||[]);
+  }catch(e){wrap.innerHTML='<div class="empty">Erro: '+e.message+'</div>';}
+}
+function renderCadastros(list){
+  const wrap=document.getElementById('cadastros-wrap');
+  if(!list.length){wrap.innerHTML='<div class="empty">Nenhum psicólogo cadastrado.</div>';return;}
+  let html='<table><thead><tr><th>#</th><th>Nome</th><th>E-mail</th><th>CRP</th><th>Status</th><th>Ativo</th><th>Visível no site</th><th>Ações</th></tr></thead><tbody>';
+  list.forEach(p=>{
+    const statusChip=p.status==='aprovado'?'<span class="chip chip-realizado">Aprovado</span>':p.status==='pendente'?'<span class="chip chip-agendado">Pendente</span>':'<span class="chip chip-cancelado">Rejeitado</span>';
+    const ativoTxt=p.ativo?'<span style="color:var(--green)">Sim</span>':'<span style="color:var(--text3)">Não</span>';
+    let acoes='';
+    if(p.status==='pendente'){
+      acoes=`<button class="btn-sm btn-realizar" onclick="aprovarPsi(${p.id},this)">✓ Aprovar</button> <button class="btn-sm btn-faltou" onclick="rejeitarPsi(${p.id},this)">✗ Rejeitar</button>`;
+    }
+    const visivel=p.visivel!==false;
+    const toggleLabel=visivel?'Ocultar':'Mostrar';
+    const toggleCls=visivel?'btn-sm btn-pagar':'btn-sm btn-realizar';
+    const visChip=visivel?'<span class="chip chip-pago-sim">Visível</span>':'<span class="chip chip-pago-nao">Oculto</span>';
+    const toggleBtn=p.status==='aprovado'?`<button class="${toggleCls}" onclick="toggleVisivel(${p.id},${!visivel},this)">${toggleLabel}</button>`:'—';
+    html+=`<tr id="psi-row-${p.id}"><td style="color:var(--text3);font-family:monospace">#${p.id}</td><td class="td-wrap">${esc(p.nome)}</td><td class="td-wrap" style="font-size:.75rem">${esc(p.email)}</td><td style="font-family:monospace;font-size:.75rem">${esc(p.crp||'')} ${esc(p.uf||'')}</td><td>${statusChip}</td><td>${ativoTxt}</td><td>${visChip} ${toggleBtn}</td><td>${acoes||'<span style="color:var(--text3);font-size:.7rem">—</span>'}</td></tr>`;
+  });
+  html+='</tbody></table>';
+  wrap.innerHTML=html;
+}
+async function aprovarPsi(id,btn){
+  if(!confirm('Aprovar este psicólogo?'))return;
+  btn.disabled=true;btn.textContent='…';
+  try{
+    const r=await fetch(API+'/api/admin/psicologo/'+id+'/aprovar',{method:'PATCH',headers:hdr()});
+    const d=await r.json();if(!d.ok)throw new Error(d.error);
+    toast('Psicólogo aprovado. E-mail enviado.','ok');carregarCadastros();
+  }catch(e){toast('Erro: '+e.message,'err');btn.disabled=false;btn.textContent='✓ Aprovar';}
+}
+async function rejeitarPsi(id,btn){
+  if(!confirm('Rejeitar este cadastro?'))return;
+  btn.disabled=true;btn.textContent='…';
+  try{
+    const r=await fetch(API+'/api/admin/psicologo/'+id+'/rejeitar',{method:'PATCH',headers:hdr()});
+    const d=await r.json();if(!d.ok)throw new Error(d.error);
+    toast('Cadastro rejeitado.','ok');carregarCadastros();
+  }catch(e){toast('Erro: '+e.message,'err');btn.disabled=false;btn.textContent='✗ Rejeitar';}
+}
+async function toggleVisivel(id,novoValor,btn){
+  btn.disabled=true;
+  try{
+    const r=await fetch(API+'/api/admin/psicologo/'+id+'/visivel',{method:'PATCH',headers:hdr(),body:JSON.stringify({visivel:novoValor})});
+    const d=await r.json();if(!d.ok)throw new Error(d.error);
+    toast(novoValor?'Perfil visível no site.':'Perfil ocultado do site.','ok');carregarCadastros();
+  }catch(e){toast('Erro: '+e.message,'err');btn.disabled=false;}
 }
 function chipStatus(s){const m={agendado:['chip-agendado','Agendado'],pago:['chip-pago','Pago'],realizado:['chip-realizado','Realizado'],cancelado:['chip-cancelado','Cancelado'],faltou:['chip-faltou','Faltou']};const[cls,label]=m[s]||['chip-agendado',s];return '<span class="chip '+cls+'">'+label+'</span>';}
 function fmtR(v){return 'R$ '+parseFloat(v||0).toFixed(2).replace('.',',');}
