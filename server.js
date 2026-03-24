@@ -2790,7 +2790,7 @@ app.get('/api/psicologo/:id', rlGeral, async (req, res) => {
               valor_sessao, tem_avaliacao, valor_avaliacao,
               apresentacao, disponibilidade, foto_url, formulario_url,
               atende_online
-         FROM psicologos WHERE id = $1 AND ativo = true AND status = 'aprovado' LIMIT 1`,
+         FROM psicologos WHERE id = $1 AND ativo = true AND status = 'aprovado' AND visivel = true LIMIT 1`,
       [req.params.id]
     );
     if (result.rowCount === 0) return res.status(404).json({ ok: false, error: 'Psicólogo não encontrado' });
