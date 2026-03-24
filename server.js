@@ -1583,11 +1583,106 @@ async function enviarEmailAprovacaoPsicologo({ nome, email }) {
   const RESEND_KEY = process.env.RESEND_API_KEY;
   if (!RESEND_KEY) { console.warn('[EMAIL-APROVACAO-PSI] RESEND_API_KEY nao definida.'); return; }
   try {
-    const html = `<div style="background:#f2f0ec;padding:32px 20px;font-family:sans-serif"><div style="max-width:520px;margin:0 auto;background:#fff;border:1px solid rgba(22,18,14,.1);border-radius:16px;overflow:hidden"><div style="padding:24px;border-bottom:1px solid rgba(22,18,14,.08)"><span style="font-size:1.1rem;font-weight:600;color:#26508e">ConsultaJá24h</span></div><div style="padding:24px"><p style="color:#16120e;font-size:.95rem;margin-bottom:12px">Olá, <strong>${nome}</strong>!</p><p style="color:#443e38;font-size:.9rem;line-height:1.65;margin-bottom:24px">Seu cadastro na plataforma foi aprovado. Você já pode acessar o painel.</p><a href="https://painel.consultaja24h.com.br/psicologo" style="display:inline-block;padding:12px 28px;border-radius:12px;background:#26508e;color:#fff;font-weight:600;font-size:.9rem;text-decoration:none">Acessar o painel</a></div></div></div>`;
+    const PAINEL_URL = 'https://painel.consultaja24h.com.br/psicologo';
+    const html = `
+<div style="background:#f2f0ec;padding:32px 20px;font-family:'Segoe UI',Arial,sans-serif">
+  <div style="max-width:560px;margin:0 auto;background:#fff;border:1px solid rgba(22,18,14,.1);border-radius:16px;overflow:hidden">
+
+    <!-- Header -->
+    <div style="padding:20px 28px;background:linear-gradient(135deg,#dce8f5,#c5d8ef);display:flex;align-items:center;justify-content:space-between">
+      <span style="font-size:1rem;font-weight:600;color:#26508e">ConsultaJá24h</span>
+      <span style="font-size:.72rem;color:#4a6fa5;background:rgba(38,80,142,.1);padding:3px 10px;border-radius:999px;font-weight:500">Psicologia Online</span>
+    </div>
+
+    <!-- Greeting -->
+    <div style="padding:28px 28px 0">
+      <h2 style="margin:0 0 8px;font-size:1rem;font-weight:400;color:#16120e">Olá, <strong>${nome}</strong> 👋</h2>
+      <p style="margin:0 0 20px;font-size:.88rem;color:#443e38;line-height:1.65">
+        Seu cadastro foi aprovado. Você já faz parte da <strong style="color:#26508e">ConsultaJá24h Psicologia</strong> e pode começar a atender pacientes online.
+      </p>
+
+      <!-- CTA principal -->
+      <a href="${PAINEL_URL}" style="display:inline-block;padding:12px 28px;border-radius:10px;background:#26508e;color:#fff;font-weight:600;font-size:.88rem;text-decoration:none;margin-bottom:28px">
+        Acessar meu painel →
+      </a>
+
+      <hr style="border:none;border-top:1px solid rgba(22,18,14,.08);margin:0 0 24px">
+
+      <!-- Título seção -->
+      <p style="margin:0 0 16px;font-size:.7rem;font-weight:600;text-transform:uppercase;letter-spacing:.1em;color:#8c857d">Como funciona</p>
+
+      <!-- Step 1 -->
+      <div style="display:flex;gap:14px;margin-bottom:18px;align-items:flex-start">
+        <div style="min-width:28px;height:28px;border-radius:50%;background:rgba(38,80,142,.1);display:flex;align-items:center;justify-content:center;font-size:.72rem;font-weight:600;color:#26508e;flex-shrink:0">1</div>
+        <div>
+          <p style="margin:0 0 3px;font-size:.88rem;font-weight:600;color:#16120e">Monte seu perfil</p>
+          <p style="margin:0;font-size:.82rem;color:#443e38;line-height:1.55">Adicione sua foto, apresentação, abordagem e focos. Esse é o perfil que os pacientes vão ver antes de agendar.</p>
+        </div>
+      </div>
+
+      <!-- Step 2 -->
+      <div style="display:flex;gap:14px;margin-bottom:18px;align-items:flex-start">
+        <div style="min-width:28px;height:28px;border-radius:50%;background:rgba(38,80,142,.1);display:flex;align-items:center;justify-content:center;font-size:.72rem;font-weight:600;color:#26508e;flex-shrink:0">2</div>
+        <div>
+          <p style="margin:0 0 3px;font-size:.88rem;font-weight:600;color:#16120e">Configure sua disponibilidade</p>
+          <p style="margin:0;font-size:.82rem;color:#443e38;line-height:1.55">Defina os dias e horários em que quer atender. Você tem controle total sobre sua agenda, e pode ativar ou pausar quando quiser.</p>
+        </div>
+      </div>
+
+      <!-- Step 3 -->
+      <div style="display:flex;gap:14px;margin-bottom:18px;align-items:flex-start">
+        <div style="min-width:28px;height:28px;border-radius:50%;background:rgba(38,80,142,.1);display:flex;align-items:center;justify-content:center;font-size:.72rem;font-weight:600;color:#26508e;flex-shrink:0">3</div>
+        <div>
+          <p style="margin:0 0 3px;font-size:.88rem;font-weight:600;color:#16120e">Receba pacientes automaticamente</p>
+          <p style="margin:0;font-size:.82rem;color:#443e38;line-height:1.55">O paciente vê seu perfil, escolhe um horário disponível e paga online (PIX ou cartão). Você recebe os dados e uma notificação por e-mail.</p>
+        </div>
+      </div>
+
+      <!-- Step 4 -->
+      <div style="display:flex;gap:14px;margin-bottom:18px;align-items:flex-start">
+        <div style="min-width:28px;height:28px;border-radius:50%;background:rgba(38,80,142,.1);display:flex;align-items:center;justify-content:center;font-size:.72rem;font-weight:600;color:#26508e;flex-shrink:0">4</div>
+        <div>
+          <p style="margin:0 0 3px;font-size:.88rem;font-weight:600;color:#16120e">Controle financeiro transparente</p>
+          <p style="margin:0;font-size:.82rem;color:#443e38;line-height:1.55">Após cada sessão, marque como realizada no painel. A plataforma calcula o repasse automaticamente — você não precisa fazer conta.</p>
+        </div>
+      </div>
+
+      <hr style="border:none;border-top:1px solid rgba(22,18,14,.08);margin:4px 0 20px">
+
+      <!-- Card resumo do painel -->
+      <div style="background:#f8f6f3;border:1px solid rgba(22,18,14,.08);border-radius:10px;padding:14px 18px;margin-bottom:24px">
+        <p style="margin:0 0 6px;font-size:.8rem;font-weight:600;color:#16120e">O que você encontra no painel:</p>
+        <p style="margin:0;font-size:.78rem;color:#6a6560;line-height:1.75">
+          Editar foto e apresentação &nbsp;·&nbsp; Configurar disponibilidade &nbsp;·&nbsp;
+          Ver agendamentos &nbsp;·&nbsp; Marcar sessões como realizadas &nbsp;·&nbsp;
+          Controlar visibilidade no site &nbsp;·&nbsp; Acompanhar repasses
+        </p>
+      </div>
+
+      <p style="margin:0 0 28px;font-size:.78rem;color:rgba(22,18,14,.4);line-height:1.55">
+        Dúvidas? Responda este e-mail ou entre em contato com a equipe da plataforma.
+      </p>
+    </div>
+
+    <!-- Footer -->
+    <div style="padding:16px 28px;border-top:1px solid rgba(22,18,14,.08)">
+      <p style="margin:0;font-size:.7rem;color:rgba(22,18,14,.35)">
+        ConsultaJá24h Psicologia &nbsp;·&nbsp; Este e-mail foi enviado automaticamente após a aprovação do seu cadastro.
+      </p>
+    </div>
+
+  </div>
+</div>`;
+
     const r = await fetch('https://api.resend.com/emails', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${RESEND_KEY}` },
-      body: JSON.stringify({ from: 'ConsultaJá24h <contato@consultaja24h.com.br>', to: [email], subject: 'Seu cadastro foi aprovado na ConsultaJá24h Psicologia', html })
+      body: JSON.stringify({
+        from: 'ConsultaJá24h <contato@consultaja24h.com.br>',
+        to: [email],
+        subject: `✅ Cadastro aprovado — bem-vindo(a) à ConsultaJá24h Psicologia`,
+        html
+      })
     });
     const d = await r.json();
     if (d.id) console.log('[EMAIL-APROVACAO-PSI] Enviado para:', email, '| ID:', d.id);
