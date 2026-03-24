@@ -1478,11 +1478,20 @@ app.delete('/api/paciente/agendamento/:id', authPaciente, async (req, res) => {
     if (!agId) return res.status(400).json({ ok: false, error: 'ID inválido' });
 
     // Busca e valida posse + regra de negócio
+    // Aceita agendamentos vinculados por paciente_id OU por e-mail (agendamentos antigos sem login)
+    const { rows: pacRows } = await pool.query(
+      `SELECT email FROM pacientes WHERE id = $1 LIMIT 1`,
+      [req.pacienteId]
+    );
+    const pacEmail = pacRows[0]?.email || '';
+
     const { rows } = await pool.query(
       `SELECT id, status, pagamento_status, horario_agendado
          FROM agendamentos_psicologia
-        WHERE id = $1 AND paciente_id = $2 LIMIT 1`,
-      [agId, req.pacienteId]
+        WHERE id = $1
+          AND (paciente_id = $2 OR paciente_email = $3)
+        LIMIT 1`,
+      [agId, req.pacienteId, pacEmail]
     );
     if (rows.length === 0)
       return res.status(404).json({ ok: false, error: 'Agendamento não encontrado' });
