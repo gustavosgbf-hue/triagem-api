@@ -365,6 +365,8 @@ async function initDB() {
       foto_url       TEXT,
       bio            TEXT,
       ativo          BOOLEAN NOT NULL DEFAULT true,
+      disponibilidade TEXT,
+      visivel        BOOLEAN NOT NULL DEFAULT true,
       created_at     TIMESTAMP DEFAULT NOW()
     )`).catch(()=>{});
     await pool.query(`CREATE TABLE IF NOT EXISTS agendamentos_especialistas (
@@ -2981,13 +2983,27 @@ app.get('/api/especialistas/horarios-ocupados/:especialistaId', rlGeral, async (
 app.get('/api/especialistas/:especialidade', rlGeral, async (req, res) => {
   try {
     const { rows } = await pool.query(
-      `SELECT id, nome_exibicao, especialidade, crm, uf, valor_consulta, foto_url, bio
+      `SELECT id, nome_exibicao, especialidade, crm, uf, valor_consulta, foto_url, bio, disponibilidade
          FROM especialistas
-        WHERE especialidade = $1 AND ativo = true
+        WHERE especialidade = $1 AND ativo = true AND visivel = true
         ORDER BY id ASC`,
       [req.params.especialidade]
     );
     return res.json({ ok: true, especialistas: rows });
+  } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// ── ESPECIALISTAS: horários ocupados por especialista ────────────────────────
+app.get('/api/especialistas/:especialistaId/horarios', rlGeral, async (req, res) => {
+  try {
+    const espId = parseInt(req.params.especialistaId, 10);
+    if (!espId) return res.status(400).json({ ok: false, error: 'ID inválido' });
+    const { rows } = await pool.query(
+      `SELECT disponibilidade FROM especialistas WHERE id = $1 AND ativo = true`,
+      [espId]
+    );
+    if (!rows.length) return res.status(404).json({ ok: false, error: 'Especialista não encontrado' });
+    return res.json({ ok: true, disponibilidade: rows[0].disponibilidade || null });
   } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
 });
 
@@ -3214,6 +3230,107 @@ app.delete('/api/admin/especialista/:id', checkAdmin, async (req, res) => {
     );
     if (!rows.length) return res.status(404).json({ ok: false, error: 'Especialista não encontrado' });
     return res.json({ ok: true, especialista: rows[0] });
+  } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// ── ESPECIALISTAS: auth middleware ──────────────────────────────────────────
+const authEspecialista = async (req, res, next) => {
+  const authH = req.headers['authorization'] || '';
+  const tok = authH.replace(/^Bearer\s+/i, '').trim();
+  if (!tok) return res.status(401).json({ ok: false, error: 'Token necessário' });
+  try {
+    const dec = jwt.verify(tok, JWT_SECRET);
+    if (dec.tipo !== 'especialista') return res.status(403).json({ ok: false, error: 'Acesso negado' });
+    const { rows } = await pool.query('SELECT id, nome_exibicao, especialidade, ativo FROM especialistas WHERE id = $1 AND ativo = true', [dec.id]);
+    if (!rows.length) return res.status(403).json({ ok: false, error: 'Especialista inativo ou não encontrado' });
+    req.especialistaId = rows[0].id;
+    req.especialista = rows[0];
+    next();
+  } catch(e) { return res.status(401).json({ ok: false, error: 'Token inválido' }); }
+};
+
+// ── ESPECIALISTAS: login ────────────────────────────────────────────────────
+app.post('/api/especialista/login', rlLogin, async (req, res) => {
+  try {
+    const { email, senha } = req.body || {};
+    if (!email || !senha) return res.status(400).json({ ok: false, error: 'Email e senha obrigatórios' });
+    const { rows } = await pool.query('SELECT id, nome_exibicao, especialidade, email, senha_hash, ativo FROM especialistas WHERE email = $1', [email.toLowerCase().trim()]);
+    if (!rows.length) return res.status(401).json({ ok: false, error: 'Credenciais inválidas' });
+    const esp = rows[0];
+    if (!esp.ativo) return res.status(403).json({ ok: false, error: 'Seu cadastro está inativo' });
+    const match = await bcrypt.compare(senha, esp.senha_hash);
+    if (!match) return res.status(401).json({ ok: false, error: 'Credenciais inválidas' });
+    const tok = jwt.sign({ id: esp.id, tipo: 'especialista', email: esp.email }, JWT_SECRET, { expiresIn: '7d' });
+    return res.json({ ok: true, token: tok, especialista: { id: esp.id, nome_exibicao: esp.nome_exibicao, especialidade: esp.especialidade } });
+  } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// ── ESPECIALISTA: meu perfil ───────────────────────────────────────────────
+app.get('/api/especialista/me', authEspecialista, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, nome, nome_exibicao, especialidade, crm, uf, valor_consulta, foto_url, bio, ativo, disponibilidade, visivel
+         FROM especialistas WHERE id = $1`,
+      [req.especialistaId]
+    );
+    if (!rows.length) return res.status(404).json({ ok: false, error: 'Especialista não encontrado' });
+    return res.json({ ok: true, especialista: rows[0] });
+  } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// ── ESPECIALISTA: atualizar perfil ─────────────────────────────────────────
+app.patch('/api/especialista/perfil', authEspecialista, async (req, res) => {
+  try {
+    const { nome_exibicao, bio, valor_consulta, crm, uf } = req.body || {};
+    const updates = [];
+    const params = [];
+    let idx = 1;
+    if (nome_exibicao !== undefined) { updates.push(`nome_exibicao = $${idx++}`); params.push(nome_exibicao.trim()); }
+    if (bio !== undefined) { updates.push(`bio = $${idx++}`); params.push(bio.trim()); }
+    if (valor_consulta !== undefined) { updates.push(`valor_consulta = $${idx++}`); params.push(parseFloat(valor_consulta)); }
+    if (crm !== undefined) { updates.push(`crm = $${idx++}`); params.push(crm.trim().toUpperCase()); }
+    if (uf !== undefined) { updates.push(`uf = $${idx++}`); params.push(uf.trim().toUpperCase()); }
+    if (!updates.length) return res.status(400).json({ ok: false, error: 'Nenhum campo para atualizar' });
+    params.push(req.especialistaId);
+    const { rows } = await pool.query(`UPDATE especialistas SET ${updates.join(', ')} WHERE id = $${idx} RETURNING id, nome_exibicao, especialidade`, params);
+    return res.json({ ok: true, especialista: rows[0] });
+  } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// ── ESPECIALISTA: atualizar disponibilidade ───────────────────────────────
+app.patch('/api/especialista/disponibilidade', authEspecialista, async (req, res) => {
+  try {
+    const { disponibilidade } = req.body || {};
+    if (typeof disponibilidade !== 'string') return res.status(400).json({ ok: false, error: 'disponibilidade deve ser texto' });
+    await pool.query(`UPDATE especialistas SET disponibilidade = $1 WHERE id = $2`, [disponibilidade.trim(), req.especialistaId]);
+    console.log(`[ESP-DISP] Especialista #${req.especialistaId} atualizou disponibilidade`);
+    return res.json({ ok: true });
+  } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// ── ESPECIALISTA: upload foto ───────────────────────────────────────────────
+const uploadEsp = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } }).single('foto');
+app.post('/api/especialista/foto', authEspecialista, uploadEsp, async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ ok: false, error: 'Nenhuma imagem enviada' });
+    const ext = req.file.originalname.split('.').pop().toLowerCase();
+    if (!['jpg','jpeg','png','webp'].includes(ext)) return res.status(400).json({ ok: false, error: 'Formato inválido' });
+    const key = `especialistas/${req.especialistaId}_${Date.now()}.${ext}`;
+    await r2Client.write(key, req.file.buffer, req.file.mimetype);
+    const foto_url = R2_PUBLIC_URL + key;
+    await pool.query(`UPDATE especialistas SET foto_url = $1 WHERE id = $2`, [foto_url, req.especialistaId]);
+    return res.json({ ok: true, foto_url });
+  } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// ── ESPECIALISTA: visibilidade (mostrar/ocultar no site) ───────────────────
+app.patch('/api/especialista/visivel', authEspecialista, async (req, res) => {
+  try {
+    const { visivel } = req.body || {};
+    if (typeof visivel !== 'boolean') return res.status(400).json({ ok: false, error: 'Campo visivel deve ser boolean' });
+    await pool.query(`UPDATE especialistas SET visivel = $1 WHERE id = $2`, [visivel, req.especialistaId]);
+    console.log(`[ESP-VISIB] Especialista #${req.especialistaId} visivel=${visivel}`);
+    return res.json({ ok: true, visivel });
   } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
 });
 
