@@ -435,10 +435,10 @@ async function initDB() {
       email          TEXT,
       ativo          BOOLEAN NOT NULL DEFAULT true,
       disponibilidade TEXT,
-      visivel        BOOLEAN NOT NULL DEFAULT true,
       created_at     TIMESTAMP DEFAULT NOW()
     )`).catch(()=>{});
     await pool.query(`ALTER TABLE especialistas ADD COLUMN IF NOT EXISTS email TEXT`).catch(()=>{});
+    await pool.query(`ALTER TABLE especialistas ADD COLUMN IF NOT EXISTS visivel BOOLEAN DEFAULT true`).catch(()=>{});
     await pool.query(`CREATE TABLE IF NOT EXISTS agendamentos_especialistas (
       id                      SERIAL PRIMARY KEY,
       especialista_id         INTEGER NOT NULL REFERENCES especialistas(id),
@@ -466,6 +466,16 @@ async function initDB() {
     await pool.query(`ALTER TABLE agendamentos_especialistas ADD COLUMN IF NOT EXISTS efi_charge_id TEXT`).catch(()=>{});
     await pool.query(`ALTER TABLE agendamentos_especialistas ADD COLUMN IF NOT EXISTS lembrete_enviado BOOLEAN DEFAULT false`).catch(()=>{});
     await pool.query(`ALTER TABLE agendamentos_especialistas ADD COLUMN IF NOT EXISTS link_sessao TEXT`).catch(()=>{});
+    await pool.query(`CREATE TABLE IF NOT EXISTS consulta_mensagens (
+      id SERIAL PRIMARY KEY,
+      agendamento_id INTEGER NOT NULL,
+      agendamento_type TEXT NOT NULL DEFAULT 'especialista',
+      autor TEXT NOT NULL,
+      texto TEXT,
+      arquivo_url TEXT,
+      created_at TIMESTAMP DEFAULT NOW()
+    )`).catch(()=>{});
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_consulta_msgs ON consulta_mensagens(agendamento_id, agendamento_type)`).catch(()=>{});
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_ag_esp_paciente ON agendamentos_especialistas(paciente_id)`).catch(()=>{});
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_ag_esp_efi ON agendamentos_especialistas(efi_charge_id)`).catch(()=>{});
     // ── LEADS ──────────────────────────────────────────────────────────────────
@@ -3162,7 +3172,7 @@ app.get('/api/especialistas/:especialidade', rlGeral, async (req, res) => {
     const { rows } = await pool.query(
       `SELECT id, nome_exibicao, especialidade, crm, uf, valor_consulta, foto_url, bio, disponibilidade
          FROM especialistas
-        WHERE especialidade = $1 AND ativo = true AND visivel = true
+        WHERE especialidade = $1 AND ativo = true AND (visivel = true OR visivel IS NULL)
         ORDER BY id ASC`,
       [req.params.especialidade]
     );
@@ -3630,6 +3640,94 @@ app.delete('/api/especialista/agendamento/:id/cancelar', authEspecialista, async
     enviarEmailCancelamentoAdmin({ especialidade: ag.especialidade, especialista: ag.especialista_nome, paciente: ag.paciente_nome, email: ag.paciente_email, horario: horarioFmt, motivo: 'Profissional cancelou' }).catch(()=>{});
     
     return res.json({ ok: true });
+  } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// ── CONSULTA: buscar dados ────────────────────────────────────────────────────
+app.get('/api/consulta/:agendamentoId', authPaciente, async (req, res) => {
+  try {
+    const agId = parseInt(req.params.agendamentoId, 10);
+    if (!agId) return res.status(400).json({ ok: false, error: 'ID inválido' });
+    
+    // Busca na tabela de especialistas
+    const agRes = await pool.query(
+      `SELECT id, especialista_nome AS profissional_nome, especialidade AS tipo_consulta, 
+              horario_agendado, link_sessao, valor_cobrado, pagamento_status, status
+         FROM agendamentos_especialistas 
+        WHERE id = $1 AND paciente_id = $2 AND pagamento_status = 'confirmado'`,
+      [agId, req.pacienteId]
+    );
+    
+    // Se não encontrar em especialistas, busca em psicologia
+    if (agRes.rowCount === 0) {
+      const agPsi = await pool.query(
+        `SELECT ap.id, ap.psicologo_nome AS profissional_nome, ap.tipo_consulta, 
+                ap.horario_agendado, ap.link_sessao, ap.valor_cobrado, ap.pagamento_status, ap.status
+           FROM agendamentos_psicologia ap
+          WHERE ap.id = $1 AND ap.paciente_id = $2 AND ap.pagamento_status = 'confirmado'`,
+        [agId, req.pacienteId]
+      );
+      if (agPsi.rowCount === 0) return res.status(404).json({ ok: false, error: 'Consulta não encontrada ou não confirmada' });
+      var agendamento = agPsi.rows[0];
+      agendamento.tipo_consulta = agendamento.tipo_consulta === 'avaliacao' ? 'Avaliação psicológica' : 'Psicoterapia';
+    } else {
+      var agendamento = agRes.rows[0];
+      agendamento.tipo_consulta = agendamento.tipo_consulta.charAt(0).toUpperCase() + agendamento.tipo_consulta.slice(1);
+    }
+    
+    // Busca mensagens
+    const msgsRes = await pool.query(
+      `SELECT autor, texto, arquivo_url, created_at 
+         FROM consulta_mensagens 
+        WHERE agendamento_id = $1 AND (agendamento_type = 'especialista' OR agendamento_type = 'psicologia')
+        ORDER BY created_at ASC`,
+      [agId]
+    );
+    
+    return res.json({ ok: true, agendamento, mensagens: msgsRes.rows });
+  } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// ── CONSULTA: enviar mensagem ────────────────────────────────────────────────
+app.post('/api/consulta/:agendamentoId/mensagem', authPaciente, async (req, res) => {
+  try {
+    const agId = parseInt(req.params.agendamentoId, 10);
+    const { texto } = req.body || {};
+    if (!texto?.trim()) return res.status(400).json({ ok: false, error: 'Mensagem obrigatória' });
+    
+    await pool.query(
+      `INSERT INTO consulta_mensagens (agendamento_id, autor, texto, agendamento_type)
+       VALUES ($1, 'paciente', $2, 'especialista')`,
+      [agId, texto.trim()]
+    );
+    
+    return res.json({ ok: true });
+  } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// ── CONSULTA: upload arquivo ────────────────────────────────────────────────
+const uploadConsulta = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } }).single('arquivo');
+app.post('/api/consulta/:agendamentoId/upload', authPaciente, uploadConsulta, async (req, res) => {
+  try {
+    const agId = parseInt(req.params.agendamentoId, 10);
+    if (!req.file) return res.status(400).json({ ok: false, error: 'Nenhum arquivo enviado' });
+    
+    const ext = req.file.originalname.split('.').pop().toLowerCase();
+    const allowed = ['jpg','jpeg','png','gif','pdf'];
+    if (!allowed.includes(ext)) return res.status(400).json({ ok: false, error: 'Tipo de arquivo não permitido' });
+    
+    const key = `consultas/${agId}_${Date.now()}.${ext}`;
+    await r2Client.write(key, req.file.buffer, req.file.mimetype);
+    const arquivo_url = `${process.env.R2_PUBLIC_URL}/${key}`;
+    
+    const texto = req.body.texto || '';
+    await pool.query(
+      `INSERT INTO consulta_mensagens (agendamento_id, autor, texto, arquivo_url, agendamento_type)
+       VALUES ($1, 'paciente', $2, $3, 'especialista')`,
+      [agId, texto, arquivo_url]
+    );
+    
+    return res.json({ ok: true, arquivo_url });
   } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
 });
 
@@ -5838,8 +5936,17 @@ app.get('/api/admin/psicologia/indicadores', checkAdmin, async (req, res) => {
 // FIM ANTI-DESVIO DE PACIENTES
 // ══════════════════════════════════════════════════════════════════════════════
 
+// Health check
+app.get('/', (req, res) => {
+  res.send('API ConsultaJá24h rodando');
+});
+
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
 const PORT = process.env.PORT || 10000;
 
-app.listen(PORT, () => {
+app.listen(PORT, '0.0.0.0', () => {
   console.log("Servidor rodando na porta", PORT);
 });
