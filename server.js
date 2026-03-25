@@ -3012,8 +3012,11 @@ app.post('/api/especialistas/agendamento/criar', rlGeral, async (req, res) => {
       `SELECT id, nome_exibicao, especialidade, valor_consulta, ativo FROM especialistas WHERE id = $1 LIMIT 1`,
       [especialistaId]
     );
-    if (espRes.rowCount === 0 || !espRes.rows[0].ativo) {
-      return res.status(404).json({ ok: false, error: 'Especialista não encontrado' });
+    if (espRes.rowCount === 0) {
+      return res.status(404).json({ ok: false, error: 'Especialista não encontrado. Verifique o ID no HTML.' });
+    }
+    if (!espRes.rows[0].ativo) {
+      return res.status(400).json({ ok: false, error: 'Especialista temporariamente indisponível.' });
     }
     const esp = espRes.rows[0];
     const slotStart = new Date(horario_agendado);
@@ -3183,6 +3186,34 @@ app.get('/api/admin/especialistas', checkAdmin, async (req, res) => {
          FROM especialistas ORDER BY especialidade, id`
     );
     return res.json({ ok: true, especialistas: rows });
+  } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// ── ESPECIALISTAS: admin — desativar especialista ─────────────────────────────
+app.put('/api/admin/especialista/:id/desativar', checkAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!id || isNaN(id)) return res.status(400).json({ ok: false, error: 'ID inválido' });
+    const { rows } = await pool.query(
+      `UPDATE especialistas SET ativo = false WHERE id = $1 RETURNING id, nome_exibicao, ativo`,
+      [id]
+    );
+    if (!rows.length) return res.status(404).json({ ok: false, error: 'Especialista não encontrado' });
+    return res.json({ ok: true, especialista: rows[0] });
+  } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// ── ESPECIALISTAS: admin — deletar especialista (permanent) ───────────────────
+app.delete('/api/admin/especialista/:id', checkAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!id || isNaN(id)) return res.status(400).json({ ok: false, error: 'ID inválido' });
+    const { rows } = await pool.query(
+      `DELETE FROM especialistas WHERE id = $1 RETURNING id, nome_exibicao`,
+      [id]
+    );
+    if (!rows.length) return res.status(404).json({ ok: false, error: 'Especialista não encontrado' });
+    return res.json({ ok: true, especialista: rows[0] });
   } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
 });
 
