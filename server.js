@@ -191,6 +191,74 @@ setInterval(async () => {
   }
 }, 6 * 60 * 60 * 1000);
 
+// LEMBRETE ESPECIALISTAS — 1h antes
+setInterval(async () => {
+  try {
+    const RESEND_KEY = process.env.RESEND_API_KEY;
+    if (!RESEND_KEY) return;
+    const result = await pool.query(
+      `SELECT e.id, e.paciente_nome, e.paciente_email, e.especialista_nome, e.especialidade, e.horario_agendado
+         FROM agendamentos_especialistas e
+        WHERE e.status = 'confirmado'
+          AND e.pagamento_status = 'confirmado'
+          AND e.lembrete_enviado IS NOT TRUE
+          AND e.horario_agendado > NOW()
+          AND e.horario_agendado <= NOW() + INTERVAL '1 hour'`
+    );
+    for (const ag of result.rows) {
+      await pool.query(`UPDATE agendamentos_especialistas SET lembrete_enviado = true WHERE id = $1`, [ag.id]);
+      const horarioFmt = new Date(ag.horario_agendado).toLocaleString('pt-BR',{timeZone:'America/Fortaleza',day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit'});
+      if (ag.paciente_email) {
+        const html = `<div style="background:#faf8f5;padding:32px;font-family:'DM Sans',sans-serif">
+          <div style="max-width:480px;margin:0 auto;background:#fff;border-radius:16px;padding:24px">
+            <div style="font-size:.72rem;color:#8a857f;margin-bottom:12px">🔔 Lembrete</div>
+            <h2 style="color:#1a1612;margin:0 0 16px">Sua consulta é em 1 hora</h2>
+            <div style="background:#e8f5e9;border-radius:12px;padding:16px;margin-bottom:16px">
+              <div style="font-size:.85rem;color:#4a4540">Profissional: <strong>${ag.especialista_nome}</strong></div>
+              <div style="font-size:.85rem;color:#4a4540">Especialidade: ${ag.especialidade}</div>
+              <div style="font-size:1rem;font-weight:600;color:#388e3c">${horarioFmt}</div>
+            </div>
+            <p style="font-size:.85rem;color:#4a4540">O link de acesso será enviado em breve.</p>
+          </div></div>`;
+        await fetch("https://api.resend.com/emails", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${RESEND_KEY}` },
+          body: JSON.stringify({ from: "ConsultaJá24h <contato@consultaja24h.com.br>", to: [ag.paciente_email], subject: `🔔 Sua consulta é em 1h — ${horarioFmt}`, html })
+        });
+      }
+      const espRes = await pool.query(`SELECT email FROM especialistas WHERE nome_exibicao = $1 AND ativo = true`, [ag.especialista_nome]);
+      if (espRes.rows[0]?.email) {
+        const htmlEsp = `<div style="background:#faf8f5;padding:32px;font-family:'DM Sans',sans-serif">
+          <div style="max-width:480px;margin:0 auto;background:#fff;border-radius:16px;padding:24px">
+            <div style="font-size:.72rem;color:#8a857f;margin-bottom:12px">🔔 Lembrete</div>
+            <h2 style="color:#1a1612;margin:0 0 16px">Você tem consulta em 1 hora</h2>
+            <div style="background:#e3f2fd;border-radius:12px;padding:16px;margin-bottom:16px">
+              <div style="font-size:.85rem;color:#4a4540">Paciente: <strong>${ag.paciente_nome}</strong></div>
+              <div style="font-size:.85rem;color:#4a4540">Especialidade: ${ag.especialidade}</div>
+              <div style="font-size:1rem;font-weight:600;color:#1976d2">${horarioFmt}</div>
+            </div>
+          </div></div>`;
+        await fetch("https://api.resend.com/emails", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${RESEND_KEY}` },
+          body: JSON.stringify({ from: "ConsultaJá24h <contato@consultaja24h.com.br>", to: [espRes.rows[0].email], subject: `🔔 Consulta em 1h — ${ag.paciente_nome}`, html: htmlEsp })
+        });
+      }
+      const ADMIN_EMAIL = "gustavosgbf@gmail.com";
+      const htmlAdmin = `<div style="background:#faf8f5;padding:32px;font-family:'DM Sans',sans-serif">
+        <div style="max-width:480px;margin:0 auto;background:#fff;border-radius:16px;padding:24px">
+          <div style="font-size:.72rem;color:#8a857f;margin-bottom:12px">🔔 Lembrete</div>
+          <div style="font-size:.85rem;color:#4a4540">Especialista: ${ag.especialista_nome} | Paciente: ${ag.paciente_nome} | ${horarioFmt}</div>
+        </div></div>`;
+      await fetch("https://api.resend.com/emails", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${RESEND_KEY}` },
+        body: JSON.stringify({ from: "ConsultaJá24h <contato@consultaja24h.com.br>", to: [ADMIN_EMAIL], subject: `🔔 Lembrete: ${ag.especialidade} em 1h`, html: htmlAdmin })
+      });
+    }
+  } catch(e) { console.error("[LEMBRETE-ESP] Erro:", e.message); }
+}, 10 * 60 * 1000);
+
 async function initDB() {
   try {
     await pool.query(`CREATE TABLE IF NOT EXISTS mensagens (
@@ -364,11 +432,13 @@ async function initDB() {
       valor_consulta NUMERIC(10,2) NOT NULL,
       foto_url       TEXT,
       bio            TEXT,
+      email          TEXT,
       ativo          BOOLEAN NOT NULL DEFAULT true,
       disponibilidade TEXT,
       visivel        BOOLEAN NOT NULL DEFAULT true,
       created_at     TIMESTAMP DEFAULT NOW()
     )`).catch(()=>{});
+    await pool.query(`ALTER TABLE especialistas ADD COLUMN IF NOT EXISTS email TEXT`).catch(()=>{});
     await pool.query(`CREATE TABLE IF NOT EXISTS agendamentos_especialistas (
       id                      SERIAL PRIMARY KEY,
       especialista_id         INTEGER NOT NULL REFERENCES especialistas(id),
@@ -394,6 +464,7 @@ async function initDB() {
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_ag_esp_status ON agendamentos_especialistas(pagamento_status)`).catch(()=>{});
     await pool.query(`ALTER TABLE agendamentos_especialistas ADD COLUMN IF NOT EXISTS paciente_id INTEGER REFERENCES pacientes(id)`).catch(()=>{});
     await pool.query(`ALTER TABLE agendamentos_especialistas ADD COLUMN IF NOT EXISTS efi_charge_id TEXT`).catch(()=>{});
+    await pool.query(`ALTER TABLE agendamentos_especialistas ADD COLUMN IF NOT EXISTS lembrete_enviado BOOLEAN DEFAULT false`).catch(()=>{});
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_ag_esp_paciente ON agendamentos_especialistas(paciente_id)`).catch(()=>{});
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_ag_esp_efi ON agendamentos_especialistas(efi_charge_id)`).catch(()=>{});
     // ── LEADS ──────────────────────────────────────────────────────────────────
@@ -1012,6 +1083,111 @@ async function enviarEmailLembretePaciente({ nome, email, horarioFormatado, moda
     if (d.id) console.log("[EMAIL-LEMBRETE-PACIENTE] Enviado para:", email);
     else console.error("[EMAIL-LEMBRETE-PACIENTE] Erro:", JSON.stringify(d));
   } catch(e) { console.error("[EMAIL-LEMBRETE-PACIENTE] Erro:", e.message); }
+}
+
+// ── E-MAIL: confirmação para especialista ───────────────────────────────────────
+async function enviarEmailConfirmacaoEspecialista({ especialista, especialidade, paciente, email, horario }) {
+  const RESEND_KEY = process.env.RESEND_API_KEY;
+  if (!RESEND_KEY || !email) return;
+  try {
+    const html = `<div style="background:#faf8f5;padding:32px 20px;font-family:'DM Sans',sans-serif">
+      <div style="max-width:500px;margin:0 auto;background:#fff;border:1px solid rgba(26,22,18,.08);border-radius:16px;overflow:hidden">
+        <div style="padding:24px;border-bottom:1px solid rgba(26,22,18,.08)">
+          <span style="font-size:1.1rem;font-weight:600;color:#1a1612">ConsultaJá24h</span>
+          <span style="font-size:.8rem;color:#8a857f;margin-left:8px">Nova consulta</span>
+        </div>
+        <div style="padding:24px">
+          <p style="color:#4a4540;font-size:.95rem;margin-bottom:16px">Olá, <strong>${especialista}</strong>!</p>
+          <p style="color:#4a4540;font-size:.9rem;margin-bottom:20px">Você tem uma nova consulta confirmada:</p>
+          <div style="background:#e8f5e9;border:1px solid #a5d6a7;border-radius:12px;padding:16px;margin-bottom:20px">
+            <div style="font-size:.72rem;color:#1b5e20;text-transform:uppercase;margin-bottom:4px">Paciente</div>
+            <div style="font-size:1rem;font-weight:600;color:#1b5e20">${paciente}</div>
+          </div>
+          <div style="font-size:.88rem;color:#4a4540;margin-bottom:8px"><strong>Especialidade:</strong> ${especialidade}</div>
+          <div style="font-size:.88rem;color:#4a4540"><strong>Horário:</strong> ${horario}</div>
+        </div>
+      </div></div>`;
+    const r = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${RESEND_KEY}` },
+      body: JSON.stringify({ from: "ConsultaJá24h <contato@consultaja24h.com.br>", to: [email], subject: `📅 Nova consulta confirmada — ${horario}`, html })
+    });
+    const d = await r.json();
+    if (d.id) console.log("[EMAIL-ESP] Confirmacao enviada para:", email);
+  } catch(e) { console.error("[EMAIL-ESP] Erro:", e.message); }
+}
+
+// ── E-MAIL: notificação para admin ────────────────────────────────────────────────
+async function enviarEmailConfirmacaoAdmin({ especialidade, especialista, paciente, email, horario, status }) {
+  const ADMIN_EMAIL = "gustavosgbf@gmail.com";
+  const RESEND_KEY = process.env.RESEND_API_KEY;
+  if (!RESEND_KEY) return;
+  try {
+    const statusLabel = status === "confirmado" ? "✅ Confirmado" : status === "cancelado" ? "❌ Cancelado" : "ℹ️ " + status;
+    const html = `<div style="background:#faf8f5;padding:32px 20px;font-family:'DM Sans',sans-serif">
+      <div style="max-width:500px;margin:0 auto;background:#fff;border:1px solid rgba(26,22,18,.08);border-radius:16px;overflow:hidden">
+        <div style="padding:24px;border-bottom:1px solid rgba(26,22,18,.08);background:#1a1612">
+          <span style="font-size:1.1rem;font-weight:600;color:#fff">ConsultaJá24h</span>
+          <span style="font-size:.8rem;color:rgba(255,255,255,.6);margin-left:8px">Notificação</span>
+        </div>
+        <div style="padding:24px">
+          <div style="font-size:.72rem;color:#8a857f;text-transform:uppercase;margin-bottom:8px">${statusLabel}</div>
+          <h2 style="color:#1a1612;font-size:1.1rem;margin:0 0 20px">Novo agendamento de especialista</h2>
+          <div style="background:#f5f5f5;border-radius:12px;padding:16px;margin-bottom:16px">
+            <div style="display:grid;grid-template-columns:100px 1fr;gap:8px;font-size:.85rem;color:#4a4540">
+              <div style="color:#8a857f">Especialidade</div><div><strong>${especialidade}</strong></div>
+              <div style="color:#8a857f">Profissional</div><div>${especialista}</div>
+              <div style="color:#8a857f">Paciente</div><div>${paciente}</div>
+              <div style="color:#8a857f">E-mail</div><div>${email||'-'}</div>
+              <div style="color:#8a857f">Horário</div><div>${horario}</div>
+            </div>
+          </div>
+        </div>
+      </div></div>`;
+    const r = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${RESEND_KEY}` },
+      body: JSON.stringify({ from: "ConsultaJá24h <contato@consultaja24h.com.br>", to: [ADMIN_EMAIL], subject: `📋 Agendamento ${especialidade}: ${status} — ${paciente}`, html })
+    });
+    const d = await r.json();
+    if (d.id) console.log("[EMAIL-ADMIN] Notificacao enviada para admin");
+  } catch(e) { console.error("[EMAIL-ADMIN] Erro:", e.message); }
+}
+
+// ── E-MAIL: cancelamento para admin ──────────────────────────────────────────────
+async function enviarEmailCancelamentoAdmin({ especialidade, especialista, paciente, email, horario, motivo }) {
+  const ADMIN_EMAIL = "gustavosgbf@gmail.com";
+  const RESEND_KEY = process.env.RESEND_API_KEY;
+  if (!RESEND_KEY) return;
+  try {
+    const html = `<div style="background:#faf8f5;padding:32px 20px;font-family:'DM Sans',sans-serif">
+      <div style="max-width:500px;margin:0 auto;background:#fff;border:1px solid rgba(26,22,18,.08);border-radius:16px;overflow:hidden">
+        <div style="padding:24px;border-bottom:1px solid rgba(26,22,18,.08);background:#dc2626">
+          <span style="font-size:1.1rem;font-weight:600;color:#fff">ConsultaJá24h</span>
+          <span style="font-size:.8rem;color:rgba(255,255,255,.6);margin-left:8px">Cancelamento</span>
+        </div>
+        <div style="padding:24px">
+          <div style="font-size:.72rem;color:#dc2626;text-transform:uppercase;margin-bottom:8px">❌ Agendamento cancelado</div>
+          <div style="background:#fef2f2;border:1px solid #fecaca;border-radius:12px;padding:16px;margin-bottom:16px">
+            <div style="display:grid;grid-template-columns:100px 1fr;gap:8px;font-size:.85rem;color:#4a4540">
+              <div style="color:#8a857f">Especialidade</div><div><strong>${especialidade}</strong></div>
+              <div style="color:#8a857f">Profissional</div><div>${especialista}</div>
+              <div style="color:#8a857f">Paciente</div><div>${paciente}</div>
+              <div style="color:#8a857f">E-mail</div><div>${email||'-'}</div>
+              <div style="color:#8a857f">Horário</div><div>${horario}</div>
+              ${motivo ? `<div style="color:#8a857f">Motivo</div><div>${motivo}</div>` : ''}
+            </div>
+          </div>
+        </div>
+      </div></div>`;
+    const r = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${RESEND_KEY}` },
+      body: JSON.stringify({ from: "ConsultaJá24h <contato@consultaja24h.com.br>", to: [ADMIN_EMAIL], subject: `❌ Cancelamento: ${especialidade} — ${paciente}`, html })
+    });
+    const d = await r.json();
+    if (d.id) console.log("[EMAIL-ADMIN-CANCEL] Notificacao enviada para admin");
+  } catch(e) { console.error("[EMAIL-ADMIN-CANCEL] Erro:", e.message); }
 }
 
 // Lista explicita de placeholders — sem LIKE, comparacao direta
@@ -3158,6 +3334,11 @@ app.post('/api/especialistas/pagbank/webhook', async (req, res) => {
       new Date(ag.horario_agendado).toLocaleString('pt-BR',{timeZone:'America/Fortaleza'}),
       'R$ '+parseFloat(ag.valor_cobrado).toFixed(2).replace('.',',')
     ]).catch(()=>{});
+    
+    // Enviar e-mails de confirmação
+    const horarioFmt = new Date(ag.horario_agendado).toLocaleString('pt-BR',{timeZone:'America/Fortaleza',day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit'});
+    enviarEmailConfirmacaoEspecialista({ especialista: ag.especialista_nome, especialidade: ag.especialidade, paciente: ag.paciente_nome, email: ag.paciente_email, horario: horarioFmt }).catch(()=>{});
+    enviarEmailConfirmacaoAdmin({ especialidade: ag.especialidade, especialista: ag.especialista_nome, paciente: ag.paciente_nome, email: ag.paciente_email, horario: horarioFmt, status: 'confirmado' }).catch(()=>{});
   } catch(e) { console.error('[ESP-WH]', e.message); }
 });
 
@@ -3358,7 +3539,8 @@ app.delete('/api/especialistas/agendamento/:id/cancelar', authPaciente, async (r
     const agId = parseInt(req.params.id, 10);
     if (!agId) return res.status(400).json({ ok: false, error: 'ID inválido' });
     const { rows } = await pool.query(
-      `SELECT id, pagamento_status FROM agendamentos_especialistas
+      `SELECT id, pagamento_status, especialista_nome, especialidade, paciente_nome, paciente_email, horario_agendado
+         FROM agendamentos_especialistas
         WHERE id = $1 AND paciente_id = $2 LIMIT 1`,
       [agId, req.pacienteId]
     );
@@ -3366,11 +3548,52 @@ app.delete('/api/especialistas/agendamento/:id/cancelar', authPaciente, async (r
     if (rows[0].pagamento_status === 'confirmado')
       return res.status(400).json({ ok: false, error: 'Sessão já paga não pode ser cancelada aqui.' });
     await pool.query(`UPDATE agendamentos_especialistas SET status='cancelado' WHERE id=$1`, [agId]);
+    
+    const ag = rows[0];
+    const horarioFmt = new Date(ag.horario_agendado).toLocaleString('pt-BR',{timeZone:'America/Fortaleza',day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit'});
+    enviarEmailCancelamentoAdmin({ especialidade: ag.especialidade, especialista: ag.especialista_nome, paciente: ag.paciente_nome, email: ag.paciente_email, horario: horarioFmt, motivo: 'Paciente cancelou' }).catch(()=>{});
+    
     return res.json({ ok: true });
   } catch(e) {
     console.error('[ESP-CANCELAR]', e.message);
     return res.status(500).json({ ok: false, error: e.message });
   }
+});
+
+// ── ESPECIALISTA: listar agendamentos ─────────────────────────────────────────
+app.get('/api/especialista/agendamentos', authEspecialista, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, paciente_nome, paciente_email, paciente_tel, horario_agendado, valor_cobrado, pagamento_status, status, created_at
+         FROM agendamentos_especialistas
+        WHERE especialista_id = $1
+        ORDER BY horario_agendado DESC LIMIT 100`,
+      [req.especialistaId]
+    );
+    return res.json({ ok: true, agendamentos: rows });
+  } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// ── ESPECIALISTA: cancelar agendamento ───────────────────────────────────────
+app.delete('/api/especialista/agendamento/:id/cancelar', authEspecialista, async (req, res) => {
+  try {
+    const agId = parseInt(req.params.id, 10);
+    if (!agId) return res.status(400).json({ ok: false, error: 'ID inválido' });
+    const { rows } = await pool.query(
+      `SELECT id, especialista_id, especialista_nome, especialidade, paciente_nome, paciente_email, horario_agendado
+         FROM agendamentos_especialistas
+        WHERE id = $1 AND especialista_id = $2 LIMIT 1`,
+      [agId, req.especialistaId]
+    );
+    if (!rows[0]) return res.status(404).json({ ok: false, error: 'Agendamento não encontrado' });
+    await pool.query(`UPDATE agendamentos_especialistas SET status='cancelado' WHERE id=$1`, [agId]);
+    
+    const ag = rows[0];
+    const horarioFmt = new Date(ag.horario_agendado).toLocaleString('pt-BR',{timeZone:'America/Fortaleza',day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit'});
+    enviarEmailCancelamentoAdmin({ especialidade: ag.especialidade, especialista: ag.especialista_nome, paciente: ag.paciente_nome, email: ag.paciente_email, horario: horarioFmt, motivo: 'Profissional cancelou' }).catch(()=>{});
+    
+    return res.json({ ok: true });
+  } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
 });
 
 // ── ESPECIALISTAS: cartão EFI ─────────────────────────────────────────────────
