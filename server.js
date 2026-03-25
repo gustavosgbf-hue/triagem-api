@@ -3463,7 +3463,7 @@ app.put('/api/admin/especialista/:id', checkAdmin, async (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
     if (!id) return res.status(400).json({ ok: false, error: 'ID inválido' });
-    const { email, nome_exibicao, bio, valor_consulta, crm, uf, ativo } = req.body || {};
+    const { email, nome_exibicao, bio, valor_consulta, crm, uf, ativo, visivel } = req.body || {};
     const updates = [];
     const params = [];
     let idx = 1;
@@ -3474,9 +3474,10 @@ app.put('/api/admin/especialista/:id', checkAdmin, async (req, res) => {
     if (crm !== undefined) { updates.push(`crm = $${idx++}`); params.push(crm?.trim().toUpperCase()); }
     if (uf !== undefined) { updates.push(`uf = $${idx++}`); params.push(uf?.trim().toUpperCase()); }
     if (ativo !== undefined) { updates.push(`ativo = $${idx++}`); params.push(!!ativo); }
+    if (visivel !== undefined) { updates.push(`visivel = $${idx++}`); params.push(!!visivel); }
     if (!updates.length) return res.status(400).json({ ok: false, error: 'Nenhum campo para atualizar' });
     params.push(id);
-    const { rows } = await pool.query(`UPDATE especialistas SET ${updates.join(', ')} WHERE id = $${idx} RETURNING id, nome_exibicao, email, ativo`, params);
+    const { rows } = await pool.query(`UPDATE especialistas SET ${updates.join(', ')} WHERE id = $${idx} RETURNING id, nome_exibicao, email, ativo, visivel`, params);
     if (!rows.length) return res.status(404).json({ ok: false, error: 'Especialista não encontrado' });
     return res.json({ ok: true, especialista: rows[0] });
   } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
