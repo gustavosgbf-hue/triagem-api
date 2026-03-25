@@ -3512,7 +3512,8 @@ app.get("/api/disponibilidade", async (req, res) => {
         hora>=HORA_FIM ? agoraFtz.getUTCDate()+1 : agoraFtz.getUTCDate(),
         HORA_INICIO+3, 0, 0, 0
       ));
-      horarioRetorno=diaRetorno.toLocaleString("pt-BR",{timeZone:"America/Fortaleza",hour:"2-digit",minute:"2-digit",day:"2-digit",month:"2-digit"});
+      const dataStr=diaRetorno.toLocaleDateString("pt-BR",{timeZone:"America/Fortaleza",day:"2-digit",month:"2-digit"});
+      horarioRetorno=HORA_INICIO+"h do dia "+dataStr;
       mensagem='Atendimento disponível das '+HORA_INICIO+'h às '+HORA_FIM+'h';
     }
     // Agendamento removido — fluxo 100% sob demanda imediata
