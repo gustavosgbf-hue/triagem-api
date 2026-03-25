@@ -439,6 +439,9 @@ async function initDB() {
     )`).catch(()=>{});
     await pool.query(`ALTER TABLE especialistas ADD COLUMN IF NOT EXISTS email TEXT`).catch(()=>{});
     await pool.query(`ALTER TABLE especialistas ADD COLUMN IF NOT EXISTS visivel BOOLEAN DEFAULT true`).catch(()=>{});
+    await pool.query(`ALTER TABLE especialistas ADD COLUMN IF NOT EXISTS foto_url TEXT`).catch(()=>{});
+    await pool.query(`ALTER TABLE especialistas ADD COLUMN IF NOT EXISTS bio TEXT`).catch(()=>{});
+    await pool.query(`ALTER TABLE especialistas ADD COLUMN IF NOT EXISTS disponibilidade TEXT`).catch(()=>{});
     await pool.query(`CREATE TABLE IF NOT EXISTS agendamentos_especialistas (
       id                      SERIAL PRIMARY KEY,
       especialista_id         INTEGER NOT NULL REFERENCES especialistas(id),
