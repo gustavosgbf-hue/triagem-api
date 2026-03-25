@@ -1302,9 +1302,48 @@ app.get("/api/chat/:atendimentoId", async (req, res) => {
 
 app.get("/api/atendimento/status/:id", async (req, res) => {
   try {
-    const result = await pool.query(`SELECT id,status,tipo,medico_nome,meet_link,criado_em,assumido_em,encerrado_em,nome,tel,cpf,data_nascimento,idade,sexo,alergias,cronicas,medicacoes,queixa,email FROM fila_atendimentos WHERE id=$1`,[req.params.id]);
-    if (result.rowCount===0) return res.status(404).json({ ok: false, error: "Atendimento nao encontrado" });
-    return res.json({ ok: true, atendimento: result.rows[0] });
+    const result = await pool.query(
+      `SELECT id, status, tipo, medico_nome, meet_link, criado_em, assumido_em, encerrado_em,
+              nome, tel, cpf, data_nascimento, idade, sexo, alergias, cronicas, medicacoes, queixa, email,
+              pagamento_status, pagbank_order_id, efi_charge_id
+         FROM fila_atendimentos WHERE id = $1`,
+      [req.params.id]
+    );
+    if (result.rowCount === 0) return res.status(404).json({ ok: false, error: "Atendimento nao encontrado" });
+
+    const at = result.rows[0];
+
+    // Fallback: se pagamento ainda pendente, consulta PagBank diretamente
+    // (cobre atraso de webhook ou reconexão do usuário antes do webhook chegar)
+    if (at.pagamento_status === 'pendente' && at.pagbank_order_id && PAGBANK_TOKEN) {
+      try {
+        const pbRes  = await fetch(`${PAGBANK_URL}/orders/${at.pagbank_order_id}`, {
+          headers: { Authorization: `Bearer ${PAGBANK_TOKEN}`, accept: 'application/json' }
+        });
+        const pbData = await pbRes.json();
+        const pago   = pbData.charges?.some(c => c.status === 'PAID') || false;
+        if (pago) {
+          await pool.query(
+            `UPDATE fila_atendimentos
+                SET pagamento_status        = 'confirmado',
+                    pagamento_confirmado_em = NOW(),
+                    status = CASE
+                      WHEN status = 'pagamento_pendente' THEN 'triagem'
+                      ELSE status
+                    END
+              WHERE id = $1 AND pagamento_status = 'pendente'`,
+            [at.id]
+          ).catch(e => console.warn('[STATUS-FALLBACK] Update PagBank:', e.message));
+          at.pagamento_status = 'confirmado';
+          if (at.status === 'pagamento_pendente') at.status = 'triagem';
+          console.log(`[STATUS-FALLBACK] Atendimento #${at.id} confirmado via consulta PagBank direta`);
+        }
+      } catch (e) {
+        console.warn('[STATUS-FALLBACK] Falha ao consultar PagBank:', e.message);
+      }
+    }
+
+    return res.json({ ok: true, atendimento: at });
   } catch (e) { return res.status(500).json({ ok: false, error: "Erro ao buscar status" }); }
 });
 
