@@ -3454,9 +3454,31 @@ app.post('/api/especialista/esqueci-senha', rlLogin, async (req, res) => {
     if (!email) return res.status(400).json({ ok: false, error: 'Email obrigatório' });
     const { rows } = await pool.query('SELECT id, nome_exibicao, email FROM especialistas WHERE email = $1', [email.toLowerCase().trim()]);
     if (!rows.length) return res.json({ ok: true, message: 'Se o email existir, você receberá instruções.' });
-    // Por segurança, não informamos se o email existe ou não
-    // Implementação real seria com token de reset via email
     return res.json({ ok: true, message: 'Se o email existir, você receberá instruções.' });
+  } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// ── ADMIN: atualizar especialista ──────────────────────────────────────────
+app.put('/api/admin/especialista/:id', checkAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).json({ ok: false, error: 'ID inválido' });
+    const { email, nome_exibicao, bio, valor_consulta, crm, uf, ativo } = req.body || {};
+    const updates = [];
+    const params = [];
+    let idx = 1;
+    if (email !== undefined) { updates.push(`email = $${idx++}`); params.push(email?.trim().toLowerCase() || null); }
+    if (nome_exibicao !== undefined) { updates.push(`nome_exibicao = $${idx++}`); params.push(nome_exibicao?.trim()); }
+    if (bio !== undefined) { updates.push(`bio = $${idx++}`); params.push(bio?.trim()); }
+    if (valor_consulta !== undefined) { updates.push(`valor_consulta = $${idx++}`); params.push(parseFloat(valor_consulta)); }
+    if (crm !== undefined) { updates.push(`crm = $${idx++}`); params.push(crm?.trim().toUpperCase()); }
+    if (uf !== undefined) { updates.push(`uf = $${idx++}`); params.push(uf?.trim().toUpperCase()); }
+    if (ativo !== undefined) { updates.push(`ativo = $${idx++}`); params.push(!!ativo); }
+    if (!updates.length) return res.status(400).json({ ok: false, error: 'Nenhum campo para atualizar' });
+    params.push(id);
+    const { rows } = await pool.query(`UPDATE especialistas SET ${updates.join(', ')} WHERE id = $${idx} RETURNING id, nome_exibicao, email, ativo`, params);
+    if (!rows.length) return res.status(404).json({ ok: false, error: 'Especialista não encontrado' });
+    return res.json({ ok: true, especialista: rows[0] });
   } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
 });
 
