@@ -217,63 +217,6 @@ async function initDB() {
         status TEXT NOT NULL DEFAULT 'pendente',
         criado_em TIMESTAMP DEFAULT NOW()
       )`);
-
-    // ── INIT: tabelas de especialistas ────────────────────────────────────────────
-// Dentro de initDB(), no final do bloco try:
-
-await pool.query(`CREATE TABLE IF NOT EXISTS especialistas (
-  id            SERIAL PRIMARY KEY,
-  nome          TEXT NOT NULL,
-  nome_exibicao TEXT NOT NULL,
-  especialidade TEXT NOT NULL,  -- 'psiquiatria' | 'dermatologia' | 'endocrinologia'
-  crm           TEXT NOT NULL,
-  uf            TEXT NOT NULL,
-  valor_consulta NUMERIC(10,2) NOT NULL,
-  foto_url      TEXT,
-  bio           TEXT,
-  ativo         BOOLEAN NOT NULL DEFAULT true,
-  created_at    TIMESTAMP DEFAULT NOW()
-)`).catch(()=>{});
-
-await pool.query(`CREATE TABLE IF NOT EXISTS agendamentos_especialistas (
-  id                      SERIAL PRIMARY KEY,
-  especialista_id         INTEGER NOT NULL REFERENCES especialistas(id),
-  especialista_nome       TEXT NOT NULL,
-  especialidade           TEXT NOT NULL,
-  paciente_nome           TEXT NOT NULL,
-  paciente_email          TEXT NOT NULL,
-  paciente_tel            TEXT,
-  paciente_cpf            TEXT,
-  horario_agendado        TIMESTAMP NOT NULL,
-  valor_cobrado           NUMERIC(10,2) NOT NULL,
-  pagamento_metodo        TEXT,
-  pagamento_status        TEXT NOT NULL DEFAULT 'pendente',
-  pagbank_order_id        TEXT,
-  pagamento_confirmado_em TIMESTAMPTZ,
-  status                  TEXT NOT NULL DEFAULT 'pendente',
-  status_sessao           TEXT NOT NULL DEFAULT 'agendado',
-  valor_repasse           NUMERIC(10,2),
-  criado_em               TIMESTAMP DEFAULT NOW()
-)`).catch(()=>{});
-
-await pool.query(`CREATE INDEX IF NOT EXISTS idx_ag_esp_especialista ON agendamentos_especialistas(especialista_id)`).catch(()=>{});
-await pool.query(`CREATE INDEX IF NOT EXISTS idx_ag_esp_pagbank ON agendamentos_especialistas(pagbank_order_id)`).catch(()=>{});
-await pool.query(`CREATE INDEX IF NOT EXISTS idx_ag_esp_status ON agendamentos_especialistas(pagamento_status)`).catch(()=>{});
-
-// ── LEAD CAPTURE: tabela de leads antes do pagamento ─────────────────────────
-await pool.query(`CREATE TABLE IF NOT EXISTS leads_agendamento (
-  id              SERIAL PRIMARY KEY,
-  nome            TEXT,
-  email           TEXT,
-  tel             TEXT,
-  especialidade   TEXT,
-  profissional    TEXT,
-  horario         TEXT,
-  modulo          TEXT NOT NULL DEFAULT 'especialistas', -- 'psicologia' | 'especialistas'
-  status          TEXT NOT NULL DEFAULT 'iniciou_agendamento',
-  criado_em       TIMESTAMP DEFAULT NOW()
-)`).catch(()=>{});
-    
     await pool.query(`ALTER TABLE medicos ADD COLUMN IF NOT EXISTS role TEXT NOT NULL DEFAULT 'medico'`);
     await pool.query(`ALTER TABLE medicos ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pendente'`);
     await pool.query(`ALTER TABLE medicos ADD COLUMN IF NOT EXISTS uf TEXT`);
@@ -410,6 +353,56 @@ await pool.query(`CREATE TABLE IF NOT EXISTS leads_agendamento (
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_fila_pagbank_order ON fila_atendimentos(pagbank_order_id)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_fila_efi_charge ON fila_atendimentos(efi_charge_id)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_fila_pagamento_status ON fila_atendimentos(pagamento_status)`);
+    // ── ESPECIALISTAS ──────────────────────────────────────────────────────────
+    await pool.query(`CREATE TABLE IF NOT EXISTS especialistas (
+      id             SERIAL PRIMARY KEY,
+      nome           TEXT NOT NULL,
+      nome_exibicao  TEXT NOT NULL,
+      especialidade  TEXT NOT NULL,
+      crm            TEXT NOT NULL,
+      uf             TEXT NOT NULL,
+      valor_consulta NUMERIC(10,2) NOT NULL,
+      foto_url       TEXT,
+      bio            TEXT,
+      ativo          BOOLEAN NOT NULL DEFAULT true,
+      created_at     TIMESTAMP DEFAULT NOW()
+    )`).catch(()=>{});
+    await pool.query(`CREATE TABLE IF NOT EXISTS agendamentos_especialistas (
+      id                      SERIAL PRIMARY KEY,
+      especialista_id         INTEGER NOT NULL REFERENCES especialistas(id),
+      especialista_nome       TEXT NOT NULL,
+      especialidade           TEXT NOT NULL,
+      paciente_nome           TEXT NOT NULL,
+      paciente_email          TEXT NOT NULL,
+      paciente_tel            TEXT,
+      paciente_cpf            TEXT,
+      horario_agendado        TIMESTAMP NOT NULL,
+      valor_cobrado           NUMERIC(10,2) NOT NULL,
+      pagamento_metodo        TEXT,
+      pagamento_status        TEXT NOT NULL DEFAULT 'pendente',
+      pagbank_order_id        TEXT,
+      pagamento_confirmado_em TIMESTAMPTZ,
+      status                  TEXT NOT NULL DEFAULT 'pendente',
+      status_sessao           TEXT NOT NULL DEFAULT 'agendado',
+      valor_repasse           NUMERIC(10,2),
+      criado_em               TIMESTAMP DEFAULT NOW()
+    )`).catch(()=>{});
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_ag_esp_especialista ON agendamentos_especialistas(especialista_id)`).catch(()=>{});
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_ag_esp_pagbank ON agendamentos_especialistas(pagbank_order_id)`).catch(()=>{});
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_ag_esp_status ON agendamentos_especialistas(pagamento_status)`).catch(()=>{});
+    // ── LEADS ──────────────────────────────────────────────────────────────────
+    await pool.query(`CREATE TABLE IF NOT EXISTS leads_agendamento (
+      id            SERIAL PRIMARY KEY,
+      nome          TEXT,
+      email         TEXT,
+      tel           TEXT,
+      especialidade TEXT,
+      profissional  TEXT,
+      horario       TEXT,
+      modulo        TEXT NOT NULL DEFAULT 'especialistas',
+      status        TEXT NOT NULL DEFAULT 'iniciou_agendamento',
+      criado_em     TIMESTAMP DEFAULT NOW()
+    )`).catch(()=>{});
     console.log("[DB] Tabelas, colunas e índices verificados com sucesso");
   } catch (e) {
     console.error("[DB] Erro no initDB:", e.message);
@@ -2875,6 +2868,262 @@ app.get('/api/psicologo/:id', rlGeral, async (req, res) => {
   } catch (err) { return res.status(500).json({ ok: false, error: err.message }); }
 });
 
+// ── LEAD CAPTURE ─────────────────────────────────────────────────────────────
+app.post('/api/lead/registrar', rlGeral, async (req, res) => {
+  try {
+    const { nome, email, tel, especialidade, profissional, horario, modulo } = req.body || {};
+    const agora = new Date().toLocaleString('pt-BR', { timeZone: 'America/Fortaleza' });
+    await pool.query(
+      `INSERT INTO leads_agendamento (nome, email, tel, especialidade, profissional, horario, modulo, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,'iniciou_agendamento')`,
+      [nome||'', email||'', tel||'', especialidade||'', profissional||'', horario||'', modulo||'especialistas']
+    );
+    appendToSheet('Leads_Agendamento', [
+      agora, nome||'', email||'', tel||'', especialidade||'', profissional||'', horario||'', modulo||'especialistas', 'iniciou_agendamento'
+    ]).catch(()=>{});
+    return res.json({ ok: true });
+  } catch(e) {
+    console.error('[LEAD]', e.message);
+    return res.json({ ok: true }); // nunca bloqueia o fluxo
+  }
+});
+
+// ── ESPECIALISTAS: listar por especialidade ───────────────────────────────────
+app.get('/api/especialistas/:especialidade', rlGeral, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, nome_exibicao, especialidade, crm, uf, valor_consulta, foto_url, bio
+         FROM especialistas
+        WHERE especialidade = $1 AND ativo = true
+        ORDER BY id ASC`,
+      [req.params.especialidade]
+    );
+    return res.json({ ok: true, especialistas: rows });
+  } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// ── ESPECIALISTAS: horários ocupados ─────────────────────────────────────────
+app.get('/api/especialistas/horarios-ocupados/:especialistaId', rlGeral, async (req, res) => {
+  try {
+    const dias = Math.min(parseInt(req.query.dias || '14', 10), 60);
+    const { rows } = await pool.query(
+      `SELECT horario_agendado FROM agendamentos_especialistas
+        WHERE especialista_id = $1
+          AND status NOT IN ('cancelado')
+          AND horario_agendado >= NOW()
+          AND horario_agendado <= NOW() + ($2 || ' days')::interval
+        ORDER BY horario_agendado`,
+      [req.params.especialistaId, dias]
+    );
+    return res.json({ ok: true, ocupados: rows.map(r => new Date(r.horario_agendado).toISOString()) });
+  } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// ── ESPECIALISTAS: criar agendamento ─────────────────────────────────────────
+app.post('/api/especialistas/agendamento/criar', rlGeral, async (req, res) => {
+  try {
+    const { especialistaId, horario_agendado, paciente_nome, paciente_email, paciente_tel, paciente_cpf } = req.body || {};
+    if (!especialistaId || !horario_agendado || !paciente_nome || !paciente_email) {
+      return res.status(400).json({ ok: false, error: 'Dados obrigatórios faltando' });
+    }
+    const espRes = await pool.query(
+      `SELECT id, nome_exibicao, especialidade, valor_consulta, ativo FROM especialistas WHERE id = $1 LIMIT 1`,
+      [especialistaId]
+    );
+    if (espRes.rowCount === 0 || !espRes.rows[0].ativo) {
+      return res.status(404).json({ ok: false, error: 'Especialista não encontrado' });
+    }
+    const esp = espRes.rows[0];
+    const slotStart = new Date(horario_agendado);
+    if (isNaN(slotStart.getTime())) return res.status(400).json({ ok: false, error: 'Horário inválido' });
+    const slotEnd = new Date(slotStart.getTime() + 60 * 60 * 1000);
+    const conflito = await pool.query(
+      `SELECT id FROM agendamentos_especialistas
+        WHERE especialista_id = $1
+          AND horario_agendado >= $2 AND horario_agendado < $3
+          AND status NOT IN ('cancelado') LIMIT 1`,
+      [especialistaId, slotStart.toISOString(), slotEnd.toISOString()]
+    );
+    if (conflito.rowCount > 0) return res.status(409).json({ ok: false, error: 'Horário indisponível. Escolha outro.' });
+    const result = await pool.query(
+      `INSERT INTO agendamentos_especialistas
+        (especialista_id, especialista_nome, especialidade, paciente_nome, paciente_email,
+         paciente_tel, paciente_cpf, horario_agendado, valor_cobrado)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+       RETURNING id, valor_cobrado`,
+      [especialistaId, esp.nome_exibicao, esp.especialidade, paciente_nome, paciente_email,
+       paciente_tel||'', paciente_cpf||'', slotStart.toISOString(), esp.valor_consulta]
+    );
+    const ag = result.rows[0];
+    console.log('[ESP-AGEND] Criado #'+ag.id+' — '+esp.especialidade+'/'+esp.nome_exibicao);
+    return res.json({ ok: true, agendamentoId: ag.id, valor: ag.valor_cobrado });
+  } catch(e) {
+    console.error('[ESP-AGEND]', e.message);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── ESPECIALISTAS: PIX PagBank ────────────────────────────────────────────────
+app.post('/api/especialistas/pagbank/order', rlGeral, async (req, res) => {
+  try {
+    const { agendamentoId, nome, email, cpf } = req.body || {};
+    if (!agendamentoId || !nome || !cpf) return res.status(400).json({ ok: false, error: 'Dados obrigatórios faltando' });
+    if (!PAGBANK_TOKEN) return res.status(503).json({ ok: false, error: 'Gateway indisponível' });
+    const agRes = await pool.query(
+      `SELECT id, valor_cobrado, pagamento_status, especialista_nome, especialidade,
+              horario_agendado, especialista_id
+         FROM agendamentos_especialistas WHERE id = $1 LIMIT 1`,
+      [agendamentoId]
+    );
+    if (agRes.rowCount === 0) return res.status(404).json({ ok: false, error: 'Agendamento não encontrado' });
+    const ag = agRes.rows[0];
+    if (ag.pagamento_status === 'confirmado') return res.status(409).json({ ok: false, error: 'Já pago' });
+    // Re-verifica conflito (race condition)
+    const slotStart = new Date(ag.horario_agendado);
+    const slotEnd   = new Date(slotStart.getTime() + 60 * 60 * 1000);
+    const conflito  = await pool.query(
+      `SELECT id FROM agendamentos_especialistas
+        WHERE especialista_id = $1 AND horario_agendado >= $2 AND horario_agendado < $3
+          AND id <> $4 AND status NOT IN ('cancelado') LIMIT 1`,
+      [ag.especialista_id, slotStart.toISOString(), slotEnd.toISOString(), agendamentoId]
+    );
+    if (conflito.rowCount > 0) {
+      await pool.query(`UPDATE agendamentos_especialistas SET status='cancelado' WHERE id=$1`, [agendamentoId]);
+      return res.status(409).json({ ok: false, error: 'Horário indisponível. Escolha outro.' });
+    }
+    const valorCentavos = Math.round(parseFloat(ag.valor_cobrado) * 100);
+    const expiracao = new Date(Date.now() + 30 * 60 * 1000);
+    const orderBody = {
+      reference_id: 'CJ-ESP-'+agendamentoId+'-'+Date.now(),
+      customer: {
+        name:   nome,
+        email:  email || 'paciente.'+cpf.replace(/\D/g,'')+'@consultaja24h.com.br',
+        tax_id: cpf.replace(/\D/g, '')
+      },
+      items: [{ name: 'Consulta '+ag.especialidade+' — '+ag.especialista_nome, quantity: 1, unit_amount: valorCentavos }],
+      qr_codes: [{ amount: { value: valorCentavos }, expiration_date: expiracao.toISOString().replace('Z', '-03:00') }],
+      notification_urls: [`${process.env.API_URL || 'https://triagem-api.onrender.com'}/api/especialistas/pagbank/webhook`]
+    };
+    const response = await fetch(`${PAGBANK_URL}/orders`, {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${PAGBANK_TOKEN}`, 'Content-Type': 'application/json', 'accept': 'application/json' },
+      body: JSON.stringify(orderBody)
+    });
+    const data = await response.json();
+    if (!response.ok) return res.status(400).json({ ok: false, error: data.error_messages || 'Erro ao gerar PIX' });
+    const qrCode = data.qr_codes?.[0];
+    if (!qrCode?.text) return res.status(502).json({ ok: false, error: 'PagBank não retornou QR Code' });
+    await pool.query(
+      `UPDATE agendamentos_especialistas SET pagbank_order_id = $1, pagamento_metodo = 'pix' WHERE id = $2`,
+      [data.id, agendamentoId]
+    );
+    const agora = new Date().toLocaleString('pt-BR', { timeZone: 'America/Fortaleza' });
+    appendToSheet('Leads_Agendamento', [
+      agora, nome, email||'', cpf||'', ag.especialidade, ag.especialista_nome,
+      slotStart.toLocaleString('pt-BR',{timeZone:'America/Fortaleza'}), 'especialistas', 'pix_gerado'
+    ]).catch(()=>{});
+    console.log('[ESP-PAGBANK] Order criada — agendamento #'+agendamentoId+' order:'+data.id);
+    return res.json({ ok: true, order_id: data.id, qr_code_text: qrCode.text, valor: ag.valor_cobrado });
+  } catch(e) {
+    console.error('[ESP-PAGBANK]', e.message);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── ESPECIALISTAS: webhook PagBank ────────────────────────────────────────────
+app.post('/api/especialistas/pagbank/webhook', async (req, res) => {
+  const event = req.body;
+  res.sendStatus(200);
+  if (!event || typeof event !== 'object') return;
+  const orderId = String(event?.data?.id || event?.id || '');
+  const charges = event?.data?.charges || event?.charges || [];
+  const pago    = charges.some(c => c.status === 'PAID');
+  if (!pago || !orderId) return;
+  try {
+    const { rows } = await pool.query(
+      `UPDATE agendamentos_especialistas
+          SET pagamento_status = 'confirmado', pagamento_confirmado_em = NOW(), status = 'confirmado'
+        WHERE pagbank_order_id = $1 AND pagamento_status = 'pendente'
+        RETURNING id, paciente_nome, paciente_email, especialista_nome, especialidade,
+                  horario_agendado, valor_cobrado`,
+      [orderId]
+    );
+    if (rows.length === 0) { console.log('[ESP-WH] Order não encontrada ou já processada:', orderId); return; }
+    const ag = rows[0];
+    console.log('[ESP-WH] Confirmado #'+ag.id+' — '+ag.especialidade+'/'+ag.especialista_nome);
+    const agora = new Date().toLocaleString('pt-BR', { timeZone: 'America/Fortaleza' });
+    appendToSheet('Especialistas_Confirmados', [
+      agora, ag.id, ag.paciente_nome, ag.paciente_email||'', ag.especialidade, ag.especialista_nome,
+      new Date(ag.horario_agendado).toLocaleString('pt-BR',{timeZone:'America/Fortaleza'}),
+      'R$ '+parseFloat(ag.valor_cobrado).toFixed(2).replace('.',',')
+    ]).catch(()=>{});
+  } catch(e) { console.error('[ESP-WH]', e.message); }
+});
+
+// ── ESPECIALISTAS: polling status ─────────────────────────────────────────────
+app.get('/api/especialistas/agendamento/:id/status', rlGeral, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, pagamento_status, status, valor_cobrado, especialista_nome, especialidade, horario_agendado
+         FROM agendamentos_especialistas WHERE id = $1 LIMIT 1`,
+      [req.params.id]
+    );
+    if (rows.length === 0) return res.status(404).json({ ok: false, error: 'Não encontrado' });
+    return res.json({ ok: true, agendamento: rows[0] });
+  } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// ── ESPECIALISTAS: admin — cadastrar especialista ─────────────────────────────
+app.post('/api/admin/especialista/criar', checkAdmin, async (req, res) => {
+  try {
+    const { nome, nome_exibicao, especialidade, crm, uf, valor_consulta, bio, foto_url } = req.body || {};
+    if (!nome || !especialidade || !crm || !uf || !valor_consulta) {
+      return res.status(400).json({ ok: false, error: 'nome, especialidade, crm, uf e valor_consulta são obrigatórios' });
+    }
+    const { rows } = await pool.query(
+      `INSERT INTO especialistas (nome, nome_exibicao, especialidade, crm, uf, valor_consulta, bio, foto_url)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id, nome_exibicao, especialidade`,
+      [nome.trim(), (nome_exibicao||nome).trim(), especialidade.trim().toLowerCase(),
+       crm.trim().toUpperCase(), uf.trim().toUpperCase(),
+       parseFloat(String(valor_consulta).replace(',','.')),
+       bio||'', foto_url||'']
+    );
+    console.log('[ESP-ADMIN] Especialista criado #'+rows[0].id+' — '+rows[0].especialidade);
+    return res.json({ ok: true, especialista: rows[0] });
+  } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// ── ESPECIALISTAS: admin — listar todos ──────────────────────────────────────
+app.get('/api/admin/especialistas', checkAdmin, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, nome_exibicao, especialidade, crm, uf, valor_consulta, ativo, created_at
+         FROM especialistas ORDER BY especialidade, id`
+    );
+    return res.json({ ok: true, especialistas: rows });
+  } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// ── ESPECIALISTAS: admin — listar agendamentos ────────────────────────────────
+app.get('/api/admin/especialistas/agendamentos', checkAdmin, async (req, res) => {
+  try {
+    const { especialidade, status } = req.query;
+    let where = '1=1';
+    const params = [];
+    if (especialidade) { params.push(especialidade); where += ' AND especialidade = $'+params.length; }
+    if (status)        { params.push(status);        where += ' AND pagamento_status = $'+params.length; }
+    const { rows } = await pool.query(
+      `SELECT id, especialista_nome, especialidade, paciente_nome, paciente_email,
+              horario_agendado, valor_cobrado, pagamento_status, status, criado_em
+         FROM agendamentos_especialistas WHERE ${where} ORDER BY criado_em DESC LIMIT 200`,
+      params
+    );
+    return res.json({ ok: true, agendamentos: rows });
+  } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// ── FIM ESPECIALISTAS ─────────────────────────────────────────────────────────
+
 app.patch("/api/admin/medico/:id/aprovar", checkAdmin, async (req, res) => {
   try {
     const result = await pool.query(`UPDATE medicos SET ativo=true,status='aprovado' WHERE id=$1 RETURNING id,nome,email,status,ativo`,[req.params.id]);
@@ -4953,213 +5202,6 @@ app.get('/api/admin/psicologia/indicadores', checkAdmin, async (req, res) => {
 // ══════════════════════════════════════════════════════════════════════════════
 
 const PORT = process.env.PORT || 10000;
-
-// ── ESPECIALISTAS: listar por especialidade ───────────────────────────────────
-app.get('/api/especialistas/:especialidade', rlGeral, async (req, res) => {
-  try {
-    const { rows } = await pool.query(
-      `SELECT id, nome_exibicao, especialidade, crm, uf, valor_consulta, foto_url, bio
-         FROM especialistas
-        WHERE especialidade = $1 AND ativo = true
-        ORDER BY id ASC`,
-      [req.params.especialidade]
-    );
-    return res.json({ ok: true, especialistas: rows });
-  } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
-});
-
-// ── ESPECIALISTAS: horários ocupados ─────────────────────────────────────────
-app.get('/api/especialistas/horarios-ocupados/:especialistaId', rlGeral, async (req, res) => {
-  try {
-    const dias = Math.min(parseInt(req.query.dias || '14', 10), 60);
-    const { rows } = await pool.query(
-      `SELECT horario_agendado FROM agendamentos_especialistas
-        WHERE especialista_id = $1
-          AND status NOT IN ('cancelado')
-          AND horario_agendado >= NOW()
-          AND horario_agendado <= NOW() + ($2 || ' days')::interval
-        ORDER BY horario_agendado`,
-      [req.params.especialistaId, dias]
-    );
-    return res.json({ ok: true, ocupados: rows.map(r => new Date(r.horario_agendado).toISOString()) });
-  } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
-});
-
-// ── LEAD CAPTURE: registrar interesse antes do pagamento ─────────────────────
-// Chamado pelo frontend imediatamente antes de criar o agendamento
-app.post('/api/lead/registrar', rlGeral, async (req, res) => {
-  try {
-    const { nome, email, tel, especialidade, profissional, horario, modulo } = req.body || {};
-    const agora = new Date().toLocaleString('pt-BR', { timeZone: 'America/Fortaleza' });
-    // Salva no banco
-    await pool.query(
-      `INSERT INTO leads_agendamento (nome, email, tel, especialidade, profissional, horario, modulo, status)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,'iniciou_agendamento')`,
-      [nome||'', email||'', tel||'', especialidade||'', profissional||'', horario||'', modulo||'especialistas']
-    );
-    // Salva no Sheets (não bloqueia)
-    appendToSheet('Leads_Agendamento', [
-      agora, nome||'', email||'', tel||'', especialidade||'', profissional||'', horario||'', modulo||'especialistas', 'iniciou_agendamento'
-    ]).catch(()=>{});
-    return res.json({ ok: true });
-  } catch(e) {
-    console.error('[LEAD]', e.message);
-    return res.json({ ok: true }); // nunca bloqueia o fluxo
-  }
-});
-
-// ── ESPECIALISTAS: criar agendamento ─────────────────────────────────────────
-// NÃO exige login — coleta dados inline igual à triagem médica
-app.post('/api/especialistas/agendamento/criar', rlGeral, async (req, res) => {
-  try {
-    const { especialistaId, horario_agendado, paciente_nome, paciente_email, paciente_tel, paciente_cpf } = req.body || {};
-    if (!especialistaId || !horario_agendado || !paciente_nome || !paciente_email) {
-      return res.status(400).json({ ok: false, error: 'Dados obrigatórios faltando' });
-    }
-    // Busca especialista e valor no backend — nunca confia no frontend
-    const espRes = await pool.query(
-      `SELECT id, nome_exibicao, especialidade, valor_consulta, ativo FROM especialistas WHERE id = $1 LIMIT 1`,
-      [especialistaId]
-    );
-    if (espRes.rowCount === 0 || !espRes.rows[0].ativo) {
-      return res.status(404).json({ ok: false, error: 'Especialista não encontrado' });
-    }
-    const esp = espRes.rows[0];
-    const slotStart = new Date(horario_agendado);
-    if (isNaN(slotStart.getTime())) return res.status(400).json({ ok: false, error: 'Horário inválido' });
-    const slotEnd = new Date(slotStart.getTime() + 60 * 60 * 1000);
-    // Verifica conflito
-    const conflito = await pool.query(
-      `SELECT id FROM agendamentos_especialistas
-        WHERE especialista_id = $1
-          AND horario_agendado >= $2 AND horario_agendado < $3
-          AND status NOT IN ('cancelado') LIMIT 1`,
-      [especialistaId, slotStart.toISOString(), slotEnd.toISOString()]
-    );
-    if (conflito.rowCount > 0) return res.status(409).json({ ok: false, error: 'Horário indisponível. Escolha outro.' });
-    const result = await pool.query(
-      `INSERT INTO agendamentos_especialistas
-        (especialista_id, especialista_nome, especialidade, paciente_nome, paciente_email,
-         paciente_tel, paciente_cpf, horario_agendado, valor_cobrado)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-       RETURNING id, valor_cobrado`,
-      [especialistaId, esp.nome_exibicao, esp.especialidade, paciente_nome, paciente_email,
-       paciente_tel||'', paciente_cpf||'', slotStart.toISOString(), esp.valor_consulta]
-    );
-    const ag = result.rows[0];
-    console.log(`[ESP-AGEND] Criado #${ag.id} — ${esp.especialidade}/${esp.nome_exibicao}`);
-    return res.json({ ok: true, agendamentoId: ag.id, valor: ag.valor_cobrado });
-  } catch(e) {
-    console.error('[ESP-AGEND]', e.message);
-    return res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-// ── ESPECIALISTAS: PIX PagBank ────────────────────────────────────────────────
-app.post('/api/especialistas/pagbank/order', rlGeral, async (req, res) => {
-  try {
-    const { agendamentoId, nome, email, cpf } = req.body || {};
-    if (!agendamentoId || !nome || !cpf) return res.status(400).json({ ok: false, error: 'Dados obrigatórios faltando' });
-    if (!PAGBANK_TOKEN) return res.status(503).json({ ok: false, error: 'Gateway indisponível' });
-    const agRes = await pool.query(
-      `SELECT id, valor_cobrado, pagamento_status, especialista_nome, especialidade, horario_agendado, especialista_id
-         FROM agendamentos_especialistas WHERE id = $1 LIMIT 1`,
-      [agendamentoId]
-    );
-    if (agRes.rowCount === 0) return res.status(404).json({ ok: false, error: 'Agendamento não encontrado' });
-    const ag = agRes.rows[0];
-    if (ag.pagamento_status === 'confirmado') return res.status(409).json({ ok: false, error: 'Já pago' });
-    // Re-verifica conflito (race condition)
-    const slotStart = new Date(ag.horario_agendado);
-    const slotEnd   = new Date(slotStart.getTime() + 60 * 60 * 1000);
-    const conflito  = await pool.query(
-      `SELECT id FROM agendamentos_especialistas
-        WHERE especialista_id = $1 AND horario_agendado >= $2 AND horario_agendado < $3
-          AND id <> $4 AND status NOT IN ('cancelado') LIMIT 1`,
-      [ag.especialista_id, slotStart.toISOString(), slotEnd.toISOString(), agendamentoId]
-    );
-    if (conflito.rowCount > 0) {
-      await pool.query(`UPDATE agendamentos_especialistas SET status='cancelado' WHERE id=$1`, [agendamentoId]);
-      return res.status(409).json({ ok: false, error: 'Horário indisponível. Escolha outro.' });
-    }
-    const valorCentavos = Math.round(parseFloat(ag.valor_cobrado) * 100);
-    const expiracao = new Date(Date.now() + 30 * 60 * 1000);
-    const orderBody = {
-      reference_id: `CJ-ESP-${agendamentoId}-${Date.now()}`,
-      customer: {
-        name:   nome,
-        email:  email || `paciente.${cpf.replace(/\D/g,'')}@consultaja24h.com.br`,
-        tax_id: cpf.replace(/\D/g, '')
-      },
-      items: [{ name: `Consulta ${ag.especialidade} — ${ag.especialista_nome}`, quantity: 1, unit_amount: valorCentavos }],
-      qr_codes: [{ amount: { value: valorCentavos }, expiration_date: expiracao.toISOString().replace('Z', '-03:00') }],
-      notification_urls: [`${process.env.API_URL || 'https://triagem-api.onrender.com'}/api/especialistas/pagbank/webhook`]
-    };
-    const response = await fetch(`${PAGBANK_URL}/orders`, {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${PAGBANK_TOKEN}`, 'Content-Type': 'application/json', 'accept': 'application/json' },
-      body: JSON.stringify(orderBody)
-    });
-    const data = await response.json();
-    if (!response.ok) return res.status(400).json({ ok: false, error: data.error_messages || 'Erro ao gerar PIX' });
-    const qrCode = data.qr_codes?.[0];
-    if (!qrCode?.text) return res.status(502).json({ ok: false, error: 'PagBank não retornou QR Code' });
-    await pool.query(
-      `UPDATE agendamentos_especialistas SET pagbank_order_id = $1, pagamento_metodo = 'pix' WHERE id = $2`,
-      [data.id, agendamentoId]
-    );
-    // Sheets: lead agora tem order gerada
-    const agora = new Date().toLocaleString('pt-BR', { timeZone: 'America/Fortaleza' });
-    appendToSheet('Leads_Agendamento', [agora, nome, email||'', cpf||'', ag.especialidade, ag.especialista_nome, slotStart.toLocaleString('pt-BR',{timeZone:'America/Fortaleza'}), 'especialistas', 'pix_gerado']).catch(()=>{});
-    return res.json({ ok: true, order_id: data.id, qr_code_text: qrCode.text, valor: ag.valor_cobrado });
-  } catch(e) {
-    console.error('[ESP-PAGBANK]', e.message);
-    return res.status(500).json({ ok: false, error: e.message });
-  }
-});
-
-// ── ESPECIALISTAS: webhook PagBank ────────────────────────────────────────────
-app.post('/api/especialistas/pagbank/webhook', async (req, res) => {
-  const event = req.body;
-  res.sendStatus(200);
-  if (!event || typeof event !== 'object') return;
-  const orderId = String(event?.data?.id || event?.id || '');
-  const charges = event?.data?.charges || event?.charges || [];
-  const pago    = charges.some(c => c.status === 'PAID');
-  if (!pago || !orderId) return;
-  try {
-    const { rows } = await pool.query(
-      `UPDATE agendamentos_especialistas
-          SET pagamento_status = 'confirmado', pagamento_confirmado_em = NOW(), status = 'confirmado'
-        WHERE pagbank_order_id = $1 AND pagamento_status = 'pendente'
-        RETURNING id, paciente_nome, especialista_nome, especialidade, horario_agendado, valor_cobrado, paciente_email`,
-      [orderId]
-    );
-    if (rows.length === 0) return;
-    const ag = rows[0];
-    console.log(`[ESP-WH] Confirmado #${ag.id} — ${ag.especialidade}/${ag.especialista_nome}`);
-    // E-mail admin
-    const agora = new Date().toLocaleString('pt-BR', { timeZone: 'America/Fortaleza' });
-    appendToSheet('Especialistas_Confirmados', [
-      agora, ag.id, ag.paciente_nome, ag.paciente_email||'', ag.especialidade, ag.especialista_nome,
-      new Date(ag.horario_agendado).toLocaleString('pt-BR',{timeZone:'America/Fortaleza'}),
-      'R$ '+parseFloat(ag.valor_cobrado).toFixed(2).replace('.',',')
-    ]).catch(()=>{});
-  } catch(e) { console.error('[ESP-WH]', e.message); }
-});
-
-// ── ESPECIALISTAS: polling status ─────────────────────────────────────────────
-app.get('/api/especialistas/agendamento/:id/status', rlGeral, async (req, res) => {
-  try {
-    const { rows } = await pool.query(
-      `SELECT id, pagamento_status, status, valor_cobrado, especialista_nome, especialidade, horario_agendado
-         FROM agendamentos_especialistas WHERE id = $1 LIMIT 1`,
-      [req.params.id]
-    );
-    if (rows.length === 0) return res.status(404).json({ ok: false, error: 'Não encontrado' });
-    return res.json({ ok: true, agendamento: rows[0] });
-  } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
-});
 
 app.listen(PORT, () => {
   console.log("Servidor rodando na porta", PORT);
