@@ -2888,21 +2888,8 @@ app.post('/api/lead/registrar', rlGeral, async (req, res) => {
   }
 });
 
-// ── ESPECIALISTAS: listar por especialidade ───────────────────────────────────
-app.get('/api/especialistas/:especialidade', rlGeral, async (req, res) => {
-  try {
-    const { rows } = await pool.query(
-      `SELECT id, nome_exibicao, especialidade, crm, uf, valor_consulta, foto_url, bio
-         FROM especialistas
-        WHERE especialidade = $1 AND ativo = true
-        ORDER BY id ASC`,
-      [req.params.especialidade]
-    );
-    return res.json({ ok: true, especialistas: rows });
-  } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
-});
-
 // ── ESPECIALISTAS: horários ocupados ─────────────────────────────────────────
+// ATENÇÃO: rota específica ANTES de /:especialidade para evitar captura pelo wildcard
 app.get('/api/especialistas/horarios-ocupados/:especialistaId', rlGeral, async (req, res) => {
   try {
     const dias = Math.min(parseInt(req.query.dias || '14', 10), 60);
@@ -2916,6 +2903,21 @@ app.get('/api/especialistas/horarios-ocupados/:especialistaId', rlGeral, async (
       [req.params.especialistaId, dias]
     );
     return res.json({ ok: true, ocupados: rows.map(r => new Date(r.horario_agendado).toISOString()) });
+  } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// ── ESPECIALISTAS: listar por especialidade ───────────────────────────────────
+// Wildcard — deve ficar DEPOIS das rotas específicas
+app.get('/api/especialistas/:especialidade', rlGeral, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, nome_exibicao, especialidade, crm, uf, valor_consulta, foto_url, bio
+         FROM especialistas
+        WHERE especialidade = $1 AND ativo = true
+        ORDER BY id ASC`,
+      [req.params.especialidade]
+    );
+    return res.json({ ok: true, especialistas: rows });
   } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
 });
 
