@@ -3487,7 +3487,7 @@ app.get("/consentimentos", checkAdmin, async (req, res) => {
 app.get("/api/disponibilidade", async (req, res) => {
   try {
     const agora = new Date();
-    const HORA_INICIO=8, HORA_FIM=23;
+    const HORA_INICIO=7, HORA_FIM=23;
     const hora = parseInt(new Intl.DateTimeFormat("en-US",{timeZone:"America/Fortaleza",hour:"2-digit",hour12:false}).formatToParts(agora).find(p=>p.type==="hour").value);
     const dentroDoHorario = hora>=HORA_INICIO && hora<HORA_FIM;
     const [medRes,filaRes] = await Promise.all([
@@ -3504,7 +3504,7 @@ app.get("/api/disponibilidade", async (req, res) => {
     if (!disponivel) status='vermelho';
     else if (tempoEstimado>12||medicosOnline===0) status='amarelo';
     let horarioRetorno=null;
-    let mensagem=disponivel?(medicosOnline>0?`${medicosOnline} medico(s) disponivel(is)`:'Atendimento disponivel'):'Atendimento indisponivel no momento';
+    let mensagem=disponivel?(medicosOnline>0 ? medicosOnline+' médico(s) disponível(is)':'Atendimento disponivel'):'Atendimento indisponivel no momento';
     const agoraFtz = new Date(agora.getTime() - 3*60*60*1000);
     if (!disponivel) {
       const diaRetorno = new Date(Date.UTC(
@@ -3513,7 +3513,7 @@ app.get("/api/disponibilidade", async (req, res) => {
         HORA_INICIO+3, 0, 0, 0
       ));
       horarioRetorno=diaRetorno.toLocaleString("pt-BR",{timeZone:"America/Fortaleza",hour:"2-digit",minute:"2-digit",day:"2-digit",month:"2-digit"});
-      mensagem=`Atendimento disponivel das ${HORA_INICIO}h as ${HORA_FIM}h`;
+      mensagem='Atendimento disponível das '+HORA_INICIO+'h às '+HORA_FIM+'h';
     }
     // Agendamento removido — fluxo 100% sob demanda imediata
     const horariosAgendamento = [];
