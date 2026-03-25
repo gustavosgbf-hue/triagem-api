@@ -465,6 +465,7 @@ async function initDB() {
     await pool.query(`ALTER TABLE agendamentos_especialistas ADD COLUMN IF NOT EXISTS paciente_id INTEGER REFERENCES pacientes(id)`).catch(()=>{});
     await pool.query(`ALTER TABLE agendamentos_especialistas ADD COLUMN IF NOT EXISTS efi_charge_id TEXT`).catch(()=>{});
     await pool.query(`ALTER TABLE agendamentos_especialistas ADD COLUMN IF NOT EXISTS lembrete_enviado BOOLEAN DEFAULT false`).catch(()=>{});
+    await pool.query(`ALTER TABLE agendamentos_especialistas ADD COLUMN IF NOT EXISTS link_sessao TEXT`).catch(()=>{});
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_ag_esp_paciente ON agendamentos_especialistas(paciente_id)`).catch(()=>{});
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_ag_esp_efi ON agendamentos_especialistas(efi_charge_id)`).catch(()=>{});
     // ── LEADS ──────────────────────────────────────────────────────────────────
@@ -1752,8 +1753,8 @@ app.get('/api/paciente/agendamentos', authPaciente, async (req, res) => {
               ae.pagamento_status,
               ae.status,
               ae.criado_em,
+              ae.link_sessao,
               NULL AS formulario_url,
-              NULL AS link_sessao,
               'especialista' AS modulo
          FROM agendamentos_especialistas ae
         WHERE ae.paciente_id = $1
@@ -3443,6 +3444,19 @@ app.post('/api/especialista/login', rlLogin, async (req, res) => {
     if (!match) return res.status(401).json({ ok: false, error: 'Credenciais inválidas' });
     const tok = jwt.sign({ id: esp.id, tipo: 'especialista', email: esp.email }, JWT_SECRET, { expiresIn: '7d' });
     return res.json({ ok: true, token: tok, especialista: { id: esp.id, nome_exibicao: esp.nome_exibicao, especialidade: esp.especialidade } });
+  } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// ── ESPECIALISTA: esqueci senha (placeholder controlado) ─────────────────────
+app.post('/api/especialista/esqueci-senha', rlLogin, async (req, res) => {
+  try {
+    const { email } = req.body || {};
+    if (!email) return res.status(400).json({ ok: false, error: 'Email obrigatório' });
+    const { rows } = await pool.query('SELECT id, nome_exibicao, email FROM especialistas WHERE email = $1', [email.toLowerCase().trim()]);
+    if (!rows.length) return res.json({ ok: true, message: 'Se o email existir, você receberá instruções.' });
+    // Por segurança, não informamos se o email existe ou não
+    // Implementação real seria com token de reset via email
+    return res.json({ ok: true, message: 'Se o email existir, você receberá instruções.' });
   } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
 });
 
