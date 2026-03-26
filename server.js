@@ -3380,17 +3380,18 @@ app.get('/api/especialistas/agendamento/:id/status', rlGeral, async (req, res) =
 // ── ESPECIALISTAS: admin — cadastrar especialista ─────────────────────────────
 app.post('/api/admin/especialista/criar', checkAdmin, async (req, res) => {
   try {
-    const { nome, nome_exibicao, especialidade, crm, uf, valor_consulta, bio, foto_url } = req.body || {};
-    if (!nome || !especialidade || !crm || !uf || !valor_consulta) {
-      return res.status(400).json({ ok: false, error: 'nome, especialidade, crm, uf e valor_consulta são obrigatórios' });
+    const { nome, nome_exibicao, especialidade, crm, uf, valor_consulta, email, bio, foto_url } = req.body || {};
+    if (!nome || !especialidade || !crm || !uf) {
+      return res.status(400).json({ ok: false, error: 'nome, especialidade, crm e uf são obrigatórios' });
     }
+    const valorNum = valor_consulta ? parseFloat(String(valor_consulta).replace(',','.')) : null;
+    const emailNorm = email ? email.trim().toLowerCase() : null;
     const { rows } = await pool.query(
-      `INSERT INTO especialistas (nome, nome_exibicao, especialidade, crm, uf, valor_consulta, bio, foto_url)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id, nome_exibicao, especialidade`,
+      `INSERT INTO especialistas (nome, nome_exibicao, especialidade, crm, uf, valor_consulta, email, bio, foto_url)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id, nome_exibicao, especialidade`,
       [nome.trim(), (nome_exibicao||nome).trim(), especialidade.trim().toLowerCase(),
        crm.trim().toUpperCase(), uf.trim().toUpperCase(),
-       parseFloat(String(valor_consulta).replace(',','.')),
-       bio||'', foto_url||'']
+       valorNum, emailNorm, bio||'', foto_url||'']
     );
     console.log('[ESP-ADMIN] Especialista criado #'+rows[0].id+' — '+rows[0].especialidade);
     return res.json({ ok: true, especialista: rows[0] });
