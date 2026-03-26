@@ -3521,12 +3521,19 @@ app.post('/api/especialista/esqueci-senha', rlLogin, async (req, res) => {
         <p style="color:#999;font-size:.78rem;margin-top:16px">Se você não solicitou este acesso, ignore este e-mail.</p>
       </div>
     </div>`;
-    await fetch('https://api.resend.com/emails', {
+    console.log(`[ESP-RECOVERY] Tentando enviar email para: ${esp.email}`);
+    console.log(`[ESP-RECOVERY] SENHA TEMP (debug): ${senhaTemp}`);
+    const resendRes = await fetch('https://api.resend.com/emails', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${RESEND_KEY}` },
       body: JSON.stringify({ from: 'ConsultaJá24h <contato@consultaja24h.com.br>', to: [esp.email], subject: 'Sua senha temporária — ConsultaJá24h', html }),
-    }).catch(() => {});
-    console.log(`[ESP-RECOVERY] Senha temporária enviada para especialista #${esp.id}`);
+    });
+    const resendData = await resendRes.json().catch(() => ({}));
+    if (resendRes.ok) {
+      console.log(`[ESP-RECOVERY] Email enviado com sucesso. ID: ${resendData.id}`);
+    } else {
+      console.error(`[ESP-RECOVERY] ERRO Resend status ${resendRes.status}:`, JSON.stringify(resendData));
+    }
   } catch (e) {
     console.error('[ESP-RECOVERY] Erro (silencioso):', e.message);
   }
