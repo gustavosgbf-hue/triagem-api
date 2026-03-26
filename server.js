@@ -3384,7 +3384,7 @@ app.post('/api/admin/especialista/criar', checkAdmin, async (req, res) => {
     if (!nome || !especialidade || !crm || !uf) {
       return res.status(400).json({ ok: false, error: 'nome, especialidade, crm e uf são obrigatórios' });
     }
-    const valorNum = valor_consulta ? parseFloat(String(valor_consulta).replace(',','.')) : null;
+    const valorNum = valor_consulta ? parseFloat(String(valor_consulta).replace(',','.')) : 0;
     const emailNorm = email ? email.trim().toLowerCase() : null;
     const { rows } = await pool.query(
       `INSERT INTO especialistas (nome, nome_exibicao, especialidade, crm, uf, valor_consulta, email, bio, foto_url)
@@ -3423,16 +3423,17 @@ app.put('/api/admin/especialista/:id/desativar', checkAdmin, async (req, res) =>
   } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
 });
 
-// ── ESPECIALISTAS: admin — deletar especialista (permanent) ───────────────────
+// ── ESPECIALISTAS: admin — desativar permanente (soft delete) ────────────────
 app.delete('/api/admin/especialista/:id', checkAdmin, async (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
     if (!id || isNaN(id)) return res.status(400).json({ ok: false, error: 'ID inválido' });
     const { rows } = await pool.query(
-      `DELETE FROM especialistas WHERE id = $1 RETURNING id, nome_exibicao`,
+      `UPDATE especialistas SET ativo = false, visivel = false WHERE id = $1 RETURNING id, nome_exibicao`,
       [id]
     );
     if (!rows.length) return res.status(404).json({ ok: false, error: 'Especialista não encontrado' });
+    console.log('[ESP-ADMIN] Especialista desativado #'+rows[0].id);
     return res.json({ ok: true, especialista: rows[0] });
   } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
 });
