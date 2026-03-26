@@ -3449,26 +3449,79 @@ app.post('/api/especialista/login', rlLogin, async (req, res) => {
   try {
     const { email, senha } = req.body || {};
     if (!email || !senha) return res.status(400).json({ ok: false, error: 'Email e senha obrigatórios' });
-    const { rows } = await pool.query('SELECT id, nome_exibicao, especialidade, email, senha_hash, ativo FROM especialistas WHERE email = $1', [email.toLowerCase().trim()]);
+    const { rows } = await pool.query(
+      `SELECT id, nome, nome_exibicao, especialidade, crm, uf,
+              email, senha_hash, precisa_trocar_senha, ativo
+         FROM especialistas WHERE email = $1 LIMIT 1`,
+      [email.toLowerCase().trim()]
+    );
     if (!rows.length) return res.status(401).json({ ok: false, error: 'Credenciais inválidas' });
     const esp = rows[0];
     if (!esp.ativo) return res.status(403).json({ ok: false, error: 'Seu cadastro está inativo' });
+    if (!esp.senha_hash) return res.status(401).json({ ok: false, error: 'Senha não configurada. Use "Esqueci minha senha".' });
     const match = await bcrypt.compare(senha, esp.senha_hash);
     if (!match) return res.status(401).json({ ok: false, error: 'Credenciais inválidas' });
     const tok = jwt.sign({ id: esp.id, tipo: 'especialista', email: esp.email }, JWT_SECRET, { expiresIn: '7d' });
-    return res.json({ ok: true, token: tok, especialista: { id: esp.id, nome_exibicao: esp.nome_exibicao, especialidade: esp.especialidade } });
+    return res.json({
+      ok: true,
+      token: tok,
+      especialista: {
+        id: esp.id,
+        nome: esp.nome_exibicao || esp.nome,
+        especialidade: esp.especialidade,
+        crm: esp.crm,
+        uf: esp.uf,
+      },
+      precisa_trocar_senha: !!esp.precisa_trocar_senha,
+    });
   } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
 });
 
-// ── ESPECIALISTA: esqueci senha (placeholder controlado) ─────────────────────
+// ── ESPECIALISTA: esqueci senha ──────────────────────────────────────────────
 app.post('/api/especialista/esqueci-senha', rlLogin, async (req, res) => {
+  // Sempre responde ok=true — não expõe se e-mail existe
+  res.json({ ok: true });
   try {
     const { email } = req.body || {};
-    if (!email) return res.status(400).json({ ok: false, error: 'Email obrigatório' });
-    const { rows } = await pool.query('SELECT id, nome_exibicao, email FROM especialistas WHERE email = $1', [email.toLowerCase().trim()]);
-    if (!rows.length) return res.json({ ok: true, message: 'Se o email existir, você receberá instruções.' });
-    return res.json({ ok: true, message: 'Se o email existir, você receberá instruções.' });
-  } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
+    if (!email) return;
+    const { rows } = await pool.query(
+      `SELECT id, nome, nome_exibicao, email FROM especialistas
+        WHERE LOWER(email) = LOWER($1) AND ativo = true LIMIT 1`,
+      [email.trim()]
+    );
+    if (!rows.length) return;
+    const esp = rows[0];
+    const chars = 'abcdefghjkmnpqrstuvwxyz23456789';
+    let senhaTemp = '';
+    for (let i = 0; i < 8; i++) senhaTemp += chars[Math.floor(Math.random() * chars.length)];
+    const hash = await bcrypt.hash(senhaTemp, 10);
+    await pool.query(
+      `UPDATE especialistas SET senha_hash = $1, precisa_trocar_senha = true WHERE id = $2`,
+      [hash, esp.id]
+    );
+    const nome = esp.nome_exibicao || esp.nome;
+    const RESEND_KEY = process.env.RESEND_API_KEY;
+    if (!RESEND_KEY) return;
+    const html = `<div style="background:#f5f5f5;padding:32px;font-family:sans-serif">
+      <div style="max-width:480px;margin:0 auto;background:#fff;border-radius:12px;padding:28px">
+        <h2 style="color:#1a1612;margin:0 0 12px">Acesso ao Painel do Especialista</h2>
+        <p style="color:#555;font-size:.9rem;margin-bottom:20px">Olá, ${nome}. Sua senha temporária de acesso é:</p>
+        <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:16px;text-align:center;margin-bottom:20px">
+          <span style="font-family:monospace;font-size:1.4rem;font-weight:700;color:#166534;letter-spacing:.12em">${senhaTemp}</span>
+        </div>
+        <p style="color:#555;font-size:.85rem">Acesse o painel e você será solicitado a criar uma nova senha permanente.</p>
+        <p style="color:#999;font-size:.78rem;margin-top:16px">Se você não solicitou este acesso, ignore este e-mail.</p>
+      </div>
+    </div>`;
+    await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${RESEND_KEY}` },
+      body: JSON.stringify({ from: 'ConsultaJá24h <contato@consultaja24h.com.br>', to: [esp.email], subject: 'Sua senha temporária — ConsultaJá24h', html }),
+    }).catch(() => {});
+    console.log(`[ESP-RECOVERY] Senha temporária enviada para especialista #${esp.id}`);
+  } catch (e) {
+    console.error('[ESP-RECOVERY] Erro (silencioso):', e.message);
+  }
 });
 
 // ── ADMIN: atualizar especialista ──────────────────────────────────────────
@@ -3927,8 +3980,72 @@ const MEMED_API_URL = process.env.MEMED_API_URL || "https://api.memed.com.br/v1"
 const MEMED_API_KEY = process.env.MEMED_API_KEY || "";
 const MEMED_SECRET_KEY = process.env.MEMED_SECRET_KEY || "";
 
-app.get("/api/memed/token", checkMedico, async (req, res) => {
+// ── Middleware combinado: aceita token de médico OU especialista ──────────────
+function checkMedicoOuEspecialista(req, res, next) {
+  const auth = req.headers['authorization'] || '';
+  const token = auth.replace(/^Bearer\s+/i, '').trim();
+  if (!token) return res.status(401).json({ ok: false, error: 'Token não fornecido' });
   try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    if (decoded.tipo === 'especialista') {
+      // Monta req.medico compatível com o handler existente usando dados do especialista
+      req.medico = { id: decoded.id, tipo: 'especialista' };
+      req.medicoId = decoded.id;
+      req._isEspecialista = true;
+      return next();
+    }
+    // Fluxo normal de médico
+    req.medico = decoded;
+    req.medicoId = decoded.id;
+    req._isEspecialista = false;
+    return next();
+  } catch (e) {
+    return res.status(401).json({ ok: false, error: 'Token inválido ou expirado' });
+  }
+}
+
+app.get("/api/memed/token", checkMedicoOuEspecialista, async (req, res) => {
+  try {
+    // Branch especialista — redireciona para lógica própria
+    if (req._isEspecialista) {
+      const { rows: espRows } = await pool.query(
+        `SELECT id, nome, nome_exibicao, crm, uf, email FROM especialistas WHERE id = $1`,
+        [req.medicoId]
+      );
+      if (espRows.length === 0) return res.status(404).json({ ok: false, error: 'Especialista não encontrado' });
+      const esp = espRows[0];
+      if (!esp.uf || esp.uf.trim().length < 2) {
+        return res.status(400).json({ ok: false, error: 'UF não cadastrada. Atualize seu perfil.' });
+      }
+      const uf = esp.uf.trim().toUpperCase();
+      const partesNome = (esp.nome_exibicao || esp.nome || 'Especialista').trim().split(/\s+/);
+      const nomeLocal = partesNome[0];
+      const sobrenomeLocal = partesNome.slice(1).join(' ') || 'ConsultaJa';
+      const externalId = `esp-${esp.id}`;
+      const getUrl = `${MEMED_API_URL}/sinapse-prescricao/usuarios/${externalId}?api-key=${MEMED_API_KEY}&secret-key=${MEMED_SECRET_KEY}`;
+      const getRes = await fetch(getUrl, { headers: { 'Accept': 'application/vnd.api+json', 'Content-Type': 'application/json' } });
+      if (getRes.ok) {
+        const getData = await getRes.json();
+        const token = getData?.data?.attributes?.token;
+        if (token) return res.json({ ok: true, token });
+      }
+      const postUrl = `${MEMED_API_URL}/sinapse-prescricao/usuarios?api-key=${MEMED_API_KEY}&secret-key=${MEMED_SECRET_KEY}`;
+      const postRes = await fetch(postUrl, {
+        method: 'POST',
+        headers: { 'Accept': 'application/vnd.api+json', 'Content-Type': 'application/json' },
+        body: JSON.stringify({ data: { type: 'usuarios', attributes: {
+          nome: nomeLocal, sobrenome: sobrenomeLocal,
+          email: esp.email || `esp${esp.id}@consultaja24h.com.br`,
+          external_id: externalId,
+          board: { board_code: 'CRM', board_number: (esp.crm || '').replace(/\D/g, ''), board_state: uf },
+        }}}),
+      });
+      const postData = await postRes.json();
+      const token = postData?.data?.attributes?.token;
+      if (!token) return res.status(502).json({ ok: false, error: 'Não foi possível carregar a prescrição' });
+      return res.json({ ok: true, token });
+    }
+    // Branch médico normal (lógica original abaixo)
     const medicoId = req.medico.id;
     const medResult = await pool.query(
       `SELECT id,nome,email,crm,uf,telefone,especialidade,cpf_medico,data_nascimento_medico,memed_external_id FROM medicos WHERE id=$1`,
@@ -5937,6 +6054,278 @@ app.get('/api/admin/psicologia/indicadores', checkAdmin, async (req, res) => {
 
 // ══════════════════════════════════════════════════════════════════════════════
 // FIM ANTI-DESVIO DE PACIENTES
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ══════════════════════════════════════════════════════════════════════════════
+// ESPECIALISTA — ENDPOINTS DO PAINEL (complemento ao bloco existente)
+// ══════════════════════════════════════════════════════════════════════════════
+
+// ── Migração mínima ───────────────────────────────────────────────────────────
+(async () => {
+  const migs = [
+    `ALTER TABLE especialistas ADD COLUMN IF NOT EXISTS precisa_trocar_senha BOOLEAN NOT NULL DEFAULT false`,
+    `ALTER TABLE agendamentos_especialistas ADD COLUMN IF NOT EXISTS modalidade TEXT NOT NULL DEFAULT 'video'`,
+    `ALTER TABLE agendamentos_especialistas ADD COLUMN IF NOT EXISTS prontuario_texto TEXT`,
+    `ALTER TABLE agendamentos_especialistas ADD COLUMN IF NOT EXISTS observacoes TEXT`,
+    `ALTER TABLE agendamentos_especialistas ADD COLUMN IF NOT EXISTS data_nascimento TEXT`,
+    `ALTER TABLE agendamentos_especialistas ADD COLUMN IF NOT EXISTS sexo TEXT`,
+    `ALTER TABLE agendamentos_especialistas ADD COLUMN IF NOT EXISTS cpf TEXT`,
+  ];
+  for (const sql of migs) {
+    await pool.query(sql).catch(e => console.warn('[ESP-MIGRATION2]', e.message));
+  }
+  console.log('[ESP] Migração de colunas (painel) concluída.');
+})();
+
+// ── Helper: enviar email via Resend (especialista) ────────────────────────────
+async function enviarEmailEspecialista({ to, subject, html }) {
+  const RESEND_KEY = process.env.RESEND_API_KEY;
+  if (!RESEND_KEY || !to) return;
+  await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${RESEND_KEY}` },
+    body: JSON.stringify({ from: 'ConsultaJá24h <contato@consultaja24h.com.br>', to: [to], subject, html }),
+  }).catch(e => console.warn('[ESP-EMAIL] Falha:', e.message));
+}
+
+// ── Helper: verificar ownership ──────────────────────────────────────────────
+async function getConsultaEsp(id, especialistaId) {
+  const { rows } = await pool.query(
+    `SELECT id, status, paciente_nome, paciente_email, modalidade, prontuario_texto
+       FROM agendamentos_especialistas
+      WHERE id = $1 AND especialista_id = $2 LIMIT 1`,
+    [id, especialistaId]
+  );
+  return rows[0] || null;
+}
+
+// ── POST /api/especialista/trocar-senha ──────────────────────────────────────
+app.post('/api/especialista/trocar-senha', authEspecialista, async (req, res) => {
+  try {
+    const { senhaAtual, novaSenha, confirmarSenha } = req.body || {};
+    if (!senhaAtual || !novaSenha || !confirmarSenha)
+      return res.status(400).json({ ok: false, error: 'Todos os campos são obrigatórios' });
+    if (novaSenha !== confirmarSenha)
+      return res.status(400).json({ ok: false, error: 'As senhas não coincidem' });
+    if (novaSenha.length < 6)
+      return res.status(400).json({ ok: false, error: 'A nova senha deve ter ao menos 6 caracteres' });
+    const { rows } = await pool.query(
+      `SELECT senha_hash FROM especialistas WHERE id = $1`, [req.especialistaId]);
+    if (!rows.length) return res.status(404).json({ ok: false, error: 'Especialista não encontrado' });
+    const ok = await bcrypt.compare(String(senhaAtual), rows[0].senha_hash || '');
+    if (!ok) return res.status(401).json({ ok: false, error: 'Senha atual incorreta' });
+    const novoHash = await bcrypt.hash(String(novaSenha), 10);
+    await pool.query(
+      `UPDATE especialistas SET senha_hash = $1, precisa_trocar_senha = false WHERE id = $2`,
+      [novoHash, req.especialistaId]
+    );
+    console.log(`[ESP-SENHA] Especialista #${req.especialistaId} trocou a senha`);
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('[ESP-SENHA] Erro:', e.message);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /api/especialista/consultas ─────────────────────────────────────────
+app.get('/api/especialista/consultas', authEspecialista, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT
+         ae.id,
+         ae.paciente_nome,
+         ae.paciente_tel,
+         ae.paciente_email,
+         ae.paciente_cpf                  AS cpf,
+         ae.horario_agendado,
+         ae.especialidade,
+         COALESCE(ae.modalidade, 'video')  AS modalidade,
+         ae.status,
+         ae.link_sessao,
+         ae.observacoes                   AS obs,
+         ae.prontuario_texto,
+         ae.data_nascimento,
+         ae.sexo,
+         ae.pagamento_status
+       FROM agendamentos_especialistas ae
+      WHERE ae.especialista_id = $1
+      ORDER BY ae.horario_agendado DESC`,
+      [req.especialistaId]
+    );
+    return res.json({ ok: true, consultas: rows });
+  } catch (e) {
+    console.error('[ESP-CONSULTAS] Erro:', e.message);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── GET /api/especialista/consulta/:id ──────────────────────────────────────
+app.get('/api/especialista/consulta/:id', authEspecialista, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).json({ ok: false, error: 'ID inválido' });
+    const { rows } = await pool.query(
+      `SELECT
+         ae.id,
+         ae.paciente_nome,
+         ae.paciente_tel,
+         ae.paciente_email,
+         ae.paciente_cpf                  AS cpf,
+         ae.horario_agendado,
+         ae.especialidade,
+         COALESCE(ae.modalidade, 'video')  AS modalidade,
+         ae.status,
+         ae.link_sessao,
+         ae.observacoes                   AS obs,
+         ae.prontuario_texto,
+         ae.data_nascimento,
+         ae.sexo,
+         ae.pagamento_status,
+         ae.valor_cobrado
+       FROM agendamentos_especialistas ae
+      WHERE ae.id = $1 AND ae.especialista_id = $2 LIMIT 1`,
+      [id, req.especialistaId]
+    );
+    if (!rows.length) return res.status(404).json({ ok: false, error: 'Consulta não encontrada' });
+    return res.json({ ok: true, consulta: rows[0] });
+  } catch (e) {
+    console.error('[ESP-CONSULTA] Erro:', e.message);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── PUT /api/especialista/consulta/:id/link_sessao ───────────────────────────
+app.put('/api/especialista/consulta/:id/link_sessao', authEspecialista, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const { link_sessao } = req.body || {};
+    if (!id) return res.status(400).json({ ok: false, error: 'ID inválido' });
+    if (!link_sessao || !/^https?:\/\//i.test(link_sessao.trim()))
+      return res.status(400).json({ ok: false, error: 'Informe um link válido (https://)' });
+    const consulta = await getConsultaEsp(id, req.especialistaId);
+    if (!consulta) return res.status(404).json({ ok: false, error: 'Consulta não encontrada' });
+    await pool.query(
+      `UPDATE agendamentos_especialistas SET link_sessao = $1 WHERE id = $2`,
+      [link_sessao.trim(), id]
+    );
+    if (consulta.paciente_email) {
+      const html = `<div style="background:#f5f5f5;padding:32px;font-family:sans-serif">
+        <div style="max-width:480px;margin:0 auto;background:#fff;border-radius:12px;padding:28px">
+          <h2 style="color:#1a1612;margin:0 0 12px">Link da sua consulta disponível</h2>
+          <p style="color:#555;font-size:.9rem;margin-bottom:16px">Olá, ${consulta.paciente_nome}. O link para sua consulta foi disponibilizado:</p>
+          <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:14px;margin-bottom:14px">
+            <a href="${link_sessao.trim()}" style="color:#166534;font-size:.88rem;word-break:break-all">${link_sessao.trim()}</a>
+          </div>
+          <p style="color:#999;font-size:.78rem">Acesse o link no horário da sua consulta.</p>
+        </div>
+      </div>`;
+      enviarEmailEspecialista({ to: consulta.paciente_email, subject: 'Link da sua consulta — ConsultaJá24h', html }).catch(() => {});
+    }
+    console.log(`[ESP-LINK] Consulta #${id} — link salvo por especialista #${req.especialistaId}`);
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('[ESP-LINK] Erro:', e.message);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── PUT /api/especialista/consulta/:id/iniciar ───────────────────────────────
+app.put('/api/especialista/consulta/:id/iniciar', authEspecialista, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).json({ ok: false, error: 'ID inválido' });
+    const consulta = await getConsultaEsp(id, req.especialistaId);
+    if (!consulta) return res.status(404).json({ ok: false, error: 'Consulta não encontrada' });
+    if (consulta.status === 'cancelada')
+      return res.status(400).json({ ok: false, error: 'Consulta cancelada não pode ser iniciada' });
+    await pool.query(
+      `UPDATE agendamentos_especialistas SET status = 'em_andamento'
+        WHERE id = $1 AND status NOT IN ('em_andamento','encerrada','cancelada')`,
+      [id]
+    );
+    console.log(`[ESP-INICIAR] Consulta #${id} iniciada por especialista #${req.especialistaId}`);
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('[ESP-INICIAR] Erro:', e.message);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── PUT /api/especialista/consulta/:id/encerrar ──────────────────────────────
+app.put('/api/especialista/consulta/:id/encerrar', authEspecialista, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const { prontuario } = req.body || {};
+    if (!id) return res.status(400).json({ ok: false, error: 'ID inválido' });
+    const consulta = await getConsultaEsp(id, req.especialistaId);
+    if (!consulta) return res.status(404).json({ ok: false, error: 'Consulta não encontrada' });
+    if (consulta.status === 'cancelada')
+      return res.status(400).json({ ok: false, error: 'Consulta cancelada não pode ser encerrada' });
+    await pool.query(
+      `UPDATE agendamentos_especialistas
+          SET status = 'encerrada', prontuario_texto = COALESCE($1, prontuario_texto)
+        WHERE id = $2`,
+      [prontuario || null, id]
+    );
+    console.log(`[ESP-ENCERRAR] Consulta #${id} encerrada por especialista #${req.especialistaId}`);
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('[ESP-ENCERRAR] Erro:', e.message);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── PUT /api/especialista/consulta/:id/cancelar ──────────────────────────────
+app.put('/api/especialista/consulta/:id/cancelar', authEspecialista, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).json({ ok: false, error: 'ID inválido' });
+    const consulta = await getConsultaEsp(id, req.especialistaId);
+    if (!consulta) return res.status(404).json({ ok: false, error: 'Consulta não encontrada' });
+    if (consulta.status === 'encerrada')
+      return res.status(400).json({ ok: false, error: 'Consulta já encerrada não pode ser cancelada' });
+    await pool.query(`UPDATE agendamentos_especialistas SET status = 'cancelada' WHERE id = $1`, [id]);
+    console.log(`[ESP-CANCELAR] Consulta #${id} cancelada por especialista #${req.especialistaId}`);
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('[ESP-CANCELAR] Erro:', e.message);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ── PUT /api/especialista/consulta/:id/prontuario ────────────────────────────
+app.put('/api/especialista/consulta/:id/prontuario', authEspecialista, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    const { prontuario, append } = req.body || {};
+    if (!id) return res.status(400).json({ ok: false, error: 'ID inválido' });
+    if (!prontuario) return res.status(400).json({ ok: false, error: 'Conteúdo do prontuário é obrigatório' });
+    const consulta = await getConsultaEsp(id, req.especialistaId);
+    if (!consulta) return res.status(404).json({ ok: false, error: 'Consulta não encontrada' });
+    if (append) {
+      await pool.query(
+        `UPDATE agendamentos_especialistas
+            SET prontuario_texto = COALESCE(prontuario_texto || E'\n\n' || $1, $1)
+          WHERE id = $2`,
+        [prontuario, id]
+      );
+    } else {
+      await pool.query(
+        `UPDATE agendamentos_especialistas SET prontuario_texto = $1 WHERE id = $2`,
+        [prontuario, id]
+      );
+    }
+    return res.json({ ok: true });
+  } catch (e) {
+    console.error('[ESP-PRONT] Erro:', e.message);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// ══════════════════════════════════════════════════════════════════════════════
+// FIM ESPECIALISTA PAINEL
+// ══════════════════════════════════════════════════════════════════════════════
+
 // ══════════════════════════════════════════════════════════════════════════════
 
 // Health check
