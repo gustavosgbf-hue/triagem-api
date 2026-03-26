@@ -3537,7 +3537,7 @@ app.put('/api/admin/especialista/:id', checkAdmin, async (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
     if (!id) return res.status(400).json({ ok: false, error: 'ID inválido' });
-    const { email, nome_exibicao, bio, valor_consulta, crm, uf, ativo, visivel } = req.body || {};
+    const { email, nome_exibicao, bio, valor_consulta, crm, uf, ativo, visivel, disponibilidade } = req.body || {};
     const updates = [];
     const params = [];
     let idx = 1;
@@ -3549,6 +3549,7 @@ app.put('/api/admin/especialista/:id', checkAdmin, async (req, res) => {
     if (uf !== undefined) { updates.push(`uf = $${idx++}`); params.push(uf?.trim().toUpperCase()); }
     if (ativo !== undefined) { updates.push(`ativo = $${idx++}`); params.push(!!ativo); }
     if (visivel !== undefined) { updates.push(`visivel = $${idx++}`); params.push(!!visivel); }
+    if (disponibilidade !== undefined) { updates.push(`disponibilidade = $${idx++}::jsonb`); params.push(JSON.stringify(Array.isArray(disponibilidade) ? disponibilidade : [])); }
     if (!updates.length) return res.status(400).json({ ok: false, error: 'Nenhum campo para atualizar' });
     params.push(id);
     const { rows } = await pool.query(`UPDATE especialistas SET ${updates.join(', ')} WHERE id = $${idx} RETURNING id, nome_exibicao, email, ativo, visivel`, params);
