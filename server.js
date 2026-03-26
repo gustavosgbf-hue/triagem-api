@@ -434,14 +434,22 @@ async function initDB() {
       bio            TEXT,
       email          TEXT,
       ativo          BOOLEAN NOT NULL DEFAULT true,
-      disponibilidade TEXT,
+      disponibilidade JSONB,
       created_at     TIMESTAMP DEFAULT NOW()
     )`).catch(()=>{});
     await pool.query(`ALTER TABLE especialistas ADD COLUMN IF NOT EXISTS email TEXT`).catch(()=>{});
     await pool.query(`ALTER TABLE especialistas ADD COLUMN IF NOT EXISTS visivel BOOLEAN DEFAULT true`).catch(()=>{});
     await pool.query(`ALTER TABLE especialistas ADD COLUMN IF NOT EXISTS foto_url TEXT`).catch(()=>{});
     await pool.query(`ALTER TABLE especialistas ADD COLUMN IF NOT EXISTS bio TEXT`).catch(()=>{});
-    await pool.query(`ALTER TABLE especialistas ADD COLUMN IF NOT EXISTS disponibilidade TEXT`).catch(()=>{});
+    await pool.query(`ALTER TABLE especialistas ADD COLUMN IF NOT EXISTS disponibilidade JSONB`).catch(()=>{});
+    await pool.query(`
+      ALTER TABLE especialistas
+      ALTER COLUMN disponibilidade TYPE JSONB
+      USING CASE
+        WHEN disponibilidade IS NULL OR trim(disponibilidade::text) = '' THEN NULL
+        ELSE disponibilidade::jsonb
+      END
+    `).catch(()=>{});
     await pool.query(`CREATE TABLE IF NOT EXISTS agendamentos_especialistas (
       id                      SERIAL PRIMARY KEY,
       especialista_id         INTEGER NOT NULL REFERENCES especialistas(id),
@@ -3173,7 +3181,7 @@ app.get('/api/especialistas/horarios-ocupados/:especialistaId', rlGeral, async (
 app.get('/api/especialistas/:especialidade', rlGeral, async (req, res) => {
   try {
     const { rows } = await pool.query(
-      `SELECT id, nome_exibicao, especialidade, crm, uf, valor_consulta, foto_url, bio, NULL as disponibilidade
+      `SELECT id, nome_exibicao, especialidade, crm, uf, valor_consulta, foto_url, bio, disponibilidade
          FROM especialistas
         WHERE especialidade = $1 AND ativo = true AND (visivel = true OR visivel IS NULL)
         ORDER BY id ASC`,
@@ -3585,8 +3593,10 @@ app.patch('/api/especialista/perfil', authEspecialista, async (req, res) => {
 app.patch('/api/especialista/disponibilidade', authEspecialista, async (req, res) => {
   try {
     const { disponibilidade } = req.body || {};
-    if (typeof disponibilidade !== 'string') return res.status(400).json({ ok: false, error: 'disponibilidade deve ser texto' });
-    await pool.query(`UPDATE especialistas SET disponibilidade = $1 WHERE id = $2`, [disponibilidade.trim(), req.especialistaId]);
+    if (!Array.isArray(disponibilidade)) {
+      return res.status(400).json({ ok: false, error: 'Disponibilidade inválida' });
+    }
+    await pool.query(`UPDATE especialistas SET disponibilidade = $1::jsonb WHERE id = $2`, [JSON.stringify(disponibilidade), req.especialistaId]);
     console.log(`[ESP-DISP] Especialista #${req.especialistaId} atualizou disponibilidade`);
     return res.json({ ok: true });
   } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
