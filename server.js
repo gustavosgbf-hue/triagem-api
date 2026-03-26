@@ -3173,7 +3173,7 @@ app.get('/api/especialistas/horarios-ocupados/:especialistaId', rlGeral, async (
 app.get('/api/especialistas/:especialidade', rlGeral, async (req, res) => {
   try {
     const { rows } = await pool.query(
-      `SELECT id, nome_exibicao, especialidade, crm, uf, valor_consulta, foto_url, bio, disponibilidade
+      `SELECT id, nome_exibicao, especialidade, crm, uf, valor_consulta, foto_url, bio, NULL as disponibilidade
          FROM especialistas
         WHERE especialidade = $1 AND ativo = true AND (visivel = true OR visivel IS NULL)
         ORDER BY id ASC`,
