@@ -3619,10 +3619,15 @@ app.post('/api/especialista/foto', authEspecialista, uploadEsp, async (req, res)
     const ext = req.file.originalname.split('.').pop().toLowerCase();
     if (!['jpg','jpeg','png','webp'].includes(ext)) return res.status(400).json({ ok: false, error: 'Formato inválido' });
     const key = `especialistas/${req.especialistaId}_${Date.now()}.${ext}`;
-    await r2Client.write(key, req.file.buffer, req.file.mimetype);
-    const foto_url = R2_PUBLIC_URL + key;
+    await r2.send(new PutObjectCommand({
+      Bucket: process.env.R2_BUCKET_NAME,
+      Key: key,
+      Body: req.file.buffer,
+      ContentType: req.file.mimetype,
+    }));
+    const foto_url = `${process.env.R2_PUBLIC_URL}/${key}`;
     await pool.query(`UPDATE especialistas SET foto_url = $1 WHERE id = $2`, [foto_url, req.especialistaId]);
-    return res.json({ ok: true, foto_url });
+    return res.json({ ok: true, url: foto_url, foto_url });
   } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
 });
 
@@ -3792,7 +3797,12 @@ app.post('/api/consulta/:agendamentoId/upload', authPaciente, uploadConsulta, as
     if (!allowed.includes(ext)) return res.status(400).json({ ok: false, error: 'Tipo de arquivo não permitido' });
     
     const key = `consultas/${agId}_${Date.now()}.${ext}`;
-    await r2Client.write(key, req.file.buffer, req.file.mimetype);
+    await r2.send(new PutObjectCommand({
+      Bucket: process.env.R2_BUCKET_NAME,
+      Key: key,
+      Body: req.file.buffer,
+      ContentType: req.file.mimetype,
+    }));
     const arquivo_url = `${process.env.R2_PUBLIC_URL}/${key}`;
     
     const texto = req.body.texto || '';
@@ -6340,6 +6350,94 @@ app.put('/api/especialista/consulta/:id/prontuario', authEspecialista, async (re
     console.error('[ESP-PRONT] Erro:', e.message);
     return res.status(500).json({ ok: false, error: e.message });
   }
+});
+
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CHAT ESPECIALISTA ↔ PACIENTE
+// ══════════════════════════════════════════════════════════════════════════════
+
+// GET /api/especialista/chat/:consultaId — busca mensagens da consulta
+app.get('/api/especialista/chat/:consultaId', authEspecialista, async (req, res) => {
+  try {
+    const consultaId = parseInt(req.params.consultaId, 10);
+    if (!consultaId) return res.status(400).json({ ok: false, error: 'ID inválido' });
+    // Verifica que a consulta pertence ao especialista autenticado
+    const { rows: check } = await pool.query(
+      `SELECT id FROM agendamentos_especialistas WHERE id = $1 AND especialista_id = $2 LIMIT 1`,
+      [consultaId, req.especialistaId]
+    );
+    if (!check.length) return res.status(403).json({ ok: false, error: 'Acesso negado' });
+    const desde = parseInt(req.query.desde || '0', 10);
+    const { rows } = await pool.query(
+      `SELECT id, autor, texto, arquivo_url, created_at AS criado_em
+         FROM consulta_mensagens
+        WHERE agendamento_id = $1 AND agendamento_type = 'especialista'
+          AND ($2 = 0 OR id > $2)
+        ORDER BY created_at ASC`,
+      [consultaId, desde]
+    );
+    return res.json({ ok: true, mensagens: rows });
+  } catch(e) { console.error('[CHAT-ESP GET]', e.message); return res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// POST /api/especialista/chat/:consultaId — envia mensagem de texto
+app.post('/api/especialista/chat/:consultaId', authEspecialista, async (req, res) => {
+  try {
+    const consultaId = parseInt(req.params.consultaId, 10);
+    if (!consultaId) return res.status(400).json({ ok: false, error: 'ID inválido' });
+    const { texto } = req.body || {};
+    if (!texto?.trim()) return res.status(400).json({ ok: false, error: 'Texto obrigatório' });
+    // Verifica pertencimento
+    const { rows: check } = await pool.query(
+      `SELECT id FROM agendamentos_especialistas WHERE id = $1 AND especialista_id = $2 LIMIT 1`,
+      [consultaId, req.especialistaId]
+    );
+    if (!check.length) return res.status(403).json({ ok: false, error: 'Acesso negado' });
+    const { rows } = await pool.query(
+      `INSERT INTO consulta_mensagens (agendamento_id, autor, texto, agendamento_type)
+       VALUES ($1, 'especialista', $2, 'especialista')
+       RETURNING id, autor, texto, arquivo_url, created_at AS criado_em`,
+      [consultaId, texto.trim()]
+    );
+    return res.json({ ok: true, mensagem: rows[0] });
+  } catch(e) { console.error('[CHAT-ESP POST]', e.message); return res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// POST /api/especialista/chat/:consultaId/upload — upload de arquivo
+const uploadChatEsp = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } }).single('arquivo');
+app.post('/api/especialista/chat/:consultaId/upload', authEspecialista, uploadChatEsp, async (req, res) => {
+  try {
+    const consultaId = parseInt(req.params.consultaId, 10);
+    if (!consultaId) return res.status(400).json({ ok: false, error: 'ID inválido' });
+    if (!req.file) return res.status(400).json({ ok: false, error: 'Nenhum arquivo enviado' });
+    // Verifica pertencimento
+    const { rows: check } = await pool.query(
+      `SELECT id FROM agendamentos_especialistas WHERE id = $1 AND especialista_id = $2 LIMIT 1`,
+      [consultaId, req.especialistaId]
+    );
+    if (!check.length) return res.status(403).json({ ok: false, error: 'Acesso negado' });
+    const ext = req.file.originalname.split('.').pop().toLowerCase();
+    const allowed = ['jpg','jpeg','png','gif','pdf'];
+    if (!allowed.includes(ext)) return res.status(400).json({ ok: false, error: 'Tipo de arquivo não permitido' });
+    const key = `chat-esp/${consultaId}_${Date.now()}.${ext}`;
+    await r2.send(new PutObjectCommand({
+      Bucket: process.env.R2_BUCKET_NAME,
+      Key: key,
+      Body: req.file.buffer,
+      ContentType: req.file.mimetype,
+    }));
+    const arquivo_url = `${process.env.R2_PUBLIC_URL}/${key}`;
+    const arquivo_tipo = ['jpg','jpeg','png','gif'].includes(ext) ? 'imagem' : 'pdf';
+    const texto = req.body.texto || '';
+    const { rows } = await pool.query(
+      `INSERT INTO consulta_mensagens (agendamento_id, autor, texto, arquivo_url, agendamento_type)
+       VALUES ($1, 'especialista', $2, $3, 'especialista')
+       RETURNING id, autor, texto, arquivo_url, created_at AS criado_em`,
+      [consultaId, texto, arquivo_url]
+    );
+    return res.json({ ok: true, mensagem: { ...rows[0], arquivo_tipo } });
+  } catch(e) { console.error('[CHAT-ESP UPLOAD]', e.message); return res.status(500).json({ ok: false, error: e.message }); }
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
