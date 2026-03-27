@@ -3176,6 +3176,36 @@ app.get('/api/especialistas/horarios-ocupados/:especialistaId', rlGeral, async (
   } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
 });
 
+function gerarDisponibilidadeFallbackEspecialista({
+  inicioHora = 16,
+  fimHora = 20,
+  dias = 7,
+} = {}) {
+  const slots = [];
+  const agora = new Date();
+  for (let d = 0; d < dias; d++) {
+    for (let h = inicioHora; h <= fimHora; h++) {
+      const slot = new Date(agora);
+      slot.setDate(slot.getDate() + d);
+      slot.setHours(h, 0, 0, 0);
+      if (slot > agora) slots.push(slot.toISOString());
+    }
+  }
+  return slots;
+}
+
+function normalizarDisponibilidadeEspecialista(disponibilidadeBruta) {
+  const arr = Array.isArray(disponibilidadeBruta) ? disponibilidadeBruta : [];
+  const agoraTs = Date.now();
+  const futuros = arr
+    .map((item) => new Date(item))
+    .filter((d) => !isNaN(d.getTime()) && d.getTime() > agoraTs)
+    .sort((a, b) => a.getTime() - b.getTime())
+    .map((d) => d.toISOString());
+  if (futuros.length > 0) return futuros;
+  return gerarDisponibilidadeFallbackEspecialista({ inicioHora: 16, fimHora: 20, dias: 7 });
+}
+
 // ── ESPECIALISTAS: listar por especialidade ───────────────────────────────────
 // Wildcard — deve ficar DEPOIS das rotas específicas
 app.get('/api/especialistas/:especialidade', rlGeral, async (req, res) => {
@@ -3187,7 +3217,11 @@ app.get('/api/especialistas/:especialidade', rlGeral, async (req, res) => {
         ORDER BY id ASC`,
       [req.params.especialidade]
     );
-    return res.json({ ok: true, especialistas: rows });
+    const especialistas = rows.map((esp) => ({
+      ...esp,
+      disponibilidade: normalizarDisponibilidadeEspecialista(esp.disponibilidade),
+    }));
+    return res.json({ ok: true, especialistas });
   } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
 });
 
@@ -3201,7 +3235,7 @@ app.get('/api/especialistas/:especialistaId/horarios', rlGeral, async (req, res)
       [espId]
     );
     if (!rows.length) return res.status(404).json({ ok: false, error: 'Especialista não encontrado' });
-    return res.json({ ok: true, disponibilidade: rows[0].disponibilidade || null });
+    return res.json({ ok: true, disponibilidade: normalizarDisponibilidadeEspecialista(rows[0].disponibilidade) });
   } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
 });
 
