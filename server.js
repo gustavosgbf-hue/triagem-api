@@ -3438,6 +3438,19 @@ app.delete('/api/admin/especialista/:id', checkAdmin, async (req, res) => {
   } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
 });
 
+// ── ESPECIALISTAS: admin — exclusão permanente ────────────────────────────────
+app.delete('/api/admin/especialista/:id/excluir', checkAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!id || isNaN(id)) return res.status(400).json({ ok: false, error: 'ID inválido' });
+    const { rows } = await pool.query(`SELECT id, nome_exibicao FROM especialistas WHERE id = $1`, [id]);
+    if (!rows.length) return res.status(404).json({ ok: false, error: 'Especialista não encontrado' });
+    await pool.query(`DELETE FROM especialistas WHERE id = $1`, [id]);
+    console.log(`[ESP-ADMIN] Especialista #${id} (${rows[0].nome_exibicao}) EXCLUÍDO permanentemente`);
+    return res.json({ ok: true });
+  } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
+});
+
 // ── ESPECIALISTAS: auth middleware ──────────────────────────────────────────
 const authEspecialista = async (req, res, next) => {
   const authH = req.headers['authorization'] || '';
@@ -3546,13 +3559,14 @@ app.put('/api/admin/especialista/:id', checkAdmin, async (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
     if (!id) return res.status(400).json({ ok: false, error: 'ID inválido' });
-    const { email, nome_exibicao, bio, valor_consulta, crm, uf, ativo, visivel } = req.body || {};
+    const { email, nome_exibicao, bio, valor_consulta, crm, uf, ativo, visivel, foto_url } = req.body || {};
     const updates = [];
     const params = [];
     let idx = 1;
     if (email !== undefined) { updates.push(`email = $${idx++}`); params.push(email?.trim().toLowerCase() || null); }
     if (nome_exibicao !== undefined) { updates.push(`nome_exibicao = $${idx++}`); params.push(nome_exibicao?.trim()); }
     if (bio !== undefined) { updates.push(`bio = $${idx++}`); params.push(bio?.trim()); }
+    if (foto_url !== undefined) { updates.push(`foto_url = $${idx++}`); params.push(foto_url?.trim() || null); }
     if (valor_consulta !== undefined) { updates.push(`valor_consulta = $${idx++}`); params.push(parseFloat(valor_consulta)); }
     if (crm !== undefined) { updates.push(`crm = $${idx++}`); params.push(crm?.trim().toUpperCase()); }
     if (uf !== undefined) { updates.push(`uf = $${idx++}`); params.push(uf?.trim().toUpperCase()); }
@@ -3627,6 +3641,29 @@ app.post('/api/especialista/foto', authEspecialista, uploadEsp, async (req, res)
     }));
     const foto_url = `${process.env.R2_PUBLIC_URL}/${key}`;
     await pool.query(`UPDATE especialistas SET foto_url = $1 WHERE id = $2`, [foto_url, req.especialistaId]);
+    return res.json({ ok: true, url: foto_url, foto_url });
+  } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// ── ADMIN: upload foto de especialista ────────────────────────────────────────
+const uploadEspAdmin = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } }).single('foto');
+app.post('/api/admin/especialista/:id/foto', checkAdmin, uploadEspAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!id || isNaN(id)) return res.status(400).json({ ok: false, error: 'ID inválido' });
+    if (!req.file) return res.status(400).json({ ok: false, error: 'Nenhuma imagem enviada' });
+    const ext = req.file.originalname.split('.').pop().toLowerCase();
+    if (!['jpg','jpeg','png','webp'].includes(ext)) return res.status(400).json({ ok: false, error: 'Formato inválido' });
+    const key = `especialistas/${id}_${Date.now()}.${ext}`;
+    await r2.send(new PutObjectCommand({
+      Bucket: process.env.R2_BUCKET_NAME,
+      Key: key,
+      Body: req.file.buffer,
+      ContentType: req.file.mimetype,
+    }));
+    const foto_url = `${process.env.R2_PUBLIC_URL}/${key}`;
+    await pool.query(`UPDATE especialistas SET foto_url = $1 WHERE id = $2`, [foto_url, id]);
+    console.log(`[ESP-ADMIN] Foto atualizada para especialista #${id}`);
     return res.json({ ok: true, url: foto_url, foto_url });
   } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
 });
