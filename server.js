@@ -3424,6 +3424,20 @@ app.put('/api/admin/especialista/:id/desativar', checkAdmin, async (req, res) =>
 });
 
 // ── ESPECIALISTAS: admin — desativar permanente (soft delete) ────────────────
+// ── ESPECIALISTAS: admin — exclusão permanente (DEVE vir antes de /:id) ────────
+app.delete('/api/admin/especialista/:id/excluir', checkAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!id || isNaN(id)) return res.status(400).json({ ok: false, error: 'ID inválido' });
+    const { rows } = await pool.query(`SELECT id, nome_exibicao FROM especialistas WHERE id = $1`, [id]);
+    if (!rows.length) return res.status(404).json({ ok: false, error: 'Especialista não encontrado' });
+    await pool.query(`DELETE FROM especialistas WHERE id = $1`, [id]);
+    console.log(`[ESP-ADMIN] Especialista #${id} (${rows[0].nome_exibicao}) EXCLUÍDO permanentemente`);
+    return res.json({ ok: true });
+  } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// ── ESPECIALISTAS: admin — desativar (rota genérica /:id, APÓS /excluir) ────────
 app.delete('/api/admin/especialista/:id', checkAdmin, async (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
@@ -3435,19 +3449,6 @@ app.delete('/api/admin/especialista/:id', checkAdmin, async (req, res) => {
     if (!rows.length) return res.status(404).json({ ok: false, error: 'Especialista não encontrado' });
     console.log('[ESP-ADMIN] Especialista desativado #'+rows[0].id);
     return res.json({ ok: true, especialista: rows[0] });
-  } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
-});
-
-// ── ESPECIALISTAS: admin — exclusão permanente ────────────────────────────────
-app.delete('/api/admin/especialista/:id/excluir', checkAdmin, async (req, res) => {
-  try {
-    const id = parseInt(req.params.id, 10);
-    if (!id || isNaN(id)) return res.status(400).json({ ok: false, error: 'ID inválido' });
-    const { rows } = await pool.query(`SELECT id, nome_exibicao FROM especialistas WHERE id = $1`, [id]);
-    if (!rows.length) return res.status(404).json({ ok: false, error: 'Especialista não encontrado' });
-    await pool.query(`DELETE FROM especialistas WHERE id = $1`, [id]);
-    console.log(`[ESP-ADMIN] Especialista #${id} (${rows[0].nome_exibicao}) EXCLUÍDO permanentemente`);
-    return res.json({ ok: true });
   } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
 });
 
@@ -3577,6 +3578,23 @@ app.put('/api/admin/especialista/:id', checkAdmin, async (req, res) => {
     const { rows } = await pool.query(`UPDATE especialistas SET ${updates.join(', ')} WHERE id = $${idx} RETURNING id, nome_exibicao, email, ativo, visivel`, params);
     if (!rows.length) return res.status(404).json({ ok: false, error: 'Especialista não encontrado' });
     return res.json({ ok: true, especialista: rows[0] });
+  } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
+});
+
+// ── ADMIN: atualizar disponibilidade de especialista ──────────────────────────
+app.patch('/api/admin/especialista/:id/disponibilidade', checkAdmin, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!id || isNaN(id)) return res.status(400).json({ ok: false, error: 'ID inválido' });
+    const { disponibilidade } = req.body || {};
+    if (!Array.isArray(disponibilidade)) return res.status(400).json({ ok: false, error: 'Disponibilidade deve ser um array' });
+    const { rows } = await pool.query(
+      `UPDATE especialistas SET disponibilidade = $1::jsonb WHERE id = $2 RETURNING id, nome_exibicao`,
+      [JSON.stringify(disponibilidade), id]
+    );
+    if (!rows.length) return res.status(404).json({ ok: false, error: 'Especialista não encontrado' });
+    console.log(`[ESP-ADMIN] Disponibilidade do especialista #${id} atualizada pelo admin (${disponibilidade.length} slot(s))`);
+    return res.json({ ok: true });
   } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
 });
 
