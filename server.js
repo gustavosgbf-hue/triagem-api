@@ -3213,7 +3213,7 @@ app.get('/api/especialistas/:especialidade', rlGeral, async (req, res) => {
     const { rows } = await pool.query(
       `SELECT id, nome_exibicao, especialidade, crm, uf, valor_consulta, foto_url, bio, disponibilidade
          FROM especialistas
-        WHERE especialidade = $1 AND ativo = true AND (visivel = true OR visivel IS NULL)
+        WHERE LOWER(especialidade) = LOWER($1) AND ativo = true AND (visivel = true OR visivel IS NULL)
         ORDER BY id ASC`,
       [req.params.especialidade]
     );
