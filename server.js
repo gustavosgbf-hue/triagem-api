@@ -6563,3 +6563,10 @@ app.get("/webhook", (req, res) => {
     return res.sendStatus(403);
   }
 });
+
+
+app.post("/webhook", (req, res) => {
+  console.log("🔥 Webhook recebido:");
+  console.log(JSON.stringify(req.body, null, 2));
+  res.sendStatus(200);
+});
