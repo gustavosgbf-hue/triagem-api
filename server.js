@@ -6612,34 +6612,27 @@ app.post("/webhook", async (req, res) => {
 
     if (!text) return;
 
-    await sendWhatsAppMessage(
-      from,
-      "Oi, sou a Julie da ConsultaJá24h 💙\nMe diz rapidinho o que você precisa."
-    );
-  } catch (err) {
-    console.error("Erro webhook:", err);
-  }
-});
+    const texto = text.toLowerCase();
 
+    let resposta = "";
 
-app.post("/webhook", (req, res) => {
-  const body = req.body;
+    if (texto.includes("psico") || texto.includes("ansiedade") || texto.includes("terapia")) {
+      resposta = "As sessões duram 50 minutos e você pode manter o mesmo psicólogo.\nVou te enviar os horários disponíveis 👇\nhttps://consultaja24h.com.br/psicologo-online";
+    }
 
-  // responde rápido pra Meta
-  res.sendStatus(200);
+    else if (texto.includes("consulta") || texto.includes("médico") || texto.includes("dor") || texto.includes("febre") || texto.includes("atestado")) {
+      resposta = "Consigo te conectar com médico agora por R$49,90.\nO pagamento aparece como JG Fonseca Serviços Médicos LTDA.\nVou te enviar o acesso 👇";
+    }
 
-  try {
-    const message =
-      body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+    else {
+      resposta = "Oi, sou a Julie da ConsultaJá24h 💙\nMe diz rapidinho o que você precisa que eu já te encaminho.";
+    }
 
-    if (!message) return;
-
-    const from = message.from; // número do usuário
-    const text = message.text?.body;
-
-    console.log("Mensagem recebida:", text, "de", from);
+    await sendWhatsAppMessage(from, resposta);
 
   } catch (err) {
     console.error("Erro webhook:", err);
   }
 });
+
+
