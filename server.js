@@ -95,16 +95,6 @@ async function sendWhatsAppMessage(to, text) {
   }
 }
 
-
-  const data = await response.json().catch(() => ({}));
-
-  if (!response.ok) {
-    console.error("Erro ao enviar WhatsApp:", data);
-  } else {
-    console.log("Resposta enviada para", to);
-  }
-}
-
 // LIMPEZA AUTOMATICA -- atendimentos travados em 'assumido' por mais de 48h
 setInterval(async () => {
   try {
