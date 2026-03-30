@@ -6627,7 +6627,7 @@ async function julieGerarPix(telefone) {
     customer: {
       name:   "Paciente WhatsApp",
       email:  `wa.${telefone}@consultaja24h.com.br`,
-      tax_id: "00000000000"
+      tax_id: "12345678909"
     },
     items: [{ name: "Consulta Médica Online — ConsultaJá24h", quantity: 1, unit_amount: VALOR_CENTAVOS }],
     qr_codes: [{ amount: { value: VALOR_CENTAVOS }, expiration_date: expiracaoISO }],
