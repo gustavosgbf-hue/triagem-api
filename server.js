@@ -85,6 +85,19 @@ async function sendWhatsAppMessage(to, text) {
 
   const data = await response.json().catch(() => ({}));
 
+  console.log("Status envio WhatsApp:", response.status);
+  console.log("Resposta completa WhatsApp:", JSON.stringify(data));
+
+  if (!response.ok) {
+    console.error("Erro ao enviar WhatsApp:", data);
+  } else {
+    console.log("Resposta enviada para", to);
+  }
+}
+  });
+
+  const data = await response.json().catch(() => ({}));
+
   if (!response.ok) {
     console.error("Erro ao enviar WhatsApp:", data);
   } else {
