@@ -82,6 +82,7 @@ async function sendWhatsAppMessage(to, text) {
     template: {
       name: "hello_world",
       language: { code: "en_US" }
+    }
   })
   });
 
