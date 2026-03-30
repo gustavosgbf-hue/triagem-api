@@ -69,21 +69,18 @@ const WHATSAPP_PHONE_NUMBER_ID = process.env.WHATSAPP_PHONE_NUMBER_ID;
 async function sendWhatsAppMessage(to, text) {
   const url = `https://graph.facebook.com/v25.0/${WHATSAPP_PHONE_NUMBER_ID}/messages`;
 
- const response = await fetch(url, {
-  method: "POST",
-  headers: {
-    "Authorization": `Bearer ${WHATSAPP_TOKEN}`,
-    "Content-Type": "application/json"
-  },
-  body: JSON.stringify({
-    messaging_product: "whatsapp",
-    to,
-    type: "template",
-    template: {
-      name: "hello_world",
-      language: { code: "en_US" }
-    }
-  })
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${WHATSAPP_TOKEN}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      messaging_product: "whatsapp",
+      to,
+      type: "text",
+      text: { body: text }
+    })
   });
 
   const data = await response.json().catch(() => ({}));
