@@ -6579,6 +6579,8 @@ app.get("/webhook", (req, res) => {
   }
 });
 
+const estadoJulie = {};
+
 function julieDetectarIntencao(texto) {
   const t = texto.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
   const cartao   = ["cartao", "credito", "parcelar", "parcelado", "debito"];
@@ -6603,6 +6605,29 @@ function julieDetectarEspecialidade(texto) {
     if (termos.some(k => t.includes(k))) return esp;
   }
   return null;
+}
+
+function julieValidarCPF(cpf) {
+  const c = cpf.replace(/\D/g, "");
+  if (c.length !== 11 || /^(\d)\1{10}$/.test(c)) return false;
+  let soma = 0;
+  for (let i = 0; i < 9; i++) soma += parseInt(c[i]) * (10 - i);
+  let r = (soma * 10) % 11;
+  if (r === 10 || r === 11) r = 0;
+  if (r !== parseInt(c[9])) return false;
+  soma = 0;
+  for (let i = 0; i < 10; i++) soma += parseInt(c[i]) * (11 - i);
+  r = (soma * 10) % 11;
+  if (r === 10 || r === 11) r = 0;
+  return r === parseInt(c[10]);
+}
+
+function julieExtrairNomeCPF(texto) {
+  const cpfMatch = texto.match(/\b(\d{3}\.?\d{3}\.?\d{3}-?\d{2})\b/);
+  const cpf = cpfMatch ? cpfMatch[1].replace(/\D/g, "") : null;
+  const semCpf = cpfMatch ? texto.replace(cpfMatch[0], "").trim() : texto.trim();
+  const nome = semCpf.replace(/[\d\.\/\-]/g, " ").trim().replace(/\s+/g, " ") || null;
+  return { nome: nome || null, cpf };
 }
 
 async function juliePromoverAtendimento(at, orderId) {
@@ -6649,11 +6674,9 @@ async function juliePromoverAtendimento(at, orderId) {
   }
 }
 
-async function julieGerarPix(telefone, queixaPaciente) {
-  const SITE_URL = process.env.SITE_URL || "https://consultaja24h.com.br";
-
+async function julieGerarPix(telefone, nome, cpf, mensagens) {
   const system = `Você é a Julie, assistente de triagem médica da ConsultaJá24h.
-O paciente enviou uma mensagem pelo WhatsApp descrevendo seu problema.
+O paciente relatou sua queixa pelo WhatsApp.
 Gere uma triagem médica resumida no formato exato abaixo, sem explicações adicionais:
 
 Queixa principal: [descrever]
@@ -6665,16 +6688,14 @@ Medicações em uso: Nega
 Solicitações: Consulta médica online
 Histórico: [resumo breve da queixa]`;
 
-  const aiResult = await callOpenAI({
-    system,
-    messages: [{ role: "user", content: queixaPaciente || "Consulta médica online via WhatsApp" }]
-  }).catch(() => ({ ok: false }));
+  const aiResult = await callOpenAI({ system, messages: mensagens }).catch(() => ({ ok: false }));
 
   const triagem = (aiResult.ok && aiResult.text?.trim())
     ? aiResult.text.trim()
     : "Queixa principal: Consulta médica online via WhatsApp\nIdade: Não informada\nSexo: Não informado\nAlergias: Nega\nDoenças crônicas: Nega\nMedicações em uso: Nega\nSolicitações: Consulta médica online";
 
   const campos = parsearTriagem(triagem);
+  const cpfLimpo = cpf.replace(/\D/g, "");
 
   const insertResult = await pool.query(
     `INSERT INTO fila_atendimentos
@@ -6683,7 +6704,7 @@ Histórico: [resumo breve da queixa]`;
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,NOW())
      RETURNING id`,
     [
-      "Paciente WhatsApp", telefone, telefone, "47130279015", "chat",
+      nome, telefone, telefone, cpfLimpo, "chat",
       triagem, "pagamento_pendente", "pendente",
       campos.queixa || triagem, campos.idade || "", campos.sexo || "",
       campos.alergias || "Nega", campos.cronicas || "Nega",
@@ -6700,9 +6721,9 @@ Histórico: [resumo breve da queixa]`;
   const orderBody = {
     reference_id: "CJ-WA-" + atendimentoId + "-" + Date.now(),
     customer: {
-      name:   "Paciente WhatsApp",
+      name:   nome,
       email:  `wa.${telefone}@consultaja24h.com.br`,
-      tax_id: "47130279015"
+      tax_id: cpfLimpo
     },
     items: [{ name: "Consulta Médica Online — ConsultaJá24h", quantity: 1, unit_amount: VALOR_CENTAVOS }],
     qr_codes: [{ amount: { value: VALOR_CENTAVOS }, expiration_date: expiracaoISO }],
@@ -6745,26 +6766,62 @@ app.post("/webhook", async (req, res) => {
 
     console.log("[JULIE] De:", from, "→", text);
 
-    const intencao = julieDetectarIntencao(text);
-    let resposta = "";
+    const estado = estadoJulie[from];
 
-    appendToSheet("Julie", [new Date().toISOString(), from, intencao, "mensagem", ""]).catch(() => {});
+    if (estado && estado.etapa === "sintomas") {
+      estado.mensagens.push({ role: "user", content: text });
+      estado.etapa = "dados";
+      appendToSheet("Julie", [new Date().toISOString(), from, "imediata", "sintomas", ""]).catch(() => {});
+      await sendWhatsAppMessage(from, "Perfeito. Agora me envia seu nome completo e CPF pra liberar seu atendimento.");
+      return;
+    }
 
-    if (intencao === "imediata") {
+    if (estado && estado.etapa === "dados") {
+      const { nome, cpf } = julieExtrairNomeCPF(text);
+      if (!cpf || !julieValidarCPF(cpf)) {
+        await sendWhatsAppMessage(from, "CPF inválido. Me envia o nome completo e CPF correto, por favor.");
+        return;
+      }
+      const nomeReal = nome && nome.length > 2 ? nome : (estado.nome || "Paciente WhatsApp");
+      estado.mensagens.push({ role: "user", content: text });
+      appendToSheet("Julie", [new Date().toISOString(), from, "imediata", "dados", ""]).catch(() => {});
       try {
-        const { pixText } = await julieGerarPix(from, text);
-        resposta =
+        const { pixText } = await julieGerarPix(from, nomeReal, cpf, estado.mensagens);
+        delete estadoJulie[from];
+        await sendWhatsAppMessage(from,
           "Consigo te conectar com médico agora por R$49,90.\n" +
           "O pagamento aparece como JG Fonseca Serviços Médicos LTDA.\n" +
           "Paga por aqui 👇\n" +
-          pixText;
+          pixText
+        );
       } catch (e) {
         console.error("[JULIE] Erro PIX:", e.message);
-        resposta =
+        delete estadoJulie[from];
+        await sendWhatsAppMessage(from,
           "Consigo te conectar com médico agora por R$49,90.\n" +
-          "Acessa aqui para pagar 👇\nhttps://consultaja24h.com.br";
+          "Acessa aqui para pagar 👇\nhttps://consultaja24h.com.br"
+        );
       }
-    } else if (intencao === "cartao") {
+      return;
+    }
+
+    const intencao = julieDetectarIntencao(text);
+    appendToSheet("Julie", [new Date().toISOString(), from, intencao, "mensagem", ""]).catch(() => {});
+
+    if (intencao === "imediata") {
+      estadoJulie[from] = {
+        etapa: "sintomas",
+        mensagens: [{ role: "user", content: text }],
+        nome: "",
+        cpf: ""
+      };
+      await sendWhatsAppMessage(from, "Entendi. Me diz rapidinho há quanto tempo começou e se tem mais algum sintoma.");
+      return;
+    }
+
+    let resposta = "";
+
+    if (intencao === "cartao") {
       resposta =
         "O pagamento no cartão é só pelo site 👇\n" +
         "https://consultaja24h.com.br";
