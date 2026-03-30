@@ -891,9 +891,9 @@ function montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno, linkAssumir, m
     }).join("");
   }
   return `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#060d0b;color:#fff;border-radius:12px;overflow:hidden">
-    <div style="background:linear-gradient(135deg,#b4e05a,#5ee0a0);padding:20px 28px"><h2 style="margin:0;color:#051208;font-size:18px">Novo paciente aguardando atendimento — ConsultaJa24h</h2></div>
+    <div style="background:linear-gradient(135deg,#b4e05a,#5ee0a0);padding:20px 28px"><h2 style="margin:0;color:#051208;font-size:18px">Novo paciente aguardando atendimento — ConsultaJá24h</h2></div>
     <div style="padding:28px">
-      <div style="margin-bottom:18px;padding:10px 16px;background:rgba(94,224,160,.07);border:1px solid rgba(94,224,160,.2);border-radius:10px;font-size:12px;color:rgba(94,224,160,.85)">\u2705 Pagamento confirmado automaticamente via PagBank</div>
+      <div style="margin-bottom:18px;padding:10px 16px;background:rgba(94,224,160,.07);border:1px solid rgba(94,224,160,.2);border-radius:10px;font-size:12px;color:rgba(94,224,160,.85)">\u2705 Acesse o painel para o atendimento</div>
       <table style="width:100%;border-collapse:collapse;margin-bottom:24px">
         <tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px;width:140px">Paciente</td><td style="padding:8px 0;font-weight:600">${nome||"-"}</td></tr>
         <tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">WhatsApp</td><td style="padding:8px 0;font-weight:600">${telLimpo}</td></tr>
@@ -914,7 +914,7 @@ function montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno, linkAssumir, m
         </a>
         <p style="margin:6px 0 0;font-size:11px;color:rgba(255,255,255,.2)">Entre com seu login para atender</p>
       </div>
-      <p style="margin:20px 0 0;font-size:12px;color:rgba(255,255,255,.3)">Enviado automaticamente pelo sistema ConsultaJa24h</p>
+      <p style="margin:20px 0 0;font-size:12px;color:rgba(255,255,255,.3)">Enviado automaticamente pelo sistema ConsultaJá24h</p>
     </div>
   </div>`;
 }
