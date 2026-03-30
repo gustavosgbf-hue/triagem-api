@@ -6683,7 +6683,7 @@ Histórico: [resumo breve da queixa]`;
      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,NOW())
      RETURNING id`,
     [
-      "Paciente WhatsApp", telefone, telefone, "00000000000", "chat",
+      "Paciente WhatsApp", telefone, telefone, "47130279015", "chat",
       triagem, "pagamento_pendente", "pendente",
       campos.queixa || triagem, campos.idade || "", campos.sexo || "",
       campos.alergias || "Nega", campos.cronicas || "Nega",
@@ -6702,7 +6702,7 @@ Histórico: [resumo breve da queixa]`;
     customer: {
       name:   "Paciente WhatsApp",
       email:  `wa.${telefone}@consultaja24h.com.br`,
-      tax_id: "00000000000"
+      tax_id: "47130279015"
     },
     items: [{ name: "Consulta Médica Online — ConsultaJá24h", quantity: 1, unit_amount: VALOR_CENTAVOS }],
     qr_codes: [{ amount: { value: VALOR_CENTAVOS }, expiration_date: expiracaoISO }],
