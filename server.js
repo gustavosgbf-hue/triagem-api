@@ -845,12 +845,7 @@ app.post("/api/pagbank/webhook", async (req, res) => {
       if (fbFila.rowCount > 0) {
         const atFb = fbFila.rows[0];
         console.log("[PAGBANK-WEBHOOK] Fallback fila_atendimentos: atendimento #" + atFb.id + " atualizado via race-condition recovery.");
-        if (atFb.tel) {
-          sendWhatsAppMessage(atFb.tel, "Pagamento confirmado ✅\nSeu atendimento já vai começar.").catch(e => console.warn("[PAGBANK-WEBHOOK] WhatsApp fallback:", e.message));
-        }
-        if (atFb.status === 'aguardando' && !isTriagemPlaceholder(atFb.triagem)) {
-          await notificarMedicos(atFb);
-        }
+        await juliePromoverAtendimento(atFb, orderId);
         return;
       }
 
@@ -860,14 +855,7 @@ app.post("/api/pagbank/webhook", async (req, res) => {
 
     const at = rows[0];
     console.log("[PAGBANK-WEBHOOK] Pagamento confirmado — atendimento #" + at.id + " status:" + at.status);
-
-    if (at.tel) {
-      sendWhatsAppMessage(at.tel, "Pagamento confirmado ✅\nSeu atendimento já vai começar.").catch(e => console.warn("[PAGBANK-WEBHOOK] WhatsApp:", e.message));
-    }
-
-    if (at.status === 'aguardando' && !isTriagemPlaceholder(at.triagem)) {
-      await notificarMedicos(at);
-    }
+    await juliePromoverAtendimento(at, orderId);
 
   } catch (e) {
     console.error("[PAGBANK-WEBHOOK] Erro no processamento:", e.message);
@@ -6593,9 +6581,9 @@ app.get("/webhook", (req, res) => {
 
 function julieDetectarIntencao(texto) {
   const t = texto.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
-  const cartao = ["cartao", "credito", "parcelar", "parcelado", "debito"];
-  const psi    = ["psicologo", "psicologa", "psicologia", "terapia", "terapeuta", "ansiedade", "depressao", "estresse", "emocional", "mental", "angustia", "tristeza", "panico", "fobia", "burnout"];
-  const esp    = ["especialista", "psiquiatra", "psiquiatria", "endocrino", "endocrinolog", "dermato", "dermatologista", "ginecolog", "nutricion", "cardiolog", "ortoped", "neurologista", "oftalmolog", "urologista"];
+  const cartao   = ["cartao", "credito", "parcelar", "parcelado", "debito"];
+  const psi      = ["psicologo", "psicologa", "psicologia", "terapia", "terapeuta", "ansiedade", "depressao", "estresse", "emocional", "mental", "angustia", "tristeza", "panico", "fobia", "burnout"];
+  const esp      = ["especialista", "psiquiatra", "psiquiatria", "endocrino", "endocrinolog", "dermato", "dermatologista", "ginecolog", "nutricion", "cardiolog", "ortoped", "neurologista", "oftalmolog", "urologista"];
   const imediata = ["consulta", "medico", "medica", "dor", "febre", "atestado", "receita", "enjoo", "vomito", "tontura", "pressao", "gripe", "tosse", "infeccao", "emergencia", "urgente", "agora", "imediato", "rapido", "doendo", "doente", "queixa", "sintoma"];
   if (cartao.some(s => t.includes(s)))   return "cartao";
   if (psi.some(s => t.includes(s)))      return "psicologo";
@@ -6617,17 +6605,104 @@ function julieDetectarEspecialidade(texto) {
   return null;
 }
 
-async function julieGerarPix(telefone) {
+async function juliePromoverAtendimento(at, orderId) {
+  const SITE_URL = process.env.SITE_URL || "https://consultaja24h.com.br";
+  const linkTriagem = `${SITE_URL}/triagem.html?consulta=${at.id}`;
+
+  if (at.tel) {
+    appendToSheet("Julie", [new Date().toISOString(), at.tel, "imediata", "pago", orderId]).catch(() => {});
+  }
+
+  if (!isTriagemPlaceholder(at.triagem)) {
+    if (at.status !== "aguardando") {
+      const upd = await pool.query(
+        `UPDATE fila_atendimentos
+            SET status = 'aguardando', pagamento_status = 'confirmado', pagamento_confirmado_em = NOW()
+          WHERE id = $1 AND status NOT IN ('assumido','encerrado')
+          RETURNING id, nome, tel, cpf, tipo, triagem, tel_documentos`,
+        [at.id]
+      ).catch(() => ({ rowCount: 0, rows: [] }));
+      if (upd.rowCount > 0) {
+        await notificarMedicos(upd.rows[0]);
+        if (upd.rows[0].tel) {
+          sendWhatsAppMessage(upd.rows[0].tel,
+            "Pagamento confirmado ✅\nSeu atendimento já vai começar."
+          ).catch(() => {});
+        }
+      }
+    } else {
+      await notificarMedicos(at);
+      if (at.tel) {
+        sendWhatsAppMessage(at.tel,
+          "Pagamento confirmado ✅\nSeu atendimento já vai começar."
+        ).catch(() => {});
+      }
+    }
+  } else {
+    if (at.tel) {
+      sendWhatsAppMessage(at.tel,
+        "Pagamento confirmado ✅\n" +
+        "Conclua sua triagem para o médico te atender mais rápido 👇\n" +
+        linkTriagem
+      ).catch(() => {});
+    }
+  }
+}
+
+async function julieGerarPix(telefone, queixaPaciente) {
+  const SITE_URL = process.env.SITE_URL || "https://consultaja24h.com.br";
+
+  const system = `Você é a Julie, assistente de triagem médica da ConsultaJá24h.
+O paciente enviou uma mensagem pelo WhatsApp descrevendo seu problema.
+Gere uma triagem médica resumida no formato exato abaixo, sem explicações adicionais:
+
+Queixa principal: [descrever]
+Idade: [estimativa ou "Não informada"]
+Sexo: [Não informado]
+Alergias: Nega
+Doenças crônicas: Nega
+Medicações em uso: Nega
+Solicitações: Consulta médica online
+Histórico: [resumo breve da queixa]`;
+
+  const aiResult = await callOpenAI({
+    system,
+    messages: [{ role: "user", content: queixaPaciente || "Consulta médica online via WhatsApp" }]
+  }).catch(() => ({ ok: false }));
+
+  const triagem = (aiResult.ok && aiResult.text?.trim())
+    ? aiResult.text.trim()
+    : "Queixa principal: Consulta médica online via WhatsApp\nIdade: Não informada\nSexo: Não informado\nAlergias: Nega\nDoenças crônicas: Nega\nMedicações em uso: Nega\nSolicitações: Consulta médica online";
+
+  const campos = parsearTriagem(triagem);
+
+  const insertResult = await pool.query(
+    `INSERT INTO fila_atendimentos
+       (nome, tel, tel_documentos, cpf, tipo, triagem, status, pagamento_status,
+        queixa, idade, sexo, alergias, cronicas, medicacoes, solicita, criado_em)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,NOW())
+     RETURNING id`,
+    [
+      "Paciente WhatsApp", telefone, telefone, "00000000000", "chat",
+      triagem, "pagamento_pendente", "pendente",
+      campos.queixa || triagem, campos.idade || "", campos.sexo || "",
+      campos.alergias || "Nega", campos.cronicas || "Nega",
+      campos.medicacoes || "Nega", campos.solicita || "Consulta médica online"
+    ]
+  );
+
+  const atendimentoId = insertResult.rows[0]?.id;
+  if (!atendimentoId) throw new Error("Falha ao criar atendimento");
+
   const expiracao    = new Date(Date.now() + 30 * 60 * 1000);
   const expiracaoISO = expiracao.toISOString().replace("Z", "-03:00");
-  const referenceId  = "CJ-WA-" + Date.now() + "-" + Math.random().toString(36).slice(2, 6).toUpperCase();
 
   const orderBody = {
-    reference_id: referenceId,
+    reference_id: "CJ-WA-" + atendimentoId + "-" + Date.now(),
     customer: {
       name:   "Paciente WhatsApp",
       email:  `wa.${telefone}@consultaja24h.com.br`,
-      tax_id: "12345678909"
+      tax_id: "00000000000"
     },
     items: [{ name: "Consulta Médica Online — ConsultaJá24h", quantity: 1, unit_amount: VALOR_CENTAVOS }],
     qr_codes: [{ amount: { value: VALOR_CENTAVOS }, expiration_date: expiracaoISO }],
@@ -6647,12 +6722,13 @@ async function julieGerarPix(telefone) {
   if (!qr?.text) throw new Error("QR Code ausente");
 
   await pool.query(
-    `INSERT INTO fila_atendimentos (nome, tel, pagamento_status, pagbank_order_id, criado_em, tipo, status)
-     VALUES ($1, $2, 'pendente', $3, NOW(), 'online', 'pagamento_pendente') ON CONFLICT DO NOTHING`,
-    ["Paciente WhatsApp", telefone, data.id]
-  ).catch(e => console.warn("[JULIE] Insert fila:", e.message));
+    `UPDATE fila_atendimentos SET pagbank_order_id = $1 WHERE id = $2`,
+    [data.id, atendimentoId]
+  );
 
-  return qr.text;
+  appendToSheet("Julie", [new Date().toISOString(), telefone, "imediata", "pendente", data.id]).catch(() => {});
+
+  return { pixText: qr.text, atendimentoId };
 }
 
 app.post("/webhook", async (req, res) => {
@@ -6672,42 +6748,36 @@ app.post("/webhook", async (req, res) => {
     const intencao = julieDetectarIntencao(text);
     let resposta = "";
 
+    appendToSheet("Julie", [new Date().toISOString(), from, intencao, "mensagem", ""]).catch(() => {});
+
     if (intencao === "imediata") {
       try {
-        const pix = await julieGerarPix(from);
+        const { pixText } = await julieGerarPix(from, text);
         resposta =
           "Consigo te conectar com médico agora por R$49,90.\n" +
           "O pagamento aparece como JG Fonseca Serviços Médicos LTDA.\n" +
           "Paga por aqui 👇\n" +
-          pix;
+          pixText;
       } catch (e) {
         console.error("[JULIE] Erro PIX:", e.message);
         resposta =
           "Consigo te conectar com médico agora por R$49,90.\n" +
           "Acessa aqui para pagar 👇\nhttps://consultaja24h.com.br";
       }
-    }
-
-    else if (intencao === "cartao") {
+    } else if (intencao === "cartao") {
       resposta =
         "O pagamento no cartão é só pelo site 👇\n" +
         "https://consultaja24h.com.br";
-    }
-
-    else if (intencao === "psicologo") {
+    } else if (intencao === "psicologo") {
       resposta =
         "Vou te enviar os horários disponíveis 👇\n" +
         "https://consultaja24h.com.br/psicologo-online";
-    }
-
-    else if (intencao === "especialista") {
+    } else if (intencao === "especialista") {
       const esp = julieDetectarEspecialidade(text);
       resposta = esp
         ? "Vou te enviar os profissionais disponíveis 👇\nhttps://consultaja24h.com.br/especialista?esp=" + esp
         : "Qual especialidade você precisa?";
-    }
-
-    else {
+    } else {
       resposta = "Me diz rapidinho o que você precisa que eu te encaminho.";
     }
 
