@@ -94,7 +94,7 @@ async function sendWhatsAppMessage(to, text) {
     console.log("Resposta enviada para", to);
   }
 }
-  });
+
 
   const data = await response.json().catch(() => ({}));
 
