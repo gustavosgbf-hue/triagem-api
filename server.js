@@ -766,8 +766,6 @@ app.post("/api/pagbank/order", async (req, res) => {
   }
 });
 
-// Webhook PagBank — notificação de pagamento confirmado
-// Responde 200 imediatamente -> processa de forma assincrona e idempotente
 app.post("/api/pagbank/webhook", async (req, res) => {
   const event = req.body;
   if (!event || typeof event !== "object") {
@@ -775,8 +773,6 @@ app.post("/api/pagbank/webhook", async (req, res) => {
     return res.status(400).end();
   }
 
-  // CORRETO: order_id real do PagBank é event.data.id (ex: "ORDE_...")
-  // reference_id (ex: "CJ-...") e nosso identificador — NAO usar para busca no banco
   const orderId  = String(event?.data?.id || event?.id || "");
   const orderRef = String(event?.data?.reference_id ?? event?.reference_id ?? "");
   const charges  = event?.data?.charges || event?.charges || [];
@@ -784,14 +780,11 @@ app.post("/api/pagbank/webhook", async (req, res) => {
 
   console.log("[PAGBANK-WEBHOOK] Recebido — orderId:", orderId, "ref:", orderRef, "pago:", pago);
 
-  // Responde 200 imediatamente — PagBank nao pode esperar processamento
   res.sendStatus(200);
 
   if (!pago || !orderId) return;
 
   try {
-    // Atualiza atendimento imediato pelo pagbank_order_id — idempotente:
-    // so avanca se ainda estiver 'pendente', prevenindo duplo processamento em retries
     const { rowCount, rows } = await pool.query(
       `UPDATE fila_atendimentos
           SET pagamento_status        = 'confirmado',
@@ -820,7 +813,6 @@ app.post("/api/pagbank/webhook", async (req, res) => {
     if (rowCount === 0) {
       console.log("[PAGBANK-WEBHOOK] Order " + orderId + " nao encontrado pelo pagbank_order_id — tentando fallback por fila_atendimentos.");
 
-      // Fallback 1: fila_atendimentos sem pagbank_order_id ainda vinculado (race condition vincular-order)
       const fbFila = await pool.query(
         `UPDATE fila_atendimentos
             SET pagamento_status        = 'confirmado',
@@ -853,6 +845,9 @@ app.post("/api/pagbank/webhook", async (req, res) => {
       if (fbFila.rowCount > 0) {
         const atFb = fbFila.rows[0];
         console.log("[PAGBANK-WEBHOOK] Fallback fila_atendimentos: atendimento #" + atFb.id + " atualizado via race-condition recovery.");
+        if (atFb.tel) {
+          sendWhatsAppMessage(atFb.tel, "Pagamento confirmado ✅\nSeu atendimento já vai começar.").catch(e => console.warn("[PAGBANK-WEBHOOK] WhatsApp fallback:", e.message));
+        }
         if (atFb.status === 'aguardando' && !isTriagemPlaceholder(atFb.triagem)) {
           await notificarMedicos(atFb);
         }
@@ -866,8 +861,10 @@ app.post("/api/pagbank/webhook", async (req, res) => {
     const at = rows[0];
     console.log("[PAGBANK-WEBHOOK] Pagamento confirmado — atendimento #" + at.id + " status:" + at.status);
 
-    // Notifica medicos apenas se o atendimento esta pronto (triagem real ja preenchida)
-    // Se status ainda e 'triagem', o /api/atendimento/atualizar-triagem notifica quando concluir
+    if (at.tel) {
+      sendWhatsAppMessage(at.tel, "Pagamento confirmado ✅\nSeu atendimento já vai começar.").catch(e => console.warn("[PAGBANK-WEBHOOK] WhatsApp:", e.message));
+    }
+
     if (at.status === 'aguardando' && !isTriagemPlaceholder(at.triagem)) {
       await notificarMedicos(at);
     }
@@ -6584,11 +6581,9 @@ app.listen(PORT, '0.0.0.0', () => {
 
 app.get("/webhook", (req, res) => {
   const VERIFY_TOKEN = "consultaja24h";
-
   const mode = req.query["hub.mode"];
   const token = req.query["hub.verify_token"];
   const challenge = req.query["hub.challenge"];
-
   if (mode === "subscribe" && token === VERIFY_TOKEN) {
     return res.status(200).send(challenge);
   } else {
@@ -6596,9 +6591,72 @@ app.get("/webhook", (req, res) => {
   }
 });
 
+function julieDetectarIntencao(texto) {
+  const t = texto.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  const cartao = ["cartao", "credito", "parcelar", "parcelado", "debito"];
+  const psi    = ["psicologo", "psicologa", "psicologia", "terapia", "terapeuta", "ansiedade", "depressao", "estresse", "emocional", "mental", "angustia", "tristeza", "panico", "fobia", "burnout"];
+  const esp    = ["especialista", "psiquiatra", "psiquiatria", "endocrino", "endocrinolog", "dermato", "dermatologista", "ginecolog", "nutricion", "cardiolog", "ortoped", "neurologista", "oftalmolog", "urologista"];
+  const imediata = ["consulta", "medico", "medica", "dor", "febre", "atestado", "receita", "enjoo", "vomito", "tontura", "pressao", "gripe", "tosse", "infeccao", "emergencia", "urgente", "agora", "imediato", "rapido", "doendo", "doente", "queixa", "sintoma"];
+  if (cartao.some(s => t.includes(s)))   return "cartao";
+  if (psi.some(s => t.includes(s)))      return "psicologo";
+  if (esp.some(s => t.includes(s)))      return "especialista";
+  if (imediata.some(s => t.includes(s))) return "imediata";
+  return "desconhecida";
+}
+
+function julieDetectarEspecialidade(texto) {
+  const t = texto.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  const mapa = {
+    psiquiatria:    ["psiquiatra", "psiquiatria"],
+    endocrinologia: ["endocrino", "endocrinolog", "diabetes", "tireoide"],
+    dermatologia:   ["dermato", "dermatologista", "pele", "acne"]
+  };
+  for (const [esp, termos] of Object.entries(mapa)) {
+    if (termos.some(k => t.includes(k))) return esp;
+  }
+  return null;
+}
+
+async function julieGerarPix(telefone) {
+  const expiracao    = new Date(Date.now() + 30 * 60 * 1000);
+  const expiracaoISO = expiracao.toISOString().replace("Z", "-03:00");
+  const referenceId  = "CJ-WA-" + Date.now() + "-" + Math.random().toString(36).slice(2, 6).toUpperCase();
+
+  const orderBody = {
+    reference_id: referenceId,
+    customer: {
+      name:   "Paciente WhatsApp",
+      email:  `wa.${telefone}@consultaja24h.com.br`,
+      tax_id: "00000000000"
+    },
+    items: [{ name: "Consulta Médica Online — ConsultaJá24h", quantity: 1, unit_amount: VALOR_CENTAVOS }],
+    qr_codes: [{ amount: { value: VALOR_CENTAVOS }, expiration_date: expiracaoISO }],
+    notification_urls: [`${process.env.API_URL || "https://triagem-api.onrender.com"}/api/pagbank/webhook`]
+  };
+
+  const response = await fetch(`${PAGBANK_URL}/orders`, {
+    method:  "POST",
+    headers: { Authorization: `Bearer ${PAGBANK_TOKEN}`, "Content-Type": "application/json", accept: "application/json" },
+    body:    JSON.stringify(orderBody)
+  });
+
+  const data = await response.json();
+  if (!response.ok) throw new Error(JSON.stringify(data));
+
+  const qr = data.qr_codes?.[0];
+  if (!qr?.text) throw new Error("QR Code ausente");
+
+  await pool.query(
+    `INSERT INTO fila_atendimentos (nome, tel, pagamento_status, pagbank_order_id, criado_em, tipo, status)
+     VALUES ($1, $2, 'pendente', $3, NOW(), 'online', 'pagamento_pendente') ON CONFLICT DO NOTHING`,
+    ["Paciente WhatsApp", telefone, data.id]
+  ).catch(e => console.warn("[JULIE] Insert fila:", e.message));
+
+  return qr.text;
+}
+
 app.post("/webhook", async (req, res) => {
   const body = req.body;
-
   res.sendStatus(200);
 
   try {
@@ -6607,32 +6665,55 @@ app.post("/webhook", async (req, res) => {
 
     const from = message.from;
     const text = message.text?.body;
-
-    console.log("Mensagem recebida:", text, "de", from);
-
     if (!text) return;
 
-    const texto = text.toLowerCase();
+    console.log("[JULIE] De:", from, "→", text);
 
+    const intencao = julieDetectarIntencao(text);
     let resposta = "";
 
-    if (texto.includes("psico") || texto.includes("ansiedade") || texto.includes("terapia")) {
-      resposta = "As sessões duram 50 minutos e você pode manter o mesmo psicólogo.\nVou te enviar os horários disponíveis 👇\nhttps://consultaja24h.com.br/psicologo-online";
+    if (intencao === "imediata") {
+      try {
+        const pix = await julieGerarPix(from);
+        resposta =
+          "Consigo te conectar com médico agora por R$49,90.\n" +
+          "O pagamento aparece como JG Fonseca Serviços Médicos LTDA.\n" +
+          "Paga por aqui 👇\n" +
+          pix;
+      } catch (e) {
+        console.error("[JULIE] Erro PIX:", e.message);
+        resposta =
+          "Consigo te conectar com médico agora por R$49,90.\n" +
+          "Acessa aqui para pagar 👇\nhttps://consultaja24h.com.br";
+      }
     }
 
-    else if (texto.includes("consulta") || texto.includes("médico") || texto.includes("dor") || texto.includes("febre") || texto.includes("atestado")) {
-      resposta = "Consigo te conectar com médico agora por R$49,90.\nO pagamento aparece como JG Fonseca Serviços Médicos LTDA.\nVou te enviar o acesso 👇";
+    else if (intencao === "cartao") {
+      resposta =
+        "O pagamento no cartão é só pelo site 👇\n" +
+        "https://consultaja24h.com.br";
+    }
+
+    else if (intencao === "psicologo") {
+      resposta =
+        "Vou te enviar os horários disponíveis 👇\n" +
+        "https://consultaja24h.com.br/psicologo-online";
+    }
+
+    else if (intencao === "especialista") {
+      const esp = julieDetectarEspecialidade(text);
+      resposta = esp
+        ? "Vou te enviar os profissionais disponíveis 👇\nhttps://consultaja24h.com.br/especialista?esp=" + esp
+        : "Qual especialidade você precisa?";
     }
 
     else {
-      resposta = "Oi, sou a Julie da ConsultaJá24h 💙\nMe diz rapidinho o que você precisa que eu já te encaminho.";
+      resposta = "Me diz rapidinho o que você precisa que eu te encaminho.";
     }
 
     await sendWhatsAppMessage(from, resposta);
 
   } catch (err) {
-    console.error("Erro webhook:", err);
+    console.error("[JULIE] Erro webhook:", err);
   }
 });
-
-
