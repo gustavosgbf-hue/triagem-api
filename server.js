@@ -63,6 +63,35 @@ const JWT_SECRET = process.env.JWT_SECRET;
 if (!OPENAI_KEY) { console.error("OPENAI_API_KEY nao definida"); process.exit(1); }
 if (!JWT_SECRET) { console.error("JWT_SECRET nao definida"); process.exit(1); }
 
+const WHATSAPP_TOKEN = process.env.WHATSAPP_TOKEN;
+const WHATSAPP_PHONE_NUMBER_ID = process.env.WHATSAPP_PHONE_NUMBER_ID;
+
+async function sendWhatsAppMessage(to, text) {
+  const url = `https://graph.facebook.com/v25.0/${WHATSAPP_PHONE_NUMBER_ID}/messages`;
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${WHATSAPP_TOKEN}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      messaging_product: "whatsapp",
+      to,
+      type: "text",
+      text: { body: text }
+    })
+  });
+
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok) {
+    console.error("Erro ao enviar WhatsApp:", data);
+  } else {
+    console.log("Resposta enviada para", to);
+  }
+}
+
 // LIMPEZA AUTOMATICA -- atendimentos travados em 'assumido' por mais de 48h
 setInterval(async () => {
   try {
@@ -6561,6 +6590,31 @@ app.get("/webhook", (req, res) => {
     return res.status(200).send(challenge);
   } else {
     return res.sendStatus(403);
+  }
+});
+
+app.post("/webhook", async (req, res) => {
+  const body = req.body;
+
+  res.sendStatus(200);
+
+  try {
+    const message = body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+    if (!message) return;
+
+    const from = message.from;
+    const text = message.text?.body;
+
+    console.log("Mensagem recebida:", text, "de", from);
+
+    if (!text) return;
+
+    await sendWhatsAppMessage(
+      from,
+      "Oi, sou a Julie da ConsultaJá24h 💙\nMe diz rapidinho o que você precisa."
+    );
+  } catch (err) {
+    console.error("Erro webhook:", err);
   }
 });
 
