@@ -6566,7 +6566,23 @@ app.get("/webhook", (req, res) => {
 
 
 app.post("/webhook", (req, res) => {
-  console.log("🔥 Webhook recebido:");
-  console.log(JSON.stringify(req.body, null, 2));
+  const body = req.body;
+
+  // responde rápido pra Meta
   res.sendStatus(200);
+
+  try {
+    const message =
+      body?.entry?.[0]?.changes?.[0]?.value?.messages?.[0];
+
+    if (!message) return;
+
+    const from = message.from; // número do usuário
+    const text = message.text?.body;
+
+    console.log("Mensagem recebida:", text, "de", from);
+
+  } catch (err) {
+    console.error("Erro webhook:", err);
+  }
 });
