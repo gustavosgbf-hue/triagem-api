@@ -6561,6 +6561,64 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
+// ── GOOGLE REVIEWS ────────────────────────────────────────────────────────────
+// Cache simples em memória: evita chamar a Places API a cada pageview
+let _reviewsCache = null;
+let _reviewsCacheTs = 0;
+const REVIEWS_CACHE_TTL = 6 * 60 * 60 * 1000; // 6 horas
+
+app.get('/api/reviews', async (req, res) => {
+  try {
+    // Serve do cache se ainda válido
+    if (_reviewsCache && Date.now() - _reviewsCacheTs < REVIEWS_CACHE_TTL) {
+      return res.json(_reviewsCache);
+    }
+
+    const placeId = 'ChIJqSmkDKj4f0YRwkydJn8bPI0';
+    const key     = process.env.GOOGLE_PLACES_KEY;
+    const url     = `https://maps.googleapis.com/maps/api/place/details/json`
+                  + `?place_id=${placeId}`
+                  + `&fields=name,rating,reviews,user_ratings_total`
+                  + `&language=pt-BR`
+                  + `&key=${key}`;
+
+    const { data } = await axios.get(url, { timeout: 8000 });
+
+    if (!data.result) {
+      return res.status(502).json({ ok: false, error: 'Place não encontrado' });
+    }
+
+    const result = {
+      rating:             data.result.rating             || null,
+      user_ratings_total: data.result.user_ratings_total || null,
+      reviews: (data.result.reviews || [])
+        .filter(r => r.text && r.text.length > 20)
+        .sort((a, b) => b.time - a.time)
+        .slice(0, 5)
+        .map(r => ({
+          author_name:               r.author_name,
+          author_url:                r.author_url,
+          profile_photo_url:         r.profile_photo_url,
+          rating:                    r.rating,
+          text:                      r.text,
+          relative_time_description: r.relative_time_description,
+          time:                      r.time,
+        }))
+    };
+
+    _reviewsCache   = result;
+    _reviewsCacheTs = Date.now();
+
+    res.json(result);
+  } catch (err) {
+    console.error('[reviews]', err.message);
+    // Se cache expirado mas existe, serve ele mesmo velho antes de 502
+    if (_reviewsCache) return res.json(_reviewsCache);
+    res.status(502).json({ ok: false, error: 'Erro ao buscar avaliações' });
+  }
+});
+// ─────────────────────────────────────────────────────────────────────────────
+
 const PORT = process.env.PORT || 10000;
 
 app.listen(PORT, '0.0.0.0', () => {
