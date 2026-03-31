@@ -1397,6 +1397,108 @@ app.post("/api/atendimento/atualizar-triagem", async (req, res) => {
   }
 });
 
+// ── POST /api/atendimento/atualizar-cpf ───────────────────────────────────────
+// Persiste CPF após confirmação de pagamento PIX.
+// Chamado pela tela leve de CPF pós-pagamento no frontend.
+// Best-effort: não bloqueia o fluxo principal se falhar.
+app.post("/api/atendimento/atualizar-cpf", async (req, res) => {
+  try {
+    const { atendimentoId, orderId, pacienteId, telefone, cpf } = req.body || {};
+
+    // ── Validação do CPF ────────────────────────────────────────────────────
+    const cpfNormalizado = String(cpf || "").replace(/\D/g, "");
+    if (!cpfNormalizado || cpfNormalizado.length !== 11) {
+      return res.status(400).json({ ok: false, error: "CPF invalido" });
+    }
+
+    // ── Pelo menos um identificador deve estar presente ─────────────────────
+    if (!atendimentoId && !orderId && !pacienteId && !telefone) {
+      return res.status(400).json({ ok: false, error: "Nenhum identificador informado" });
+    }
+
+    let updated = false;
+
+    // ── 1. Por atendimentoId (mais preciso) ─────────────────────────────────
+    if (!updated && atendimentoId) {
+      const r = await pool.query(
+        `UPDATE fila_atendimentos SET cpf = $1
+           WHERE id = $2
+           RETURNING id`,
+        [cpfNormalizado, atendimentoId]
+      );
+      if (r.rowCount > 0) {
+        console.log(`[CPF-UPDATE] atendimento #${atendimentoId} — CPF atualizado via atendimentoId`);
+        updated = true;
+      }
+    }
+
+    // ── 2. Por orderId (pagbank_order_id) ───────────────────────────────────
+    if (!updated && orderId) {
+      const r = await pool.query(
+        `UPDATE fila_atendimentos SET cpf = $1
+           WHERE pagbank_order_id = $2
+           RETURNING id`,
+        [cpfNormalizado, orderId]
+      );
+      if (r.rowCount > 0) {
+        console.log(`[CPF-UPDATE] order ${orderId} — CPF atualizado via pagbank_order_id`);
+        updated = true;
+      }
+    }
+
+    // ── 3. Por pacienteId na tabela pacientes ────────────────────────────────
+    if (!updated && pacienteId) {
+      const r = await pool.query(
+        `UPDATE pacientes SET cpf = $1
+           WHERE id = $2
+           RETURNING id`,
+        [cpfNormalizado, pacienteId]
+      );
+      if (r.rowCount > 0) {
+        console.log(`[CPF-UPDATE] paciente #${pacienteId} — CPF atualizado via pacienteId`);
+        updated = true;
+      }
+    }
+
+    // ── 4. Por telefone normalizado (fallback, pega o atendimento mais recente) ──
+    if (!updated && telefone) {
+      const telNorm = String(telefone).replace(/\D/g, "");
+      const telBusca = telNorm.length > 11 && telNorm.startsWith("55")
+        ? telNorm.slice(2)
+        : telNorm;
+      if (telBusca.length >= 10) {
+        const r = await pool.query(
+          `UPDATE fila_atendimentos SET cpf = $1
+             WHERE id = (
+               SELECT id FROM fila_atendimentos
+                WHERE regexp_replace(tel, '\\D', '', 'g') LIKE $2
+                  AND pagamento_status = 'confirmado'
+                ORDER BY criado_em DESC
+                LIMIT 1
+             )
+             RETURNING id`,
+          [cpfNormalizado, `%${telBusca}`]
+        );
+        if (r.rowCount > 0) {
+          console.log(`[CPF-UPDATE] tel ${telBusca} — CPF atualizado via telefone fallback`);
+          updated = true;
+        }
+      }
+    }
+
+    if (!updated) {
+      console.warn(`[CPF-UPDATE] Nenhum registro encontrado — atendimentoId:${atendimentoId} orderId:${orderId} pacienteId:${pacienteId}`);
+      return res.status(404).json({ ok: false, error: "Atendimento nao encontrado" });
+    }
+
+    return res.json({ ok: true });
+
+  } catch (e) {
+    console.error("Erro em /api/atendimento/atualizar-cpf:", e);
+    return res.status(500).json({ ok: false, error: "Erro ao atualizar CPF" });
+  }
+});
+
 // ── ROTA PÚBLICA: busca paciente por WhatsApp para autopreenchimento ──────────
 // Sem autenticação — retorna apenas campos básicos para UX de retorno
 app.get("/api/paciente/buscar", rlGeral, async (req, res) => {
