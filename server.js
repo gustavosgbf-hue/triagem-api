@@ -5299,40 +5299,25 @@ app.post("/api/efi/cartao/cobrar", rlGeral, async (req, res) => {
         ).catch(e => console.warn("[EFI-CARTAO] Salvar charge_id falhou:", e.message));
       }
 
-      // Se já veio "paid" (ex: sandbox), confirma na hora igual ao webhook faria
+      // Se já veio "paid" (ex: sandbox), confirma pagamento na hora.
+      // NÃO chama notificarMedicos aqui — o tipo (chat/video) ainda não foi escolhido.
+      // notificarMedicos será chamado por atualizar-triagem após modalidade + triagem concluídas.
       if ((status === "paid" || status === "approved") && atendimentoId) {
-        const { rows: atRows } = await pool.query(
+        await pool.query(
           `UPDATE fila_atendimentos
               SET pagamento_status        = 'confirmado',
                   pagamento_confirmado_em = NOW(),
                   status = CASE
                     WHEN status = 'pagamento_pendente' THEN 'triagem'
-                    WHEN status = 'triagem' THEN
-                      CASE
-                        WHEN LOWER(TRIM(triagem)) NOT IN (
-                          '(aguardando pagamento)',
-                          '(pagamento confirmado — aguardando triagem)',
-                          '(triagem em andamento)',
-                          '(aguardando triagem de agendamento)',
-                          '(aguardando resposta)'
-                        ) THEN 'aguardando'
-                        ELSE 'triagem'
-                      END
+                    WHEN status = 'triagem' THEN 'triagem'
                     ELSE status
                   END
             WHERE id = $1
-              AND pagamento_status = 'pendente'
-            RETURNING id, nome, tel, cpf, tipo, triagem, status`,
+              AND pagamento_status = 'pendente'`,
           [atendimentoId]
-        ).catch(e => { console.warn("[EFI-CARTAO] Update fila falhou:", e.message); return { rows: [] }; });
+        ).catch(e => console.warn("[EFI-CARTAO] Salvar confirmação síncrona falhou:", e.message));
 
-        const at = atRows[0];
-        if (at) {
-          console.log(`[EFI-CARTAO] Atendimento #${at.id} — paid síncrono, status: ${at.status}`);
-          if (at.status === "aguardando" && !isTriagemPlaceholder(at.triagem)) {
-            await notificarMedicos(at);
-          }
-        }
+        console.log(`[EFI-CARTAO] Atendimento #${atendimentoId} — pagamento confirmado (paid síncrono). Notificação pendente até triagem.`);
       }
 
       console.log(`[EFI-CARTAO] charge_id ${chargeId} — status: ${status} — aguardando webhook para confirmação final`);
