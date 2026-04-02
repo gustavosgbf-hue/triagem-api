@@ -1879,6 +1879,14 @@ app.post('/api/paciente/login', rlLogin, async (req, res) => {
     const pac = result.rows[0];
     const senhaOk = await bcrypt.compare(senha, pac.senha_hash);
     if (!senhaOk) return res.status(401).json({ ok: false, error: 'E-mail ou senha incorretos' });
+    // Conta criada via agendamento guest — ainda sem senha real definida
+    if (pac.senha_hash === '__GUEST__') {
+      return res.status(403).json({
+        ok: false,
+        error: 'Esta conta foi criada via agendamento. Defina sua senha pelo link enviado no e-mail de confirmação.',
+        code: 'GUEST_ACCOUNT'
+      });
+    }
     const token = jwt.sign({ id: pac.id, tipo: 'paciente' }, JWT_SECRET, { expiresIn: '7d' });
     const { senha_hash: _, ...pacPublico } = pac;
     return res.json({ ok: true, token, paciente: pacPublico });
@@ -2436,6 +2444,127 @@ app.post('/api/psicologia/agendamento/criar', rlGeral, async (req, res) => {
   }
 });
 
+// ── PSICOLOGIA: criar agendamento SEM autenticação (guest checkout) ───────────
+// POST /api/psicologia/agendamento/criar-guest
+// Aceita nome, email, telefone, cpf — sem token. Cria ou reutiliza paciente
+// silenciosamente. Após pagamento, envia convite para criar senha.
+app.post('/api/psicologia/agendamento/criar-guest', rlGeral, async (req, res) => {
+  try {
+    const {
+      psicologoId, horario_agendado, tipo_consulta,
+      paciente_nome, paciente_email, paciente_tel, paciente_cpf
+    } = req.body || {};
+
+    if (!psicologoId || !horario_agendado || !paciente_nome || !paciente_email) {
+      return res.status(400).json({ ok: false, error: 'psicologoId, horario_agendado, paciente_nome e paciente_email são obrigatórios' });
+    }
+
+    const emailNorm = paciente_email.trim().toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailNorm)) {
+      return res.status(400).json({ ok: false, error: 'E-mail inválido' });
+    }
+
+    // Busca psicólogo e valor no backend
+    const psiRes = await pool.query(
+      `SELECT id, nome_exibicao, valor_sessao, valor_avaliacao, tem_avaliacao, ativo, status
+         FROM psicologos WHERE id = $1 LIMIT 1`,
+      [psicologoId]
+    );
+    if (psiRes.rowCount === 0 || !psiRes.rows[0].ativo || psiRes.rows[0].status !== 'aprovado') {
+      return res.status(404).json({ ok: false, error: 'Psicólogo não encontrado ou inativo' });
+    }
+    const psi = psiRes.rows[0];
+
+    const tipoFinal = tipo_consulta === 'avaliacao' && psi.tem_avaliacao ? 'avaliacao' : 'psicoterapia';
+    const valorRaw  = tipoFinal === 'avaliacao' ? psi.valor_avaliacao : psi.valor_sessao;
+    const valor     = parseFloat(String(valorRaw || '').replace(',', '.'));
+    if (!valor || valor < 130) {
+      return res.status(400).json({ ok: false, error: 'Valor da sessão inválido para este profissional' });
+    }
+
+    // Verifica conflito de horário
+    const slotStart = new Date(horario_agendado);
+    if (isNaN(slotStart.getTime())) {
+      return res.status(400).json({ ok: false, error: 'horario_agendado inválido' });
+    }
+    const slotEnd = new Date(slotStart.getTime() + 60 * 60 * 1000);
+    const conflito = await pool.query(
+      `SELECT id FROM agendamentos_psicologia
+        WHERE psicologo_id = $1
+          AND horario_agendado >= $2 AND horario_agendado < $3
+          AND status NOT IN ('cancelado')
+        LIMIT 1`,
+      [psicologoId, slotStart.toISOString(), slotEnd.toISOString()]
+    );
+    if (conflito.rowCount > 0) {
+      return res.status(409).json({ ok: false, error: 'Horário indisponível. Escolha outro.' });
+    }
+
+    // Cria ou reutiliza paciente sem exigir senha
+    // Usa sentinel '__GUEST__' como senha_hash
+    let pacienteId = null;
+    try {
+      const existente = await pool.query(
+        `SELECT id, senha_hash FROM pacientes WHERE email = $1 LIMIT 1`,
+        [emailNorm]
+      );
+      if (existente.rowCount > 0) {
+        pacienteId = existente.rows[0].id;
+        await pool.query(
+          `UPDATE pacientes
+              SET nome = COALESCE(NULLIF(TRIM(nome),''), $1),
+                  tel  = COALESCE(NULLIF(TRIM(tel),''),  $2),
+                  cpf  = COALESCE(NULLIF(TRIM(cpf),''),  $3)
+            WHERE id = $4`,
+          [paciente_nome.trim(), (paciente_tel||'').trim(), (paciente_cpf||'').replace(/\D/g,''), pacienteId]
+        );
+      } else {
+        const ins = await pool.query(
+          `INSERT INTO pacientes (nome, email, senha_hash, cpf, tel)
+           VALUES ($1, $2, '__GUEST__', $3, $4)
+           ON CONFLICT (email) DO UPDATE
+             SET nome = COALESCE(NULLIF(EXCLUDED.nome,''), pacientes.nome)
+           RETURNING id`,
+          [paciente_nome.trim(), emailNorm, (paciente_cpf||'').replace(/\D/g,''), (paciente_tel||'').trim()]
+        );
+        pacienteId = ins.rows[0]?.id || null;
+      }
+    } catch (err) {
+      console.warn('[GUEST-AGEND] paciente upsert falhou (não fatal):', err.message);
+      pacienteId = null;
+    }
+
+    // Cria agendamento
+    const result = await pool.query(
+      `INSERT INTO agendamentos_psicologia
+        (psicologo_id, psicologo_nome, paciente_nome, paciente_email,
+         paciente_tel, paciente_cpf, tipo_consulta, horario_agendado,
+         valor_cobrado, pagamento_status, status, paciente_id)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pendente','pendente',$10)
+       RETURNING id, valor_cobrado`,
+      [psicologoId, psi.nome_exibicao, paciente_nome.trim(), emailNorm,
+       (paciente_tel||'').trim(), (paciente_cpf||'').replace(/\D/g,''),
+       tipoFinal, slotStart.toISOString(), valor, pacienteId]
+    );
+    const ag = result.rows[0];
+
+    // Registra lead
+    pool.query(
+      `INSERT INTO leads_agendamento (nome, email, tel, especialidade, profissional, horario, modulo, status)
+       VALUES ($1,$2,$3,'psicologia',$4,$5,'psicologia','agendamento_guest')`,
+      [paciente_nome.trim(), emailNorm, (paciente_tel||'').trim(), psi.nome_exibicao, slotStart.toISOString()]
+    ).catch(() => {});
+
+    console.log(`[GUEST-AGEND] Criado #${ag.id} — ${psi.nome_exibicao} — ${emailNorm} — R$${ag.valor_cobrado}`);
+    return res.json({ ok: true, agendamentoId: ag.id, valor: ag.valor_cobrado });
+
+  } catch (err) {
+    console.error('[GUEST-AGEND] Erro:', err.message);
+    return res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+
 // ── PSICOLOGIA: horários ocupados de um psicólogo ────────────────────────────
 // GET /api/psicologia/horarios-ocupados/:psicologoId?dias=14
 // Retorna array de ISO strings com horários já reservados (não cancelados)
@@ -2596,6 +2725,8 @@ app.post('/api/psicologia/pagbank/webhook', async (req, res) => {
     enviarEmailAdminPsicologia(ag).catch(() => {});
     enviarEmailConfirmacaoPacientePsi(ag).catch(() => {});
     enviarEmailNotificacaoPsicologo(ag).catch(() => {});
+    // Convite para criar senha (apenas contas guest sem senha real)
+    enviarEmailConviteContaGuest({ nome: ag.paciente_nome, email: ag.paciente_email, psicologo: ag.psicologo_nome, horario: ag.horario_agendado }).catch(() => {});
   } catch (e) {
     console.error('[PSI-PAGBANK-WH] Erro:', e.message);
   }
@@ -2750,6 +2881,7 @@ app.post('/api/psicologia/efi/cartao/cobrar', rlGeral, async (req, res) => {
           enviarEmailAdminPsicologia(rows[0]).catch(() => {});
           enviarEmailConfirmacaoPacientePsi(rows[0]).catch(() => {});
           enviarEmailNotificacaoPsicologo(rows[0]).catch(() => {});
+          enviarEmailConviteContaGuest({ nome: rows[0].paciente_nome, email: rows[0].paciente_email, psicologo: rows[0].psicologo_nome, horario: rows[0].horario_agendado }).catch(() => {});
         }
       }
       return res.json({ ok: true, charge_id: chargeId, status });
@@ -2794,6 +2926,7 @@ app.post('/api/psicologia/efi/cartao/webhook', async (req, res) => {
         enviarEmailAdminPsicologia(rows[0]).catch(() => {});
         enviarEmailConfirmacaoPacientePsi(rows[0]).catch(() => {});
         enviarEmailNotificacaoPsicologo(rows[0]).catch(() => {});
+        enviarEmailConviteContaGuest({ nome: rows[0].paciente_nome, email: rows[0].paciente_email, psicologo: rows[0].psicologo_nome, horario: rows[0].horario_agendado }).catch(() => {});
       }
     }
   } catch (e) {
@@ -2946,6 +3079,77 @@ async function enviarEmailConfirmacaoPacientePsi({ id, paciente_nome, paciente_e
     if (d.id) console.log(`[PSI-EMAIL-CONFIRM] Enviado para ${paciente_email} | Agendamento #${id}`);
     else console.error('[PSI-EMAIL-CONFIRM] Resend recusou:', JSON.stringify(d));
   } catch (e) { console.error('[PSI-EMAIL-CONFIRM] Erro:', e.message); }
+}
+
+
+// ── PSICOLOGIA: e-mail convite para guest criar senha ────────────────────────
+// Disparado pós-pagamento quando paciente agendou sem autenticação.
+// Envia link JWT de 24h para o paciente definir sua senha e acessar o painel.
+async function enviarEmailConviteContaGuest({ nome, email, psicologo, horario }) {
+  const RESEND_KEY = process.env.RESEND_API_KEY;
+  if (!RESEND_KEY || !email) return;
+
+  // Só envia se for conta guest (senha_hash = '__GUEST__')
+  try {
+    const check = await pool.query(
+      `SELECT senha_hash FROM pacientes WHERE email = $1 LIMIT 1`,
+      [String(email).trim().toLowerCase()]
+    );
+    if (!check.rows[0] || check.rows[0].senha_hash !== '__GUEST__') return;
+  } catch(_) { return; }
+
+  const token = jwt.sign(
+    { email: String(email).trim().toLowerCase(), tipo: 'criar_senha_guest' },
+    JWT_SECRET,
+    { expiresIn: '24h' }
+  );
+  const PAINEL_URL = 'https://painel.consultaja24h.com.br';
+  const linkCriarSenha = `${PAINEL_URL}/paciente?criar_senha=${encodeURIComponent(token)}`;
+
+  const horarioFmt = new Date(horario).toLocaleString('pt-BR', {
+    timeZone: 'America/Fortaleza', weekday: 'long', day: '2-digit',
+    month: 'long', year: 'numeric', hour: '2-digit', minute: '2-digit'
+  });
+
+  const html = `<div style="background:#f2f0ec;padding:32px 20px;font-family:sans-serif">
+    <div style="max-width:520px;margin:0 auto;background:#fff;border:1px solid rgba(22,18,14,.1);border-radius:16px;overflow:hidden">
+      <div style="padding:20px 28px;background:linear-gradient(135deg,#e8eef7,#d0ddef)">
+        <span style="font-size:1.1rem;font-weight:600;color:#26508e">ConsultaJá24h</span>
+        <span style="font-size:.8rem;color:rgba(22,18,14,.5);margin-left:8px">Psicologia Online</span>
+      </div>
+      <div style="padding:28px">
+        <p style="color:#16120e;font-size:.95rem;margin-bottom:12px">Olá, <strong>${nome}</strong>!</p>
+        <p style="color:#443e38;font-size:.9rem;line-height:1.65;margin-bottom:16px">
+          Sua sessão com <strong>${psicologo}</strong> em <strong>${horarioFmt}</strong> está confirmada. 🎉
+        </p>
+        <p style="color:#443e38;font-size:.88rem;line-height:1.65;margin-bottom:20px">
+          Crie uma senha para acompanhar todas as suas sessões, ver o link de acesso e gerenciar agendamentos:
+        </p>
+        <a href="${linkCriarSenha}" style="display:inline-block;padding:12px 28px;border-radius:12px;background:#26508e;color:#fff;font-weight:600;font-size:.9rem;text-decoration:none;margin-bottom:16px">
+          Criar minha senha →
+        </a>
+        <p style="font-size:.72rem;color:rgba(22,18,14,.35);line-height:1.55;margin-top:8px">
+          Este link é válido por 24 horas. Se não foi você, ignore este e-mail.
+        </p>
+      </div>
+    </div>
+  </div>`;
+
+  try {
+    const r = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${RESEND_KEY}` },
+      body: JSON.stringify({
+        from: 'ConsultaJá24h <contato@consultaja24h.com.br>',
+        to: [email],
+        subject: `✅ Sessão confirmada com ${psicologo} — crie sua senha`,
+        html
+      })
+    });
+    const d = await r.json();
+    if (d.id) console.log(`[GUEST-CONVITE] Enviado para ${email}`);
+    else console.error('[GUEST-CONVITE] Resend recusou:', JSON.stringify(d));
+  } catch (e) { console.error('[GUEST-CONVITE] Erro:', e.message); }
 }
 
 // ── PSICOLOGIA: e-mail de notificação ao psicólogo ──────────────────────────
