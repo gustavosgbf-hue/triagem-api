@@ -5155,7 +5155,7 @@ app.get("/api/disponibilidade", async (req, res) => {
     // Agendamento removido — fluxo 100% sob demanda imediata
     const horariosAgendamento = [];
     // Aviso de baixa demanda: período noturno 23h–7h
-    const avisoHorario = hora >= 23 || hora < 7;
+    const avisoHorario = hora >= 22 || hora < 7; // aviso de demora: 22h–7h (inclui periodo de menor volume)
     res.json({ok:true,disponivel,medicosOnline,pacientesAguardando,tempoEstimado,status,mensagem,horarioRetorno,horariosAgendamento,avisoHorario,horaAtual:hora,horaInicio:HORA_INICIO,horaFim:HORA_FIM});
   } catch(e) {
     console.error("Erro em /api/disponibilidade:", e);
