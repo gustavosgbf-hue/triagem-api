@@ -348,7 +348,6 @@ async function initDB() {
       ['pagbank_order_id','TEXT'],
       ['pagamento_confirmado_em','TIMESTAMPTZ'],
       ['efi_charge_id','TEXT'],
-      ['prioridade_liberada_em','TIMESTAMPTZ'],
     ];
     // Coluna para controle de lembrete de agendamento
     await pool.query(`ALTER TABLE agendamentos ADD COLUMN IF NOT EXISTS lembrete_enviado BOOLEAN DEFAULT false`).catch(()=>{});
@@ -920,141 +919,47 @@ function montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno, linkAssumir, m
   </div>`;
 }
 
-// ── PRIORIDADE DE DISTRIBUIÇÃO (invisível para os médicos) ───────────────────
-// Emails das médicas que recebem prioridade nos primeiros atendimentos do dia
-const EMAILS_PRIORITARIOS = [
-  "raquel.lima@consultaja24h.com.br",   // ← substituir pelo email real da Dra. Raquel
-  "mariana.martins@consultaja24h.com.br" // ← substituir pelo email real da Dra. Mariana
-];
-const LIMITE_PRIORIDADE_DIA  = 2;   // max atendimentos prioritários por médica/dia
-const JANELA_PRIORIDADE_MS   = 45 * 1000; // 45 segundos de espera
-
-// Quantos atendimentos uma médica prioritária já assumiu hoje via prioridade
-async function _contarPrioridadeHoje(email) {
-  try {
-    const hoje = new Date().toISOString().slice(0, 10); // YYYY-MM-DD (UTC)
-    const r = await pool.query(
-      `SELECT COUNT(*) FROM fila_atendimentos fa
-       JOIN medicos m ON m.id = fa.medico_id
-       WHERE m.email = $1
-         AND fa.assumido_em >= $2::date
-         AND fa.assumido_em <  ($2::date + interval '1 day')`,
-      [email, hoje]
-    );
-    return parseInt(r.rows[0].count, 10);
-  } catch { return 0; }
-}
-
 async function enviarEmailMedicos({ nome, tel, tipo, triagem, linkRetorno, subject, atendimentoId, horarioAgendado, horarioAgendadoRaw }) {
   const RESEND_KEY = process.env.RESEND_API_KEY;
   if (!RESEND_KEY) { console.warn("[EMAIL] RESEND_API_KEY nao definida."); return; }
   try {
-    const API_URL = process.env.API_URL || "https://triagem-api.onrender.com";
+    const medicosResult = await pool.query(`SELECT id,nome,email FROM medicos WHERE ativo=true AND status='aprovado' ORDER BY status_online DESC`);
+    const medicos = medicosResult.rows.filter(m=>m.email);
+    // Garante que o admin sempre recebe
+    // Admin sempre primeiro
     const adminEmail = "gustavosgbf@gmail.com";
+    const adminIdx = medicos.findIndex(m=>m.email===adminEmail);
+    if (adminIdx > 0) medicos.splice(adminIdx, 1);
+    if (adminIdx !== 0) medicos.unshift({ id: 0, nome: "Gustavo", email: adminEmail });
 
-    // Buscar todos os médicos ativos aprovados
-    const res = await pool.query(
-      `SELECT id, nome, email FROM medicos WHERE ativo=true AND status='aprovado' ORDER BY status_online DESC`
-    );
-    const todosMedicos = res.rows.filter(m => m.email);
-
-    // Garantir admin na lista e sempre em primeiro
-    if (!todosMedicos.find(m => m.email === adminEmail)) {
-      todosMedicos.unshift({ id: 0, nome: "Gustavo", email: adminEmail });
-    } else {
-      const idx = todosMedicos.findIndex(m => m.email === adminEmail);
-      if (idx > 0) { const [a] = todosMedicos.splice(idx, 1); todosMedicos.unshift(a); }
-    }
-
-    // Token helper
+    const PAINEL_URL = "https://painel.consultaja24h.com.br";
+    const API_URL = process.env.API_URL || "https://triagem-api.onrender.com";
+    // Envia e-mail individual para cada médico com token único
+    // Token expira 4h após o horário do agendamento (ou 2h para imediatos)
     let tokenExpiresAt;
     if (horarioAgendado && horarioAgendadoRaw) {
-      tokenExpiresAt = Math.floor(new Date(horarioAgendadoRaw).getTime() / 1000) + 4 * 3600;
+      const horarioDate = new Date(horarioAgendadoRaw);
+      tokenExpiresAt = Math.floor(horarioDate.getTime() / 1000) + 4 * 60 * 60; // +4h após horário
     }
-    const makeToken = (med) => {
-      const payload = { medicoId: med.id, medicoNome: med.nome, atendimentoId, tipo: "assumir" };
-      const opts = tokenExpiresAt
-        ? { expiresIn: Math.max(tokenExpiresAt - Math.floor(Date.now() / 1000), 3600) }
+    for (const med of medicos) {
+      const tokenPayload = { medicoId: med.id, medicoNome: med.nome, atendimentoId, tipo: "assumir" };
+      const tokenOpts = tokenExpiresAt
+        ? { expiresIn: Math.max(tokenExpiresAt - Math.floor(Date.now()/1000), 3600) } // mínimo 1h
         : { expiresIn: "2h" };
-      return jwt.sign(payload, JWT_SECRET, opts);
-    };
-
-    // Envio helper
-    const enviarPara = async (lista) => {
-      for (const med of lista) {
-        const token     = makeToken(med);
-        const linkAsumir = `${API_URL}/api/atendimento/assumir-email?token=${token}`;
-        const html       = montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno, linkAsumir, medicoNome: med.nome, horarioAgendado });
-        const rr = await fetch("https://api.resend.com/emails", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", Authorization: `Bearer ${RESEND_KEY}` },
-          body: JSON.stringify({ from: "ConsultaJa24h <contato@consultaja24h.com.br>", to: [med.email], subject, html })
-        });
-        const rd = await rr.json();
-        if (rd.id) console.log("[EMAIL] Enviado para:", med.email, "| ID:", rd.id);
-        else        console.error("[EMAIL] Resend recusou para", med.email, ":", JSON.stringify(rd));
-        await new Promise(r => setTimeout(r, 600)); // respeita rate limit Resend
-      }
-    };
-
-    // ── Lógica de prioridade ─────────────────────────────────────────────────
-    const prioritarias = todosMedicos.filter(m => EMAILS_PRIORITARIOS.includes(m.email));
-    const demais       = todosMedicos.filter(m => !EMAILS_PRIORITARIOS.includes(m.email));
-
-    // Quais prioritárias ainda estão abaixo do limite diário?
-    const elegiveis = [];
-    for (const m of prioritarias) {
-      const count = await _contarPrioridadeHoje(m.email);
-      if (count < LIMITE_PRIORIDADE_DIA) elegiveis.push(m);
+      const token = jwt.sign(tokenPayload, JWT_SECRET, tokenOpts);
+      const linkAsumir = `${API_URL}/api/atendimento/assumir-email?token=${token}`;
+      const html = montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno, linkAsumir, medicoNome: med.nome, horarioAgendado });
+      const resendRes = await fetch("https://api.resend.com/emails", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${RESEND_KEY}` },
+        body: JSON.stringify({ from: "ConsultaJa24h <contato@consultaja24h.com.br>", to: [med.email], subject, html })
+      });
+      const resendData = await resendRes.json();
+      if (resendData.id) console.log("[EMAIL] Enviado para:", med.email, "| ID:", resendData.id);
+      else console.error("[EMAIL] Resend recusou para", med.email, ":", JSON.stringify(resendData));
+      // Delay para respeitar rate limit do Resend (max 2 req/s)
+      await new Promise(r => setTimeout(r, 600));
     }
-
-    if (elegiveis.length > 0) {
-      // Primeiro envio: admin + médicas elegíveis (sem duplicatas)
-      const primeiroEnvio = [todosMedicos[0], ...elegiveis]
-        .filter((m, i, arr) => arr.findIndex(x => x.email === m.email) === i);
-
-      console.log(`[PRIORIDADE] Janela ${JANELA_PRIORIDADE_MS/1000}s p/ atend #${atendimentoId} — elegíveis:`, elegiveis.map(m => m.nome));
-
-      // Marcar no banco: janela ativa até agora + 45s (painel filtra baseado nisso)
-      const liberadaEm = new Date(Date.now() + JANELA_PRIORIDADE_MS);
-      await pool.query(
-        `UPDATE fila_atendimentos SET prioridade_liberada_em = $1 WHERE id = $2`,
-        [liberadaEm, atendimentoId]
-      ).catch(() => {});
-
-      await enviarPara(primeiroEnvio);
-
-      // Aguardar janela de prioridade sem bloquear o event loop
-      await new Promise(r => setTimeout(r, JANELA_PRIORIDADE_MS));
-
-      // Verificar se alguma médica assumiu
-      const statusRow = await pool.query(
-        `SELECT status FROM fila_atendimentos WHERE id = $1`, [atendimentoId]
-      );
-      const statusAtual = statusRow.rows[0]?.status;
-
-      if (statusAtual === "aguardando") {
-        // Ninguém assumiu — limpar flag e liberar para os demais
-        await pool.query(
-          `UPDATE fila_atendimentos SET prioridade_liberada_em = NULL WHERE id = $1`,
-          [atendimentoId]
-        ).catch(() => {});
-
-        const jaReceberam = new Set(primeiroEnvio.map(m => m.email));
-        const segundoEnvio = demais.filter(m => !jaReceberam.has(m.email));
-        if (segundoEnvio.length > 0) {
-          console.log(`[PRIORIDADE] Janela expirada — liberando para fila geral (${segundoEnvio.length} médico(s))`);
-          await enviarPara(segundoEnvio);
-        }
-      } else {
-        console.log(`[PRIORIDADE] Atend #${atendimentoId} assumido na janela. Status: ${statusAtual}`);
-      }
-    } else {
-      // Todas as prioritárias já atingiram o limite ou não há nenhuma — envio normal
-      console.log(`[PRIORIDADE] Sem elegíveis — envio normal para todos (${todosMedicos.length})`);
-      await enviarPara(todosMedicos);
-    }
-
   } catch(e) {
     console.error("[EMAIL] Erro:", e.message);
   }
@@ -4876,39 +4781,7 @@ app.post("/api/medico/login", rlLogin, async (req, res) => {
 
 app.get("/api/fila", checkMedico, async (req, res) => {
   try {
-    const medicoId   = req.medico.id;
-    const adminEmail = "gustavosgbf@gmail.com";
-
-    // Buscar email real do médico (não está no JWT atual)
-    let medicoEmail = "";
-    if (medicoId && medicoId !== 0) {
-      const mRow = await pool.query(`SELECT email FROM medicos WHERE id=$1 LIMIT 1`, [medicoId]);
-      medicoEmail = mRow.rows[0]?.email || "";
-    } else {
-      medicoEmail = adminEmail; // id=0 é o admin
-    }
-
-    // Admin e médicas prioritárias veem tudo (inclusive na janela de prioridade)
-    const podeVerPrioridade =
-      medicoEmail === adminEmail ||
-      EMAILS_PRIORITARIOS.includes(medicoEmail);
-
-    const query = podeVerPrioridade
-      ? `SELECT id,nome,tel,cpf,tipo,triagem,status,medico_id,medico_nome,meet_link,
-                criado_em,data_nascimento,idade,sexo,alergias,cronicas,medicacoes,queixa,solicita,horario_agendado
-         FROM fila_atendimentos
-         WHERE status IN ('aguardando','assumido')
-           AND (horario_agendado IS NULL OR horario_agendado <= NOW() + INTERVAL '15 minutes')
-         ORDER BY criado_em ASC`
-      : `SELECT id,nome,tel,cpf,tipo,triagem,status,medico_id,medico_nome,meet_link,
-                criado_em,data_nascimento,idade,sexo,alergias,cronicas,medicacoes,queixa,solicita,horario_agendado
-         FROM fila_atendimentos
-         WHERE status IN ('aguardando','assumido')
-           AND (horario_agendado IS NULL OR horario_agendado <= NOW() + INTERVAL '15 minutes')
-           AND (prioridade_liberada_em IS NULL OR prioridade_liberada_em <= NOW())
-         ORDER BY criado_em ASC`;
-
-    const result = await pool.query(query);
+    const result = await pool.query(`SELECT id,nome,tel,cpf,tipo,triagem,status,medico_id,medico_nome,meet_link,criado_em,data_nascimento,idade,sexo,alergias,cronicas,medicacoes,queixa,solicita,horario_agendado FROM fila_atendimentos WHERE status IN ('aguardando','assumido') AND (horario_agendado IS NULL OR horario_agendado <= NOW() + INTERVAL '15 minutes') ORDER BY criado_em ASC`);
     return res.json({ ok: true, fila: result.rows });
   } catch (err) { return res.status(500).json({ ok: false, error: "Erro ao carregar fila" }); }
 });
