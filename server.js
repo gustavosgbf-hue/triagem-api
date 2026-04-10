@@ -863,6 +863,8 @@ app.post("/api/pagbank/webhook", async (req, res) => {
 });
 
 // Consultar status de uma order PagBank — usado como fallback de polling
+// FIX: quando detecta pagamento, confirma no banco imediatamente
+// Evita race condition onde triagem termina antes do webhook chegar
 app.get("/api/pagbank/order/:id", async (req, res) => {
   try {
     if (!PAGBANK_TOKEN) return res.status(503).json({ ok: false, error: "Gateway indisponivel" });
@@ -870,8 +872,43 @@ app.get("/api/pagbank/order/:id", async (req, res) => {
       headers: { "Authorization": `Bearer ${PAGBANK_TOKEN}`, "accept": "application/json" }
     });
     const data = await response.json();
-    // Verifica pagamento tanto em charges quanto em qr_codes
     const pago = data.charges?.some(c => c.status === "PAID") || false;
+
+    // Se pago: confirma no banco para cobrir caso onde webhook ainda não chegou
+    if (pago) {
+      try {
+        const orderId = req.params.id;
+        const upd = await pool.query(
+          `UPDATE fila_atendimentos
+              SET pagamento_status        = 'confirmado',
+                  pagamento_confirmado_em = COALESCE(pagamento_confirmado_em, NOW())
+            WHERE pagbank_order_id = $1
+              AND pagamento_status  = 'pendente'
+            RETURNING id, nome, tel, cpf, tipo, triagem, status`,
+          [orderId]
+        );
+        if (upd.rowCount > 0) {
+          const at = upd.rows[0];
+          console.log("[PAGBANK-POLL] Pagamento confirmado via polling para atendimento #" + at.id);
+          // Se triagem já foi feita e está em status 'triagem' com conteúdo real → libera para fila
+          if (at.status === 'triagem' && !isTriagemPlaceholder(at.triagem)) {
+            const lib = await pool.query(
+              `UPDATE fila_atendimentos SET status='aguardando'
+                WHERE id=$1 AND status='triagem'
+                RETURNING id, nome, tel, cpf, tipo, triagem, tel_documentos`,
+              [at.id]
+            );
+            if (lib.rowCount > 0) {
+              console.log("[PAGBANK-POLL] Atendimento #" + at.id + " liberado para fila via polling");
+              notificarMedicos(lib.rows[0]).catch(e => console.error("[PAGBANK-POLL] Erro ao notificar:", e.message));
+            }
+          }
+        }
+      } catch(e) {
+        console.warn("[PAGBANK-POLL] Erro ao confirmar pagamento no banco:", e.message);
+      }
+    }
+
     return res.json({ ok: true, status: data.status, pago });
   } catch (e) {
     return res.status(500).json({ ok: false, error: e.message });
@@ -934,31 +971,75 @@ async function enviarEmailMedicos({ nome, tel, tipo, triagem, linkRetorno, subje
 
     const PAINEL_URL = "https://painel.consultaja24h.com.br";
     const API_URL = process.env.API_URL || "https://triagem-api.onrender.com";
-    // Envia e-mail individual para cada médico com token único
-    // Token expira 4h após o horário do agendamento (ou 2h para imediatos)
     let tokenExpiresAt;
     if (horarioAgendado && horarioAgendadoRaw) {
       const horarioDate = new Date(horarioAgendadoRaw);
-      tokenExpiresAt = Math.floor(horarioDate.getTime() / 1000) + 4 * 60 * 60; // +4h após horário
+      tokenExpiresAt = Math.floor(horarioDate.getTime() / 1000) + 4 * 60 * 60;
     }
+
+    // ── PRIORIDADE DE E-MAIL ─────────────────────────────────────────────────
+    // Se estiver na janela de prioridade (06h–13h BRT):
+    //   - Admin + prioritárias recebem imediatamente
+    //   - Demais recebem após FILA_PRIO_JANELA_S segundos
+    // Fora da janela: todos recebem ao mesmo tempo (comportamento original)
+    const prioAtiva = typeof _filaPrioAtiva === 'function' && _filaPrioAtiva();
+    const prioImediatos = [];
+    const prioDelayados = [];
+
     for (const med of medicos) {
+      const emailMed = (med.email || "").toLowerCase();
+      const isAdmin = emailMed === FILA_ADMIN_EMAIL.toLowerCase();
+      const isPrio  = FILA_PRIO_EMAILS.map(e=>e.toLowerCase()).includes(emailMed);
+      if (!prioAtiva || isAdmin || isPrio) {
+        prioImediatos.push(med);
+      } else {
+        prioDelayados.push(med);
+      }
+    }
+
+    // Helper: envia email para um médico
+    async function _enviarParaMedico(med) {
       const tokenPayload = { medicoId: med.id, medicoNome: med.nome, atendimentoId, tipo: "assumir" };
       const tokenOpts = tokenExpiresAt
-        ? { expiresIn: Math.max(tokenExpiresAt - Math.floor(Date.now()/1000), 3600) } // mínimo 1h
+        ? { expiresIn: Math.max(tokenExpiresAt - Math.floor(Date.now()/1000), 3600) }
         : { expiresIn: "2h" };
       const token = jwt.sign(tokenPayload, JWT_SECRET, tokenOpts);
       const linkAsumir = `${API_URL}/api/atendimento/assumir-email?token=${token}`;
       const html = montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno, linkAsumir, medicoNome: med.nome, horarioAgendado });
-      const resendRes = await fetch("https://api.resend.com/emails", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${RESEND_KEY}` },
-        body: JSON.stringify({ from: "ConsultaJa24h <contato@consultaja24h.com.br>", to: [med.email], subject, html })
-      });
-      const resendData = await resendRes.json();
-      if (resendData.id) console.log("[EMAIL] Enviado para:", med.email, "| ID:", resendData.id);
-      else console.error("[EMAIL] Resend recusou para", med.email, ":", JSON.stringify(resendData));
-      // Delay para respeitar rate limit do Resend (max 2 req/s)
-      await new Promise(r => setTimeout(r, 600));
+      try {
+        const resendRes = await fetch("https://api.resend.com/emails", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${RESEND_KEY}` },
+          body: JSON.stringify({ from: "ConsultaJa24h <contato@consultaja24h.com.br>", to: [med.email], subject, html })
+        });
+        const resendData = await resendRes.json();
+        if (resendData.id) console.log("[EMAIL] Enviado para:", med.email, "| ID:", resendData.id);
+        else console.error("[EMAIL] Resend recusou para", med.email, ":", JSON.stringify(resendData));
+      } catch(e) { console.error("[EMAIL] Falha para", med.email, ":", e.message); }
+      await new Promise(r => setTimeout(r, 600)); // rate limit Resend
+    }
+
+    // Envia imediatamente para admin e prioritárias
+    for (const med of prioImediatos) await _enviarParaMedico(med);
+
+    // Agenda envio com delay para os demais (não bloqueia o request)
+    if (prioDelayados.length > 0) {
+      const delayMs = FILA_PRIO_JANELA_S * 1000;
+      setTimeout(async () => {
+        // Verifica se o paciente ainda está aguardando — se já foi assumido, não notifica
+        try {
+          const check = await pool.query(
+            "SELECT status FROM fila_atendimentos WHERE id=$1 LIMIT 1", [atendimentoId]
+          );
+          if (check.rows[0]?.status !== "aguardando") {
+            console.log(`[EMAIL-DELAY] Atendimento #${atendimentoId} já foi assumido — envio cancelado para demais médicos.`);
+            return;
+          }
+        } catch(e) { /* continua mesmo se falhar a verificação */ }
+        for (const med of prioDelayados) await _enviarParaMedico(med);
+        console.log(`[EMAIL-DELAY] Enviado para ${prioDelayados.length} médico(s) após ${FILA_PRIO_JANELA_S}s — atendimento #${atendimentoId}`);
+      }, delayMs);
+      console.log(`[EMAIL-PRIO] ${prioImediatos.length} email(s) imediato(s), ${prioDelayados.length} agendado(s) para daqui ${FILA_PRIO_JANELA_S}s`);
     }
   } catch(e) {
     console.error("[EMAIL] Erro:", e.message);
@@ -1352,7 +1433,6 @@ app.post("/api/atendimento/atualizar-triagem", async (req, res) => {
         const pbData = await pbRes.json();
         const pagoNaPagBank = pbData.charges?.some(c => c.status === "PAID") || false;
         if (pagoNaPagBank) {
-          // Confirma no banco para não depender do webhook atrasado
           await pool.query(
             `UPDATE fila_atendimentos SET pagamento_status='confirmado', pagamento_confirmado_em=NOW() WHERE id=$1`,
             [atendimentoId]
@@ -1362,6 +1442,28 @@ app.post("/api/atendimento/atualizar-triagem", async (req, res) => {
         }
       } catch (e) {
         console.warn("[TRIAGEM] Falha ao consultar PagBank diretamente:", e.message);
+      }
+    }
+
+    // Fallback Efí: se ainda pendente e tem efi_charge_id, consulta status diretamente
+    if (!pagamentoConfirmado && check.rows[0].efi_charge_id) {
+      try {
+        const efiTok = await efiGetToken();
+        const efiRes = await axios.get(
+          `${EFI_BASE_URL}/v1/charge/${check.rows[0].efi_charge_id}`,
+          { httpsAgent: getEfiAgent(), headers: { Authorization: `Bearer ${efiTok}` } }
+        );
+        const efiStatus = efiRes.data?.data?.status;
+        if (efiStatus === "paid" || efiStatus === "approved") {
+          await pool.query(
+            `UPDATE fila_atendimentos SET pagamento_status='confirmado', pagamento_confirmado_em=NOW() WHERE id=$1`,
+            [atendimentoId]
+          );
+          pagamentoConfirmado = true;
+          console.log("[TRIAGEM] Pagamento confirmado via consulta direta Efí — atendimento #" + atendimentoId);
+        }
+      } catch (e) {
+        console.warn("[TRIAGEM] Falha ao consultar Efí diretamente:", e.message);
       }
     }
 
@@ -4764,6 +4866,27 @@ app.post("/api/medico/trocar-senha", checkMedico, async (req, res) => {
   }
 });
 
+// ── RENOVAÇÃO DE TOKEN ────────────────────────────────────────────────────────
+// Permite renovar o JWT sem precisar de senha, desde que o token atual ainda seja válido.
+// Chamado automaticamente pelo frontend 30min antes de expirar.
+app.post("/api/medico/renovar-token", checkMedico, async (req, res) => {
+  try {
+    const medicoId = req.medico.id;
+    const result = await pool.query(
+      "SELECT id,nome,nome_exibicao,email,crm,ativo FROM medicos WHERE id=$1 AND ativo=true LIMIT 1",
+      [medicoId]
+    );
+    if (result.rowCount === 0) return res.status(403).json({ ok: false, error: "Médico não encontrado ou inativo" });
+    const med = result.rows[0];
+    const token = jwt.sign({ id: med.id, nome: med.nome, crm: med.crm }, JWT_SECRET, { expiresIn: "8h" });
+    console.log("[RENOVAR-TOKEN] Token renovado para médico #" + med.id + " (" + med.email + ")");
+    return res.json({ ok: true, token, medico: { id: med.id, nome: med.nome_exibicao||med.nome, email: med.email, crm: med.crm } });
+  } catch(e) {
+    console.error("[RENOVAR-TOKEN] Erro:", e.message);
+    return res.status(500).json({ ok: false, error: "Erro ao renovar token" });
+  }
+});
+
 app.post("/api/medico/login", rlLogin, async (req, res) => {
   try {
     const { email, senha } = req.body || {};
@@ -4779,10 +4902,110 @@ app.post("/api/medico/login", rlLogin, async (req, res) => {
   } catch (err) { return res.status(500).json({ ok: false, error: "Erro interno no login" }); }
 });
 
+// ── PRIORIDADE DE FILA ────────────────────────────────────────────────────────
+// Emails das médicas que recebem prioridade pela manhã (06h–13h BRT)
+// e do admin (sempre prioridade máxima).
+const FILA_ADMIN_EMAIL   = "gustavosgbf@gmail.com";
+const FILA_PRIO_EMAILS   = ["marianamartinsc1@gmail.com", "raquellimaleite09@gmail.com"];
+const FILA_PRIO_JANELA_S = 40;  // segundos de prioridade exclusiva
+const FILA_PRIO_H_INI    = 6;   // hora início (BRT)
+const FILA_PRIO_H_FIM    = 13;  // hora fim (BRT)
+const FILA_PRIO_MAX_PAC  = 2;   // máx pacientes reservados por prioritária
+
+function _filaPrioAtiva() {
+  const h = new Date(new Date().toLocaleString("en-US", { timeZone: "America/Fortaleza" })).getHours();
+  return h >= FILA_PRIO_H_INI && h < FILA_PRIO_H_FIM;
+}
+
+// Map: atendimentoId → { email (da prioritária dona), expireTs }
+// Mantido em memória — reseta só se o processo reiniciar (aceitável: janela é 40s)
+const _filaReservas = new Map();
+
+function _limparReservasExp() {
+  const now = Date.now();
+  for (const [id, r] of _filaReservas) { if (r.expireTs < now) _filaReservas.delete(id); }
+}
+
+// Cria reservas para os próximos pacientes aguardando, por médica prioritária
+function _atualizarReservasServidor(rows) {
+  if (!_filaPrioAtiva()) return;
+  _limparReservasExp();
+  const aguardando = rows.filter(r => r.status === "aguardando");
+  for (const prioEmail of FILA_PRIO_EMAILS) {
+    const jaReservados = [..._filaReservas.values()].filter(r => r.email === prioEmail).length;
+    if (jaReservados >= FILA_PRIO_MAX_PAC) continue;
+    let alocados = jaReservados;
+    for (const p of aguardando) {
+      if (alocados >= FILA_PRIO_MAX_PAC) break;
+      if (_filaReservas.has(p.id)) continue; // já tem reserva (de outra prioritária ou desta)
+      _filaReservas.set(p.id, {
+        email: prioEmail,
+        expireTs: Date.now() + FILA_PRIO_JANELA_S * 1000
+      });
+      alocados++;
+    }
+  }
+}
+
+// Retorna true se o médico (email) pode ver este paciente agora
+function _podeVerPaciente(pacienteId, medicoEmail) {
+  const email = (medicoEmail || "").toLowerCase();
+  // Admin sempre vê tudo
+  if (email === FILA_ADMIN_EMAIL.toLowerCase()) return true;
+  _limparReservasExp();
+  const reserva = _filaReservas.get(pacienteId);
+  if (!reserva) return true; // sem reserva ativa → todos veem
+  // Há reserva: só a dona vê
+  return reserva.email === email;
+}
+
 app.get("/api/fila", checkMedico, async (req, res) => {
   try {
-    const result = await pool.query(`SELECT id,nome,tel,cpf,tipo,triagem,status,medico_id,medico_nome,meet_link,criado_em,data_nascimento,idade,sexo,alergias,cronicas,medicacoes,queixa,solicita,horario_agendado FROM fila_atendimentos WHERE status IN ('aguardando','assumido') AND (horario_agendado IS NULL OR horario_agendado <= NOW() + INTERVAL '15 minutes') ORDER BY criado_em ASC`);
-    return res.json({ ok: true, fila: result.rows });
+    const result = await pool.query(`SELECT id,nome,tel,cpf,tipo,triagem,status,medico_id,medico_nome,meet_link,criado_em,assumido_em,data_nascimento,idade,sexo,alergias,cronicas,medicacoes,queixa,solicita,horario_agendado FROM fila_atendimentos WHERE status IN ('aguardando','assumido') AND (horario_agendado IS NULL OR horario_agendado <= NOW() + INTERVAL '15 minutes') ORDER BY criado_em ASC`);
+    const rows = result.rows;
+
+    // Atualiza reservas com base na fila atual
+    _atualizarReservasServidor(rows);
+
+    // Busca email do médico logado (não está no JWT — busca no banco)
+    let medicoEmail = "";
+    try {
+      const meRes = await pool.query("SELECT email FROM medicos WHERE id=$1 LIMIT 1", [req.medico.id]);
+      medicoEmail = (meRes.rows[0]?.email || "").toLowerCase();
+    } catch(e) { /* fallback: sem email → trata como médico comum */ }
+
+    // Filtra: remove pacientes reservados para outra prioritária
+    // E também oculta pacientes assumidos dentro da janela de prioridade
+    // para que os demais médicos nunca descubram que houve prioridade
+    const isAdminEmail = medicoEmail === FILA_ADMIN_EMAIL.toLowerCase();
+    const isPrioEmail  = FILA_PRIO_EMAILS.map(e=>e.toLowerCase()).includes(medicoEmail);
+
+    const filaFiltrada = rows.filter(p => {
+      // Paciente assumido: verificar se foi assumido dentro da janela de prioridade
+      if (p.status === 'assumido' && p.assumido_em && p.criado_em) {
+        const assumidoMs = new Date(p.assumido_em).getTime();
+        const criadoMs   = new Date(p.criado_em).getTime();
+        const deltaS     = (assumidoMs - criadoMs) / 1000;
+        // Assumido dentro da janela → só admin e prioritárias veem
+        if (deltaS <= FILA_PRIO_JANELA_S) {
+          if (!isAdminEmail && !isPrioEmail) return false;
+        }
+      }
+      // Paciente aguardando: aplicar filtro de reserva normal
+      return _podeVerPaciente(p.id, medicoEmail);
+    });
+
+    // Adiciona campo prio_segundos: ms restantes da janela (só para a dona da reserva)
+    const filaComPrio = filaFiltrada.map(p => {
+      const reserva = _filaReservas.get(p.id);
+      const isPrioDona = reserva && reserva.email === medicoEmail;
+      return {
+        ...p,
+        prio_segundos: isPrioDona ? Math.max(0, Math.ceil((reserva.expireTs - Date.now()) / 1000)) : 0
+      };
+    });
+
+    return res.json({ ok: true, fila: filaComPrio });
   } catch (err) { return res.status(500).json({ ok: false, error: "Erro ao carregar fila" }); }
 });
 
