@@ -4768,14 +4768,14 @@ app.post("/api/medico/login", rlLogin, async (req, res) => {
   try {
     const { email, senha } = req.body || {};
     if (!email||!senha) return res.status(400).json({ ok: false, error: "E-mail e senha sao obrigatorios" });
-    const result = await pool.query("SELECT id,nome,nome_exibicao,email,crm,senha_hash,ativo,precisa_trocar_senha FROM medicos WHERE email=$1 LIMIT 1",[email.trim().toLowerCase()]);
+    const result = await pool.query("SELECT id,nome,nome_exibicao,email,crm,senha_hash,ativo,precisa_trocar_senha,status_online FROM medicos WHERE email=$1 LIMIT 1",[email.trim().toLowerCase()]);
     if (result.rowCount===0) return res.status(401).json({ ok: false, error: "Credenciais invalidas" });
     const med = result.rows[0];
     if (!med.ativo) return res.status(403).json({ ok: false, error: "Seu cadastro ainda esta em analise pela equipe da plataforma." });
     const senhaOk = await bcrypt.compare(senha, med.senha_hash);
     if (!senhaOk) return res.status(401).json({ ok: false, error: "Credenciais invalidas" });
     const token = jwt.sign({ id: med.id, nome: med.nome, crm: med.crm }, JWT_SECRET, { expiresIn: "8h" });
-    return res.json({ ok: true, token, precisa_trocar_senha: !!med.precisa_trocar_senha, medico: { id: med.id, nome: med.nome_exibicao||med.nome, email: med.email, crm: med.crm } });
+    return res.json({ ok: true, token, precisa_trocar_senha: !!med.precisa_trocar_senha, medico: { id: med.id, nome: med.nome_exibicao||med.nome, email: med.email, crm: med.crm, status_online: !!med.status_online } });
   } catch (err) { return res.status(500).json({ ok: false, error: "Erro interno no login" }); }
 });
 
