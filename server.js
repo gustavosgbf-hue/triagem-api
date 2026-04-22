@@ -305,6 +305,7 @@ async function initDB() {
       )`);
     await pool.query(`ALTER TABLE mensagens ADD COLUMN IF NOT EXISTS arquivo_url TEXT`);
     await pool.query(`ALTER TABLE mensagens ADD COLUMN IF NOT EXISTS arquivo_tipo TEXT`);
+    await pool.query(`ALTER TABLE mensagens ADD COLUMN IF NOT EXISTS arquivo_nome TEXT`); // [UX] nome real do arquivo
     await pool.query(`CREATE TABLE IF NOT EXISTS agendamentos (
         id SERIAL PRIMARY KEY,
         nome TEXT NOT NULL,
@@ -1618,9 +1619,11 @@ app.post("/api/chat/upload", rlUpload, upload.single("arquivo"), async (req, res
       ContentType: req.file.mimetype,
     }));
     const url = `${process.env.R2_PUBLIC_URL}/${key}`;
+    // [UX] Sanitiza e trunca o nome original pra evitar XSS e strings absurdas (max 120 chars)
+    const arquivoNome = String(req.file.originalname || '').replace(/[\r\n\t]/g,' ').slice(0,120) || ('arquivo.'+ext);
     const result = await pool.query(
-      `INSERT INTO mensagens (atendimento_id,autor,autor_id,texto,arquivo_url,arquivo_tipo) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id,atendimento_id,autor,texto,arquivo_url,arquivo_tipo,criado_em`,
-      [atendimentoId, autor, autorId || null, "", url, tipo]
+      `INSERT INTO mensagens (atendimento_id,autor,autor_id,texto,arquivo_url,arquivo_tipo,arquivo_nome) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id,atendimento_id,autor,texto,arquivo_url,arquivo_tipo,arquivo_nome,criado_em`,
+      [atendimentoId, autor, autorId || null, "", url, tipo, arquivoNome]
     );
     return res.json({ ok: true, mensagem: result.rows[0] });
   } catch (e) { console.error("Erro em /api/chat/upload:", e); return res.status(500).json({ ok: false, error: "Erro ao fazer upload" }); }
@@ -1632,7 +1635,7 @@ app.post("/api/chat/enviar", rlMensagem, async (req, res) => {
     if (!atendimentoId||!autor||(!texto&&!arquivo_url)) return res.status(400).json({ ok: false, error: "Campos obrigatorios: atendimentoId, autor, texto ou arquivo" });
     if (!["paciente","medico"].includes(autor)) return res.status(400).json({ ok: false, error: "autor deve ser paciente ou medico" });
     const result = await pool.query(
-      `INSERT INTO mensagens (atendimento_id,autor,autor_id,texto,arquivo_url,arquivo_tipo) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id,atendimento_id,autor,texto,arquivo_url,arquivo_tipo,criado_em`,
+      `INSERT INTO mensagens (atendimento_id,autor,autor_id,texto,arquivo_url,arquivo_tipo) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id,atendimento_id,autor,texto,arquivo_url,arquivo_tipo,arquivo_nome,criado_em`,
       [atendimentoId,autor,autorId||null,(texto||"").trim(),arquivo_url||null,arquivo_tipo||null]
     );
     return res.json({ ok: true, mensagem: result.rows[0] });
@@ -1648,7 +1651,7 @@ app.get("/api/chat/:atendimentoId", async (req, res) => {
     if (token) { try { jwt.verify(token, JWT_SECRET); autorizado=true; } catch(e){} }
     if (!autorizado) { const check = await pool.query(`SELECT id FROM fila_atendimentos WHERE id=$1`,[atendimentoId]); autorizado=check.rowCount>0; }
     if (!autorizado) return res.status(403).json({ ok: false, error: "Acesso negado" });
-    const result = await pool.query(`SELECT id,atendimento_id,autor,texto,arquivo_url,arquivo_tipo,criado_em FROM mensagens WHERE atendimento_id=$1 ORDER BY criado_em ASC`,[atendimentoId]);
+    const result = await pool.query(`SELECT id,atendimento_id,autor,texto,arquivo_url,arquivo_tipo,arquivo_nome,criado_em FROM mensagens WHERE atendimento_id=$1 ORDER BY criado_em ASC`,[atendimentoId]);
     return res.json({ ok: true, mensagens: result.rows });
   } catch (e) { console.error("Erro em /api/chat/:id:", e); return res.status(500).json({ ok: false, error: "Erro ao buscar mensagens" }); }
 });
