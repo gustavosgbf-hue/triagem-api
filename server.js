@@ -1696,9 +1696,37 @@ app.get("/api/atendimento/status/:id", async (req, res) => {
       }
     }
 
-    return res.json({ ok: true, atendimento: at });
+    return res.json({ ok: true, atendimento: at, fila: await _filaPos(at) });
   } catch (e) { return res.status(500).json({ ok: false, error: "Erro ao buscar status" }); }
 });
+
+// [UX] Calcula posição do atendimento na fila de aguardando (1 = próximo) e total aguardando.
+// Usado pela tela de espera do paciente para mostrar "Você é o Nº X da fila".
+async function _filaPos(at) {
+  try {
+    if (!at || at.status !== 'aguardando' || at.pagamento_status !== 'confirmado') {
+      return { posicao: 0, total: 0 };
+    }
+    const q = await pool.query(
+      `SELECT COUNT(*)::int AS pos
+         FROM fila_atendimentos
+        WHERE status = 'aguardando'
+          AND pagamento_status = 'confirmado'
+          AND tipo = $1
+          AND criado_em <= $2`,
+      [at.tipo, at.criado_em]
+    );
+    const t = await pool.query(
+      `SELECT COUNT(*)::int AS total
+         FROM fila_atendimentos
+        WHERE status = 'aguardando'
+          AND pagamento_status = 'confirmado'
+          AND tipo = $1`,
+      [at.tipo]
+    );
+    return { posicao: q.rows[0]?.pos || 0, total: t.rows[0]?.total || 0 };
+  } catch (e) { return { posicao: 0, total: 0 }; }
+}
 
 app.post("/api/identify", async (req, res) => {
   try {
