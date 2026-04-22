@@ -726,10 +726,15 @@ app.post("/api/pagbank/order", async (req, res) => {
     const expiracao    = new Date(Date.now() + 30 * 60 * 1000);
     const expiracaoISO = expiracao.toISOString().replace("Z", "-03:00");
 
+    const nomeClean = (nome || '').trim();
+    if (!nomeClean || nomeClean === '-' || nomeClean.length < 2) {
+      console.warn("[PAGBANK] Nome invalido recebido, usando fallback:", JSON.stringify(nomeClean));
+    }
+
     const orderBody = {
       reference_id: "CJ-" + Date.now() + "-" + Math.random().toString(36).slice(2,6).toUpperCase(),
       customer: {
-        name:   nome,
+        name:   (nomeClean.length > 1 && nomeClean !== '-') ? nomeClean : 'Paciente',
         email:  email || `paciente.${cpf.replace(/\D/g,"")}@consultaja24h.com.br`,
         tax_id: cpf.replace(/\D/g, "")
       },
