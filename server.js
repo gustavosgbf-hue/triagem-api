@@ -728,6 +728,20 @@ function formatPagBankError(err) {
   return err.description || err.message || err.code || JSON.stringify(err);
 }
 
+function emailSeguroPagBank(email, cpf, prefixo = "paciente") {
+  const cpfLimpo = String(cpf || "").replace(/\D/g, "");
+  const recebido = String(email || "").trim().toLowerCase();
+  const fallback = `${prefixo}.${cpfLimpo || Date.now()}@consultaja24h.com.br`;
+  const emailsMerchant = [
+    process.env.PAGBANK_MERCHANT_EMAIL,
+    process.env.RENOVACAO_ADMIN_EMAIL,
+    "gustavosgbf@gmail.com",
+    "contato@consultaja24h.com.br"
+  ].filter(Boolean).map(e => String(e).trim().toLowerCase());
+  if (!recebido || emailsMerchant.includes(recebido)) return fallback;
+  return recebido;
+}
+
 // Comissão da plataforma sobre sessões de psicologia (%)
 // Pode ser sobrescrita por variável de ambiente PSI_COMISSAO_PCT
 const PSI_COMISSAO_PCT = parseFloat(process.env.PSI_COMISSAO_PCT || '20');
@@ -7116,7 +7130,7 @@ app.post("/api/renovacao/pagbank/order", rlGeral, async (req, res) => {
     const expiracaoISO = new Date(Date.now() + 30 * 60 * 1000).toISOString().replace("Z", "-03:00");
     const orderBody = {
       reference_id: `RENOV-${atendimentoId}-${Date.now()}`,
-      customer: { name: nome, email: email || `renovacao.${String(cpf).replace(/\D/g, "")}@consultaja24h.com.br`, tax_id: String(cpf).replace(/\D/g, "") },
+      customer: { name: nome, email: emailSeguroPagBank(email, cpf, "renovacao"), tax_id: String(cpf).replace(/\D/g, "") },
       items: [{ name: q.rows[0].tipo === "renovacao_fisica" ? "Renovação de Receita Física — ConsultaJá24h" : "Renovação de Receita Digital — ConsultaJá24h", quantity: 1, unit_amount: valorCentavos }],
       qr_codes: [{ amount: { value: valorCentavos }, expiration_date: expiracaoISO }],
       notification_urls: [`${process.env.API_URL || "https://triagem-api.onrender.com"}/api/renovacao/pagbank/webhook`]
