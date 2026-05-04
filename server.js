@@ -4848,7 +4848,14 @@ app.post("/api/medico/login", rlLogin, async (req, res) => {
 
 app.get("/api/fila", checkMedico, async (req, res) => {
   try {
-    const result = await pool.query(`SELECT id,nome,tel,cpf,tipo,triagem,status,medico_id,medico_nome,meet_link,criado_em,data_nascimento,idade,sexo,alergias,cronicas,medicacoes,queixa,solicita,horario_agendado FROM fila_atendimentos WHERE status IN ('aguardando','assumido') AND (horario_agendado IS NULL OR horario_agendado <= NOW() + INTERVAL '15 minutes') ORDER BY criado_em ASC`);
+    const isAdmin = req.medico.email === "gustavosgbf@gmail.com";
+    let query, params;
+    if (isAdmin) {
+      query = `SELECT id,nome,tel,cpf,tipo,triagem,status,medico_id,medico_nome,meet_link,criado_em,data_nascimento,idade,sexo,alergias,cronicas,medicacoes,queixa,solicita,horario_agendado FROM fila_atendimentos WHERE status IN ('aguardando','assumido') AND tipo LIKE 'renovacao%' ORDER BY criado_em ASC`;
+    } else {
+      query = `SELECT id,nome,tel,cpf,tipo,triagem,status,medico_id,medico_nome,meet_link,criado_em,data_nascimento,idade,sexo,alergias,cronicas,medicacoes,queixa,solicita,horario_agendado FROM fila_atendimentos WHERE status IN ('aguardando','assumido') AND tipo NOT LIKE 'renovacao%' AND (horario_agendado IS NULL OR horario_agendado <= NOW() + INTERVAL '15 minutes') ORDER BY criado_em ASC`;
+    }
+    const result = await pool.query(query, params || []);
     return res.json({ ok: true, fila: result.rows });
   } catch (err) { return res.status(500).json({ ok: false, error: "Erro ao carregar fila" }); }
 });
