@@ -347,8 +347,16 @@ async function initDB() {
       ['aprovacao_token','TEXT'],
       ['pagamento_status','TEXT NOT NULL DEFAULT \'pendente\''],
       ['pagbank_order_id','TEXT'],
+      ['pagamento_metodo','TEXT'],
       ['pagamento_confirmado_em','TIMESTAMPTZ'],
       ['efi_charge_id','TEXT'],
+      ['anexos_urls','JSONB DEFAULT \'{}\'::jsonb'],
+      ['endereco_envio','JSONB'],
+      ['frete_valor','NUMERIC(10,2)'],
+      ['frete_modalidade','TEXT'],
+      ['frete_servico_id','TEXT'],
+      ['frete_prazo_dias','INTEGER'],
+      ['questionario','JSONB'],
     ];
     // Coluna para controle de lembrete de agendamento
     await pool.query(`ALTER TABLE agendamentos ADD COLUMN IF NOT EXISTS lembrete_enviado BOOLEAN DEFAULT false`).catch(()=>{});
@@ -6912,6 +6920,314 @@ app.post('/api/especialista/chat/:consultaId/upload', authEspecialista, uploadCh
 // ══════════════════════════════════════════════════════════════════════════════
 
 // ══════════════════════════════════════════════════════════════════════════════
+
+// ── RENOVAÇÃO DE RECEITA ─────────────────────────────────────────────────────
+const RENOVACAO_PRECO_BASE = parseFloat(process.env.RENOVACAO_PRECO_BASE || "59.90");
+const RENOVACAO_ADMIN_EMAIL = process.env.RENOVACAO_ADMIN_EMAIL || "gustavosgbf@gmail.com";
+const FRETE_MARGEM_LOGISTICA = parseFloat(process.env.FRETE_MARGEM_LOGISTICA || "10");
+const ME_TOKEN = process.env.MELHOR_ENVIO_TOKEN?.trim();
+const ME_FROM_CEP = String(process.env.MELHOR_ENVIO_FROM_CEP || "65000000").replace(/\D/g, "");
+const ME_BASE = process.env.MELHOR_ENVIO_AMBIENTE === "sandbox"
+  ? "https://sandbox.melhorenvio.com.br/api/v2"
+  : "https://melhorenvio.com.br/api/v2";
+
+function renovacaoValorCentavos(row) {
+  const frete = parseFloat(row?.frete_valor || 0);
+  const total = row?.tipo === "renovacao_fisica"
+    ? RENOVACAO_PRECO_BASE + frete + FRETE_MARGEM_LOGISTICA
+    : RENOVACAO_PRECO_BASE;
+  return Math.round(total * 100);
+}
+
+function fallbackFreteRenovacao(cepDestino) {
+  const prefixo = parseInt(String(cepDestino || "").replace(/\D/g, "").slice(0, 2), 10) || 0;
+  let tabela;
+  if (prefixo >= 1 && prefixo <= 19) tabela = { sedex: 135, pac: 78, ps: 5, pp: 11 };
+  else if (prefixo >= 20 && prefixo <= 39) tabela = { sedex: 130, pac: 75, ps: 5, pp: 11 };
+  else if (prefixo >= 40 && prefixo <= 49) tabela = { sedex: 75, pac: 45, ps: 4, pp: 9 };
+  else if (prefixo >= 50 && prefixo <= 59) tabela = { sedex: 65, pac: 40, ps: 3, pp: 8 };
+  else if (prefixo >= 60 && prefixo <= 65) tabela = { sedex: 45, pac: 28, ps: 3, pp: 7 };
+  else if (prefixo >= 66 && prefixo <= 69) tabela = { sedex: 100, pac: 60, ps: 6, pp: 12 };
+  else if (prefixo >= 70 && prefixo <= 79) tabela = { sedex: 110, pac: 65, ps: 6, pp: 12 };
+  else if (prefixo >= 80 && prefixo <= 99) tabela = { sedex: 155, pac: 90, ps: 7, pp: 13 };
+  else tabela = { sedex: 100, pac: 60, ps: 6, pp: 12 };
+  return [
+    { id: "2", nome: "SEDEX", valor: tabela.sedex, prazo: tabela.ps, transportadora: "Correios" },
+    { id: "1", nome: "PAC", valor: tabela.pac, prazo: tabela.pp, transportadora: "Correios" }
+  ];
+}
+
+async function enviarEmailRenovacaoAdmin(at) {
+  const RESEND_KEY = process.env.RESEND_API_KEY;
+  if (!RESEND_KEY) return;
+  const anexos = at.anexos_urls || {};
+  const endereco = at.endereco_envio || {};
+  const tipoLabel = at.tipo === "renovacao_fisica" ? "FÍSICA" : "DIGITAL";
+  const html = `
+    <div style="font-family:Arial,sans-serif;background:#f7f7f7;padding:24px">
+      <div style="max-width:640px;margin:auto;background:white;border-radius:12px;padding:24px">
+        <div style="display:inline-block;background:#0c4a30;color:white;padding:6px 12px;border-radius:6px;font-weight:700;font-size:12px">RENOVAÇÃO ${tipoLabel}</div>
+        <h2 style="margin:16px 0 6px;color:#111">${at.nome || "Paciente"}</h2>
+        <p style="color:#555;margin:0 0 16px">Tel: ${at.tel || ""} · CPF: ${at.cpf || ""} · ID #${at.id}</p>
+        <h3 style="margin:18px 0 6px;color:#111">Medicamentos solicitados</h3>
+        <div style="white-space:pre-wrap;background:#f3f4f6;border-radius:8px;padding:12px;color:#222">${String(at.medicacoes || "").replace(/</g, "&lt;")}</div>
+        <h3 style="margin:18px 0 6px;color:#111">Anexos</h3>
+        <p>${anexos.receita_anterior ? `<a href="${anexos.receita_anterior}">Receita anterior</a>` : "Receita anterior não encontrada"}</p>
+        ${anexos.documento ? `<p><a href="${anexos.documento}">Documento com foto</a></p>` : ""}
+        ${at.tipo === "renovacao_fisica" ? `
+          <h3 style="margin:18px 0 6px;color:#111">Envio</h3>
+          <p style="line-height:1.6;color:#333">
+            ${endereco.rua || ""}, ${endereco.numero || ""} ${endereco.complemento || ""}<br>
+            ${endereco.bairro || ""} · ${endereco.cidade || ""}/${endereco.uf || ""}<br>
+            CEP ${endereco.cep || ""}<br>
+            ${at.frete_modalidade || ""} · R$ ${Number(at.frete_valor || 0).toFixed(2)}
+          </p>` : ""}
+      </div>
+    </div>`;
+  await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${RESEND_KEY}` },
+    body: JSON.stringify({
+      from: "ConsultaJa24h <contato@consultaja24h.com.br>",
+      to: [RENOVACAO_ADMIN_EMAIL],
+      subject: `Nova renovação ${tipoLabel} — ${at.nome || "Paciente"}`,
+      html
+    })
+  }).catch(e => console.error("[RENOVACAO-EMAIL]", e.message));
+}
+
+async function confirmarRenovacao(at) {
+  const agora = new Date().toLocaleString("pt-BR", { timeZone: "America/Fortaleza" });
+  appendToSheet("Atendimentos", [
+    agora, at.nome || "", at.tel || "", at.cpf || "", "Aguardando", "",
+    `RENOVAÇÃO ${at.tipo === "renovacao_fisica" ? "FÍSICA" : "DIGITAL"}`,
+    at.tipo || "", "", String(at.id)
+  ]).catch(e => console.error("[RENOVACAO-SHEETS]", e.message));
+  enviarEmailRenovacaoAdmin(at).catch(e => console.error("[RENOVACAO-EMAIL]", e.message));
+}
+
+app.post("/api/correios/calcular-frete", rlGeral, async (req, res) => {
+  try {
+    const cepDestino = String(req.body?.cep_destino || "").replace(/\D/g, "");
+    if (cepDestino.length !== 8) return res.status(400).json({ ok: false, error: "CEP inválido" });
+    if (ME_TOKEN) {
+      try {
+        const response = await fetch(`${ME_BASE}/me/shipment/calculate`, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${ME_TOKEN}`, Accept: "application/json", "Content-Type": "application/json", "User-Agent": "ConsultaJa24h (gustavosgbf@gmail.com)" },
+          body: JSON.stringify({
+            from: { postal_code: ME_FROM_CEP },
+            to: { postal_code: cepDestino },
+            package: { height: 2, width: 12, length: 17, weight: 0.1 },
+            options: { receipt: false, own_hand: false, insurance_value: 0 },
+            services: "1,2"
+          })
+        });
+        const data = await response.json();
+        if (response.ok && Array.isArray(data)) {
+          const servicos = data
+            .filter(s => !s.error && s.price && s.delivery_time && ["PAC", "SEDEX"].includes(String(s.name).toUpperCase()))
+            .map(s => ({ id: String(s.id), nome: s.name, valor: parseFloat(s.custom_price || s.price), prazo: parseInt(s.custom_delivery_time || s.delivery_time, 10), transportadora: s.company?.name || "Correios" }))
+            .sort((a, b) => b.valor - a.valor);
+          if (servicos.length) return res.json({ ok: true, fonte: "melhor_envio", servicos, margem_logistica: FRETE_MARGEM_LOGISTICA });
+        }
+      } catch (e) {
+        console.warn("[RENOVACAO-FRETE] Melhor Envio falhou:", e.message);
+      }
+    }
+    return res.json({ ok: true, fonte: "fallback", servicos: fallbackFreteRenovacao(cepDestino), margem_logistica: FRETE_MARGEM_LOGISTICA });
+  } catch (e) {
+    console.error("[RENOVACAO-FRETE]", e.message);
+    return res.status(500).json({ ok: false, error: "Erro ao calcular frete" });
+  }
+});
+
+app.post("/api/renovacao/criar-pre", rlGeral, async (req, res) => {
+  try {
+    const { nome, tel, cpf, data_nascimento, email, tipo_renovacao, medicamentos, questionario, endereco_envio, frete_modalidade, frete_valor, frete_servico_id, frete_prazo_dias } = req.body || {};
+    if (!nome || !tel || !cpf || !tipo_renovacao || !medicamentos) return res.status(400).json({ ok: false, error: "Campos obrigatórios faltando" });
+    if (!["digital", "fisica"].includes(tipo_renovacao)) return res.status(400).json({ ok: false, error: "tipo_renovacao inválido" });
+    if (tipo_renovacao === "fisica" && (!endereco_envio || !frete_modalidade || !frete_valor)) return res.status(400).json({ ok: false, error: "Endereço e frete obrigatórios para receita física" });
+    const tipoFila = tipo_renovacao === "fisica" ? "renovacao_fisica" : "renovacao_digital";
+    const triagem = `RENOVAÇÃO DE RECEITA — ${tipo_renovacao.toUpperCase()}\n\nMedicamentos solicitados:\n${medicamentos}`;
+    const result = await pool.query(
+      `INSERT INTO fila_atendimentos
+       (nome,tel,tel_documentos,cpf,tipo,triagem,status,pagamento_status,queixa,medicacoes,data_nascimento,email,
+        endereco_envio,frete_valor,frete_modalidade,frete_servico_id,frete_prazo_dias,questionario)
+       VALUES ($1,$2,$3,$4,$5,$6,'pagamento_pendente','pendente',$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+       RETURNING id, tipo, frete_valor`,
+      [
+        nome.trim(), tel, tel, String(cpf).replace(/\D/g, ""), tipoFila, triagem,
+        `Renovação de receita (${tipo_renovacao})`, medicamentos, data_nascimento || "", email || null,
+        endereco_envio ? JSON.stringify(endereco_envio) : null,
+        tipo_renovacao === "fisica" ? parseFloat(frete_valor) : null,
+        frete_modalidade || null,
+        frete_servico_id ? String(frete_servico_id) : null,
+        frete_prazo_dias ? parseInt(frete_prazo_dias, 10) : null,
+        questionario ? JSON.stringify(questionario) : null
+      ]
+    );
+    const row = result.rows[0];
+    return res.json({ ok: true, atendimentoId: row.id, valorCentavos: renovacaoValorCentavos(row), valorTotal: renovacaoValorCentavos(row) / 100 });
+  } catch (e) {
+    console.error("[RENOVACAO-CRIAR]", e.message);
+    return res.status(500).json({ ok: false, error: "Erro ao criar renovação" });
+  }
+});
+
+app.post("/api/renovacao/upload-anexo", rlUpload, upload.single("arquivo"), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ ok: false, error: "Nenhum arquivo enviado" });
+    const atendimentoId = parseInt(req.body?.atendimentoId, 10);
+    const tipo = String(req.body?.tipo_anexo || "");
+    if (!atendimentoId || !["receita_anterior", "documento"].includes(tipo)) return res.status(400).json({ ok: false, error: "Dados de upload inválidos" });
+    const ext = (req.file.originalname.split(".").pop() || "bin").toLowerCase().replace(/[^a-z0-9]/g, "");
+    if (!["jpg", "jpeg", "png", "webp", "pdf"].includes(ext)) return res.status(400).json({ ok: false, error: "Tipo de arquivo não permitido" });
+    const check = await pool.query(`SELECT id FROM fila_atendimentos WHERE id=$1 AND tipo LIKE 'renovacao_%'`, [atendimentoId]);
+    if (!check.rowCount) return res.status(404).json({ ok: false, error: "Renovação não encontrada" });
+    const key = `renovacao/${atendimentoId}/${tipo}-${randomUUID()}.${ext}`;
+    await r2.send(new PutObjectCommand({ Bucket: process.env.R2_BUCKET_NAME, Key: key, Body: req.file.buffer, ContentType: req.file.mimetype }));
+    const url = `${process.env.R2_PUBLIC_URL}/${key}`;
+    await pool.query(`UPDATE fila_atendimentos SET anexos_urls = COALESCE(anexos_urls, '{}'::jsonb) || $1::jsonb WHERE id = $2`, [JSON.stringify({ [tipo]: url }), atendimentoId]);
+    return res.json({ ok: true, url, tipo_anexo: tipo });
+  } catch (e) {
+    console.error("[RENOVACAO-UPLOAD]", e.message);
+    return res.status(500).json({ ok: false, error: "Erro ao fazer upload" });
+  }
+});
+
+app.post("/api/renovacao/pagbank/order", rlGeral, async (req, res) => {
+  try {
+    const { atendimentoId, nome, email, cpf } = req.body || {};
+    if (!atendimentoId || !nome || !cpf) return res.status(400).json({ ok: false, error: "Dados obrigatórios faltando" });
+    if (!PAGBANK_TOKEN) return res.status(503).json({ ok: false, error: "Gateway de pagamento indisponível" });
+    const q = await pool.query(`SELECT id,tipo,frete_valor FROM fila_atendimentos WHERE id=$1 AND tipo LIKE 'renovacao_%'`, [atendimentoId]);
+    if (!q.rowCount) return res.status(404).json({ ok: false, error: "Renovação não encontrada" });
+    const valorCentavos = renovacaoValorCentavos(q.rows[0]);
+    const expiracaoISO = new Date(Date.now() + 30 * 60 * 1000).toISOString().replace("Z", "-03:00");
+    const orderBody = {
+      reference_id: `RENOV-${atendimentoId}-${Date.now()}`,
+      customer: { name: nome, email: email || `renovacao.${String(cpf).replace(/\D/g, "")}@consultaja24h.com.br`, tax_id: String(cpf).replace(/\D/g, "") },
+      items: [{ name: q.rows[0].tipo === "renovacao_fisica" ? "Renovação de Receita Física — ConsultaJá24h" : "Renovação de Receita Digital — ConsultaJá24h", quantity: 1, unit_amount: valorCentavos }],
+      qr_codes: [{ amount: { value: valorCentavos }, expiration_date: expiracaoISO }],
+      notification_urls: [`${process.env.API_URL || "https://triagem-api.onrender.com"}/api/renovacao/pagbank/webhook`]
+    };
+    const response = await fetch(`${PAGBANK_URL}/orders`, { method: "POST", headers: { Authorization: `Bearer ${PAGBANK_TOKEN}`, "Content-Type": "application/json", accept: "application/json" }, body: JSON.stringify(orderBody) });
+    const data = await response.json();
+    if (!response.ok) return res.status(400).json({ ok: false, error: data.error_messages || "Erro ao criar cobrança" });
+    const qr = data.qr_codes?.[0];
+    if (!qr?.text) return res.status(502).json({ ok: false, error: "PagBank não retornou QR Code" });
+    await pool.query(`UPDATE fila_atendimentos SET pagbank_order_id=$1, pagamento_metodo='pix' WHERE id=$2`, [data.id, atendimentoId]);
+    return res.json({ ok: true, order_id: data.id, qr_code_text: qr.text, valor: valorCentavos / 100 });
+  } catch (e) {
+    console.error("[RENOVACAO-PIX]", e.message);
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.post("/api/renovacao/pagbank/webhook", async (req, res) => {
+  res.sendStatus(200);
+  try {
+    const orderId = String(req.body?.data?.id || req.body?.id || "");
+    const charges = req.body?.data?.charges || req.body?.charges || [];
+    const pago = charges.some(c => c.status === "PAID");
+    if (!orderId || !pago) return;
+    const upd = await pool.query(
+      `UPDATE fila_atendimentos SET pagamento_status='confirmado', pagamento_confirmado_em=NOW(), status='aguardando'
+       WHERE pagbank_order_id=$1 AND tipo LIKE 'renovacao_%' AND pagamento_status='pendente'
+       RETURNING id,nome,tel,cpf,tipo,medicacoes,anexos_urls,endereco_envio,frete_modalidade,frete_valor,email`,
+      [orderId]
+    );
+    if (upd.rowCount) await confirmarRenovacao(upd.rows[0]);
+  } catch (e) {
+    console.error("[RENOVACAO-PIX-WH]", e.message);
+  }
+});
+
+app.post("/api/renovacao/efi/cartao/cobrar", rlGeral, async (req, res) => {
+  try {
+    const { payment_token, nome, cpf, email, telefone, nascimento, parcelas = 1, atendimentoId } = req.body || {};
+    if (!payment_token || !nome || !cpf || !email || !telefone || !atendimentoId) return res.status(400).json({ ok: false, error: "Dados obrigatórios faltando" });
+    const cpfLimpo = String(cpf).replace(/\D/g, "");
+    const telLimpo = String(telefone).replace(/\D/g, "");
+    const atRes = await pool.query(`SELECT id,tipo,frete_valor,endereco_envio FROM fila_atendimentos WHERE id=$1 AND tipo LIKE 'renovacao_%'`, [atendimentoId]);
+    if (!atRes.rowCount) return res.status(404).json({ ok: false, error: "Renovação não encontrada" });
+    const at = atRes.rows[0];
+    const efiToken = await efiGetToken();
+    const headers = { Authorization: `Bearer ${efiToken}`, "Content-Type": "application/json" };
+    const httpsAgent = getEfiAgent();
+    const valorCentavos = renovacaoValorCentavos(at);
+    const chargeRes = await axios.post(`${EFI_BASE_URL}/v1/charge`, {
+      items: [{ name: at.tipo === "renovacao_fisica" ? "Renovação de Receita Física — ConsultaJá24h" : "Renovação de Receita Digital — ConsultaJá24h", value: valorCentavos, amount: 1 }],
+      metadata: { custom_id: `RENOV-${atendimentoId}-${Date.now()}`, notification_url: `${process.env.API_URL || "https://triagem-api.onrender.com"}/api/renovacao/efi/cartao/webhook` }
+    }, { httpsAgent, headers });
+    const chargeId = chargeRes.data?.data?.charge_id;
+    if (!chargeId) return res.status(502).json({ ok: false, error: "Efí não retornou charge_id" });
+    const endereco = at.endereco_envio || {};
+    const payRes = await axios.post(`${EFI_BASE_URL}/v1/charge/${chargeId}/pay`, {
+      payment: { credit_card: {
+        customer: { name: nome.trim(), cpf: cpfLimpo, email: email.trim(), phone_number: telLimpo, ...(nascimento ? { birth: nascimento } : {}) },
+        installments: Math.max(1, parseInt(parcelas) || 1),
+        payment_token: payment_token.trim(),
+        billing_address: { street: endereco.rua || "Rua da Consulta", number: endereco.numero || "1", neighborhood: endereco.bairro || "Centro", zipcode: String(endereco.cep || ME_FROM_CEP || "65000000").replace(/\D/g, ""), city: endereco.cidade || "São Luís", complement: endereco.complemento || "", state: endereco.uf || "MA" }
+      }}
+    }, { httpsAgent, headers });
+    const status = payRes.data?.data?.status;
+    if (["paid", "approved", "waiting"].includes(status)) {
+      await pool.query(`UPDATE fila_atendimentos SET efi_charge_id=$1, pagamento_metodo='cartao' WHERE id=$2`, [String(chargeId), atendimentoId]);
+      if (status === "paid" || status === "approved") {
+        const upd = await pool.query(
+          `UPDATE fila_atendimentos SET pagamento_status='confirmado', pagamento_confirmado_em=NOW(), status='aguardando'
+           WHERE id=$1 AND tipo LIKE 'renovacao_%' AND pagamento_status='pendente'
+           RETURNING id,nome,tel,cpf,tipo,medicacoes,anexos_urls,endereco_envio,frete_modalidade,frete_valor,email`,
+          [atendimentoId]
+        );
+        if (upd.rowCount) await confirmarRenovacao(upd.rows[0]);
+      }
+      return res.json({ ok: true, charge_id: chargeId, status });
+    }
+    return res.status(402).json({ ok: false, status: status || "unpaid", error: payRes.data?.data?.reason || "Cartão não aprovado" });
+  } catch (e) {
+    console.error("[RENOVACAO-EFI]", e.response?.data || e.message);
+    return res.status(500).json({ ok: false, error: e.response?.data?.error_description || e.message || "Erro no cartão" });
+  }
+});
+
+app.post("/api/renovacao/efi/cartao/webhook", async (req, res) => {
+  res.sendStatus(200);
+  try {
+    const notificationToken = req.body?.notification;
+    if (!notificationToken) return;
+    const efiToken = await efiGetToken();
+    const notifRes = await axios.get(`${EFI_BASE_URL}/v1/notification/${notificationToken}`, { httpsAgent: getEfiAgent(), headers: { Authorization: `Bearer ${efiToken}`, "Content-Type": "application/json" } });
+    const charges = notifRes.data?.data || [];
+    for (const charge of charges) {
+      const chargeId = String(charge.charge_id || charge.id || "");
+      if (charge.status !== "paid" || !chargeId) continue;
+      const upd = await pool.query(
+        `UPDATE fila_atendimentos SET pagamento_status='confirmado', pagamento_confirmado_em=NOW(), status='aguardando'
+         WHERE efi_charge_id=$1 AND tipo LIKE 'renovacao_%' AND pagamento_status='pendente'
+         RETURNING id,nome,tel,cpf,tipo,medicacoes,anexos_urls,endereco_envio,frete_modalidade,frete_valor,email`,
+        [chargeId]
+      );
+      if (upd.rowCount) await confirmarRenovacao(upd.rows[0]);
+    }
+  } catch (e) {
+    console.error("[RENOVACAO-EFI-WH]", e.response?.data || e.message);
+  }
+});
+
+app.get("/api/renovacao/:id/status", rlGeral, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).json({ ok: false });
+    const q = await pool.query(`SELECT id,status,pagamento_status FROM fila_atendimentos WHERE id=$1 AND tipo LIKE 'renovacao_%'`, [id]);
+    if (!q.rowCount) return res.status(404).json({ ok: false });
+    return res.json({ ok: true, ...q.rows[0] });
+  } catch (e) {
+    return res.status(500).json({ ok: false });
+  }
+});
 
 // Health check
 app.get('/', (req, res) => {
