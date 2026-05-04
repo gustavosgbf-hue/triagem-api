@@ -6985,7 +6985,23 @@ async function enviarEmailRenovacaoAdmin(at) {
   if (!RESEND_KEY) return;
   const anexos = at.anexos_urls || {};
   const endereco = at.endereco_envio || {};
+  const questionario = at.questionario || {};
+  const esc = (v) => String(v || "").replace(/</g, "&lt;").replace(/>/g, "&gt;");
   const tipoLabel = at.tipo === "renovacao_fisica" ? "FÍSICA" : "DIGITAL";
+  const labelsQuestionario = {
+    condicao_diagnostico: "Condição/diagnóstico",
+    tempo_uso: "Tempo de uso",
+    mudanca_dose: "Mudança de dose",
+    efeitos_colaterais: "Efeitos colaterais",
+    informacoes_importantes: "Informações importantes",
+    medico_original: "Médico/especialidade original",
+    acompanhamento: "Acompanhamento regular",
+    laudo_diagnostico: "Laudo/diagnóstico documentado"
+  };
+  const linhasQuestionario = Object.entries(labelsQuestionario)
+    .filter(([key]) => questionario[key])
+    .map(([key, label]) => `<div style="margin:6px 0"><strong>${label}:</strong> ${esc(questionario[key])}</div>`)
+    .join("");
   const html = `
     <div style="font-family:Arial,sans-serif;background:#f7f7f7;padding:24px">
       <div style="max-width:640px;margin:auto;background:white;border-radius:12px;padding:24px">
@@ -6993,7 +7009,11 @@ async function enviarEmailRenovacaoAdmin(at) {
         <h2 style="margin:16px 0 6px;color:#111">${at.nome || "Paciente"}</h2>
         <p style="color:#555;margin:0 0 16px">Tel: ${at.tel || ""} · CPF: ${at.cpf || ""} · ID #${at.id}</p>
         <h3 style="margin:18px 0 6px;color:#111">Medicamentos solicitados</h3>
-        <div style="white-space:pre-wrap;background:#f3f4f6;border-radius:8px;padding:12px;color:#222">${String(at.medicacoes || "").replace(/</g, "&lt;")}</div>
+        <div style="white-space:pre-wrap;background:#f3f4f6;border-radius:8px;padding:12px;color:#222">${esc(at.medicacoes)}</div>
+        ${linhasQuestionario ? `
+          <h3 style="margin:18px 0 6px;color:#111">Questionário clínico</h3>
+          <div style="background:#f0fdf4;border-left:4px solid #16a34a;border-radius:8px;padding:12px;color:#222;line-height:1.5">${linhasQuestionario}</div>
+        ` : ""}
         <h3 style="margin:18px 0 6px;color:#111">Anexos</h3>
         <p>${anexos.receita_anterior ? `<a href="${anexos.receita_anterior}">Receita anterior</a>` : "Receita anterior não encontrada"}</p>
         ${anexos.documento ? `<p><a href="${anexos.documento}">Documento com foto</a></p>` : ""}
@@ -7161,7 +7181,7 @@ app.post("/api/renovacao/pagbank/webhook", async (req, res) => {
     const upd = await pool.query(
       `UPDATE fila_atendimentos SET pagamento_status='confirmado', pagamento_confirmado_em=NOW(), status='aguardando'
        WHERE pagbank_order_id=$1 AND tipo LIKE 'renovacao_%' AND pagamento_status='pendente'
-       RETURNING id,nome,tel,cpf,tipo,medicacoes,anexos_urls,endereco_envio,frete_modalidade,frete_valor,email`,
+       RETURNING id,nome,tel,cpf,tipo,medicacoes,questionario,anexos_urls,endereco_envio,frete_modalidade,frete_valor,email`,
       [orderId]
     );
     if (upd.rowCount) await confirmarRenovacao(upd.rows[0]);
@@ -7205,7 +7225,7 @@ app.post("/api/renovacao/efi/cartao/cobrar", rlGeral, async (req, res) => {
         const upd = await pool.query(
           `UPDATE fila_atendimentos SET pagamento_status='confirmado', pagamento_confirmado_em=NOW(), status='aguardando'
            WHERE id=$1 AND tipo LIKE 'renovacao_%' AND pagamento_status='pendente'
-           RETURNING id,nome,tel,cpf,tipo,medicacoes,anexos_urls,endereco_envio,frete_modalidade,frete_valor,email`,
+           RETURNING id,nome,tel,cpf,tipo,medicacoes,questionario,anexos_urls,endereco_envio,frete_modalidade,frete_valor,email`,
           [atendimentoId]
         );
         if (upd.rowCount) await confirmarRenovacao(upd.rows[0]);
@@ -7233,7 +7253,7 @@ app.post("/api/renovacao/efi/cartao/webhook", async (req, res) => {
       const upd = await pool.query(
         `UPDATE fila_atendimentos SET pagamento_status='confirmado', pagamento_confirmado_em=NOW(), status='aguardando'
          WHERE efi_charge_id=$1 AND tipo LIKE 'renovacao_%' AND pagamento_status='pendente'
-         RETURNING id,nome,tel,cpf,tipo,medicacoes,anexos_urls,endereco_envio,frete_modalidade,frete_valor,email`,
+         RETURNING id,nome,tel,cpf,tipo,medicacoes,questionario,anexos_urls,endereco_envio,frete_modalidade,frete_valor,email`,
         [chargeId]
       );
       if (upd.rowCount) await confirmarRenovacao(upd.rows[0]);
