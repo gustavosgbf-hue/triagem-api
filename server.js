@@ -719,6 +719,15 @@ const PAGBANK_TOKEN = process.env.PAGBANK_TOKEN?.trim();
 const PAGBANK_URL   = "https://api.pagseguro.com";
 const VALOR_CENTAVOS = 4990; // R$ 49,90 — fixo no backend
 
+function formatPagBankError(err) {
+  if (!err) return "Erro ao criar cobrança";
+  if (typeof err === "string") return err;
+  if (Array.isArray(err)) {
+    return err.map(e => e?.description || e?.message || e?.code || JSON.stringify(e)).join(" · ");
+  }
+  return err.description || err.message || err.code || JSON.stringify(err);
+}
+
 // Comissão da plataforma sobre sessões de psicologia (%)
 // Pode ser sobrescrita por variável de ambiente PSI_COMISSAO_PCT
 const PSI_COMISSAO_PCT = parseFloat(process.env.PSI_COMISSAO_PCT || '20');
@@ -7114,7 +7123,10 @@ app.post("/api/renovacao/pagbank/order", rlGeral, async (req, res) => {
     };
     const response = await fetch(`${PAGBANK_URL}/orders`, { method: "POST", headers: { Authorization: `Bearer ${PAGBANK_TOKEN}`, "Content-Type": "application/json", accept: "application/json" }, body: JSON.stringify(orderBody) });
     const data = await response.json();
-    if (!response.ok) return res.status(400).json({ ok: false, error: data.error_messages || "Erro ao criar cobrança" });
+    if (!response.ok) {
+      console.error("[RENOVACAO-PIX] PagBank recusou:", JSON.stringify(data).slice(0, 800));
+      return res.status(400).json({ ok: false, error: formatPagBankError(data.error_messages || data.message || data.error || data) });
+    }
     const qr = data.qr_codes?.[0];
     if (!qr?.text) return res.status(502).json({ ok: false, error: "PagBank não retornou QR Code" });
     await pool.query(`UPDATE fila_atendimentos SET pagbank_order_id=$1, pagamento_metodo='pix' WHERE id=$2`, [data.id, atendimentoId]);
