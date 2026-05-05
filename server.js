@@ -931,6 +931,16 @@ app.get("/api/pagbank/order/:id", async (req, res) => {
 function montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno, linkAssumir, medicoNome, horarioAgendado, isLembrete }) {
   const tipoLabel = tipo === "video" ? "Video" : "Chat";
   const telLimpo = String(tel||"").replace(/\D/g,"");
+  const tituloEmail = isLembrete
+    ? "Lembrete de atendimento — ConsultaJá24h"
+    : (horarioAgendado ? "Agendamento pronto para atendimento — ConsultaJá24h" : "Paciente novo na fila — ConsultaJá24h");
+  const avisoTitulo = isLembrete
+    ? "LEMBRETE DE ATENDIMENTO"
+    : (horarioAgendado ? "AGENDAMENTO PRONTO" : "PACIENTE NOVO NA FILA");
+  const avisoTexto = isLembrete
+    ? "Este atendimento está próximo do horário agendado. Confira os dados e entre no painel para acompanhar."
+    : "Um paciente acabou de concluir a triagem e está aguardando médico. Clique em Assumir atendimento para vincular este paciente ao seu nome.";
+  const preheader = `${avisoTitulo}: ${nome || "Paciente"} aguardando atendimento ${tipoLabel}.`;
   function montarTabelaTriagem(texto) {
     if (!texto) return '<tr><td colspan="2">-</td></tr>';
     return texto.split(/[;\n]/).map(item => {
@@ -939,10 +949,15 @@ function montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno, linkAssumir, m
       return `<tr><td colspan="2" style="padding:8px 12px;color:rgba(255,255,255,.7);font-size:13px">${item.trim()}</td></tr>`;
     }).join("");
   }
-  return `<div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#060d0b;color:#fff;border-radius:12px;overflow:hidden">
-    <div style="background:linear-gradient(135deg,#b4e05a,#5ee0a0);padding:20px 28px"><h2 style="margin:0;color:#051208;font-size:18px">Novo paciente aguardando atendimento — ConsultaJá24h</h2></div>
+  return `<span style="display:none!important;visibility:hidden;opacity:0;color:transparent;height:0;width:0;overflow:hidden">${preheader}</span>
+  <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#060d0b;color:#fff;border-radius:12px;overflow:hidden">
+    <div style="background:linear-gradient(135deg,#b4e05a,#5ee0a0);padding:20px 28px"><h2 style="margin:0;color:#051208;font-size:18px">${tituloEmail}</h2></div>
     <div style="padding:28px">
-      <div style="margin-bottom:18px;padding:10px 16px;background:rgba(94,224,160,.07);border:1px solid rgba(94,224,160,.2);border-radius:10px;font-size:12px;color:rgba(94,224,160,.85)">\u2705 Acesse o painel para o atendimento</div>
+      <div style="margin-bottom:18px;padding:14px 16px;background:rgba(255,189,46,.12);border:1px solid rgba(255,189,46,.34);border-radius:12px">
+        <div style="font-size:11px;font-weight:800;letter-spacing:.12em;color:#ffbd2e;margin-bottom:6px">${avisoTitulo}</div>
+        <div style="font-size:14px;line-height:1.5;color:rgba(255,255,255,.92);font-weight:600">${avisoTexto}</div>
+        ${linkAssumir ? `<div style="margin-top:8px;font-size:12px;color:rgba(255,255,255,.52)">O primeiro médico a clicar assume o atendimento. Link válido por 2h.</div>` : ""}
+      </div>
       <table style="width:100%;border-collapse:collapse;margin-bottom:24px">
         <tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px;width:140px">Paciente</td><td style="padding:8px 0;font-weight:600">${nome||"-"}</td></tr>
         <tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">WhatsApp</td><td style="padding:8px 0;font-weight:600">${telLimpo}</td></tr>
@@ -1341,7 +1356,7 @@ async function notificarMedicos(at) {
     triagem: at.triagem, linkRetorno,
     atendimentoId: at.id,
     horarioAgendado: null, horarioAgendadoRaw: null,
-    subject: "Novo paciente aguardando atendimento — " + (at.nome || "Paciente")
+    subject: "PACIENTE NOVO NA FILA - " + (at.nome || "Paciente")
   });
 
   console.log("[NOTIFICACAO] Medicos notificados — atendimento #" + at.id);
