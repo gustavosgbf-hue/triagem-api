@@ -836,7 +836,13 @@ app.post("/api/pagbank/webhook", async (req, res) => {
                       '(triagem em andamento)',
                       '(aguardando triagem de agendamento)',
                       '(aguardando resposta)'
-                    ) THEN 'aguardando'
+                    )
+                    AND LOWER(TRIM(triagem)) NOT LIKE '(aguardando pagamento)%'
+                    AND LOWER(TRIM(triagem)) NOT LIKE '(pagamento confirmado%'
+                    AND LOWER(TRIM(triagem)) NOT LIKE '(triagem em andamento)%'
+                    AND LOWER(TRIM(triagem)) NOT LIKE '(aguardando triagem de agendamento)%'
+                    AND LOWER(TRIM(triagem)) NOT LIKE '(aguardando resposta)%'
+                    THEN 'aguardando'
                     ELSE 'triagem'
                   END
                 ELSE status
@@ -865,7 +871,13 @@ app.post("/api/pagbank/webhook", async (req, res) => {
                         '(triagem em andamento)',
                         '(aguardando triagem de agendamento)',
                         '(aguardando resposta)'
-                      ) THEN 'aguardando'
+                      )
+                      AND LOWER(TRIM(triagem)) NOT LIKE '(aguardando pagamento)%'
+                      AND LOWER(TRIM(triagem)) NOT LIKE '(pagamento confirmado%'
+                      AND LOWER(TRIM(triagem)) NOT LIKE '(triagem em andamento)%'
+                      AND LOWER(TRIM(triagem)) NOT LIKE '(aguardando triagem de agendamento)%'
+                      AND LOWER(TRIM(triagem)) NOT LIKE '(aguardando resposta)%'
+                      THEN 'aguardando'
                       ELSE 'triagem'
                     END
                   ELSE status
@@ -984,8 +996,8 @@ async function enviarEmailMedicos({ nome, tel, tipo, triagem, linkRetorno, subje
         ? { expiresIn: Math.max(tokenExpiresAt - Math.floor(Date.now()/1000), 3600) } // mínimo 1h
         : { expiresIn: "2h" };
       const token = jwt.sign(tokenPayload, JWT_SECRET, tokenOpts);
-      const linkAsumir = `${API_URL}/api/atendimento/assumir-email?token=${token}`;
-      const html = montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno, linkAsumir, medicoNome: med.nome, horarioAgendado });
+      const linkAssumir = `${API_URL}/api/atendimento/assumir-email?token=${token}`;
+      const html = montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno, linkAssumir, medicoNome: med.nome, horarioAgendado });
       const resendRes = await fetch("https://api.resend.com/emails", {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${RESEND_KEY}` },
@@ -1277,12 +1289,40 @@ const TRIAGEM_PLACEHOLDERS = new Set([
 
 function isTriagemPlaceholder(triagem) {
   if (!triagem) return true;
-  return TRIAGEM_PLACEHOLDERS.has(triagem.trim().toLowerCase());
+  const t = triagem.trim().toLowerCase();
+  if (TRIAGEM_PLACEHOLDERS.has(t)) return true;
+  return t.startsWith('(aguardando pagamento)')
+    || t.startsWith('(pagamento confirmado')
+    || t.startsWith('(triagem em andamento)')
+    || t.startsWith('(aguardando triagem de agendamento)')
+    || t.startsWith('(aguardando resposta)');
 }
 
 // Mantido por compatibilidade com /api/notify
 function ehPlaceholder(triagem) {
   return isTriagemPlaceholder(triagem);
+}
+
+function normalizarTexto(valor) {
+  const v = String(valor || "").trim();
+  return v && v !== "-" ? v : null;
+}
+
+function normalizarNomePaciente(nome) {
+  const n = String(nome || "").trim().replace(/\s+/g, " ");
+  const k = n.toLowerCase();
+  if (!n || k === "-" || k === "paciente" || k === "paciente whatsapp") return null;
+  return n;
+}
+
+function normalizarCpf(cpf) {
+  const c = String(cpf || "").replace(/\D/g, "");
+  return c.length === 11 ? c : null;
+}
+
+function normalizarEmail(email) {
+  const e = String(email || "").trim().toLowerCase();
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e) ? e : null;
 }
 
 // Notificacao centralizada: unica fonte de verdade para envio de email aos medicos
@@ -1578,12 +1618,14 @@ app.get("/api/paciente/buscar", rlGeral, async (req, res) => {
     // Normaliza: remove DDI 55 se presente
     if (tel.length > 11 && tel.startsWith("55")) tel = tel.slice(2);
     if (tel.length < 10) return res.json({ ok: false });
-    // Busca o atendimento mais recente do paciente com este número
+    // Busca o atendimento mais recente, priorizando cadastro com nome real.
     const result = await pool.query(
-      `SELECT nome, tel, data_nascimento
+      `SELECT nome, tel, data_nascimento, cpf, email
          FROM fila_atendimentos
-        WHERE regexp_replace(tel, '\D', '', 'g') LIKE $1
-        ORDER BY criado_em DESC
+        WHERE regexp_replace(tel, '\\D', '', 'g') LIKE $1
+        ORDER BY
+          CASE WHEN LOWER(TRIM(COALESCE(nome,''))) IN ('','-','paciente','paciente whatsapp') THEN 1 ELSE 0 END,
+          criado_em DESC
         LIMIT 1`,
       [`%${tel}`]
     );
@@ -1594,7 +1636,9 @@ app.get("/api/paciente/buscar", rlGeral, async (req, res) => {
       paciente: {
         nome: p.nome || "",
         tel: p.tel || "",
-        data_nascimento: p.data_nascimento || ""
+        data_nascimento: p.data_nascimento || "",
+        cpf: p.cpf || "",
+        email: p.email || ""
       }
     });
   } catch (e) {
@@ -1605,35 +1649,89 @@ app.get("/api/paciente/buscar", rlGeral, async (req, res) => {
 
 app.post("/api/notify", rlTriagem, async (req, res) => {
   try {
-    const { nome, tel, tel_documentos, cpf, triagem, tipo, data_nascimento } = req.body || {};
+    const { atendimentoId, nome, tel, tel_documentos, cpf, triagem, tipo, data_nascimento, email } = req.body || {};
     const tipoConsulta = tipo === "video" ? "video" : "chat";
     const SITE_URL = process.env.SITE_URL || "https://consultaja24h.com.br";
-    const campos = parsearTriagem(triagem);
+    const triagemTexto = String(triagem || "");
+    const triagemPlaceholder = ehPlaceholder(triagemTexto);
+    const campos = parsearTriagem(triagemTexto);
+    const nomeLimpo = normalizarNomePaciente(nome);
+    const telLimpo = normalizarTexto(tel);
+    const telDocLimpo = normalizarTexto(tel_documentos) || telLimpo;
+    const cpfLimpo = normalizarCpf(cpf);
+    const dataNascLimpa = normalizarTexto(data_nascimento);
+    const emailLimpo = normalizarEmail(email);
+
+    if (atendimentoId) {
+      const updateResult = await pool.query(
+        `UPDATE fila_atendimentos
+            SET nome = COALESCE($2, nome),
+                tel = COALESCE($3, tel),
+                tel_documentos = COALESCE($4, tel_documentos),
+                cpf = COALESCE($5, cpf),
+                tipo = $6,
+                triagem = CASE
+                  WHEN $15 = false AND $7 <> '' THEN $7
+                  WHEN COALESCE(triagem,'') = '' AND $7 <> '' THEN $7
+                  ELSE triagem
+                END,
+                queixa = CASE WHEN $15 = false AND $7 <> '' THEN $8 ELSE queixa END,
+                idade = CASE WHEN $15 = false THEN $9 ELSE idade END,
+                sexo = CASE WHEN $15 = false THEN $10 ELSE sexo END,
+                alergias = CASE WHEN $15 = false THEN $11 ELSE alergias END,
+                cronicas = CASE WHEN $15 = false THEN $12 ELSE cronicas END,
+                medicacoes = CASE WHEN $15 = false THEN $13 ELSE medicacoes END,
+                data_nascimento = COALESCE($14, data_nascimento),
+                email = COALESCE($16, email)
+          WHERE id = $1
+          RETURNING id, nome, tel, cpf, tipo, triagem, status`,
+        [atendimentoId, nomeLimpo, telLimpo, telDocLimpo, cpfLimpo, tipoConsulta,
+         triagemTexto, campos.queixa||triagemTexto||"", campos.idade||"", campos.sexo||"",
+         campos.alergias||"", campos.cronicas||"", campos.medicacoes||"", dataNascLimpa,
+         triagemPlaceholder, emailLimpo]
+      );
+
+      if (updateResult.rowCount === 0) {
+        return res.status(404).json({ ok: false, error: "Atendimento nao encontrado" });
+      }
+
+      console.log(`[NOTIFY-UPDATE] atendimento #${atendimentoId} atualizado — nome: ${updateResult.rows[0].nome || "-"}`);
+      return res.json({
+        ok: true,
+        atendimentoId: updateResult.rows[0].id,
+        linkRetorno: `${SITE_URL}/triagem.html?consulta=${updateResult.rows[0].id}`
+      });
+    }
+
     // STATUS:
     // 'pagamento_pendente' = pré-registro antes do pagamento confirmado — invisível para o painel médico
     // 'triagem' = pagamento confirmado, triagem em andamento
     // 'aguardando' = triagem concluída + pagamento confirmado — visível para médicos
-    const statusInicial = ehPlaceholder(triagem) ? 'pagamento_pendente' : 'aguardando';
+    const statusInicial = triagemPlaceholder ? 'pagamento_pendente' : 'aguardando';
     const insertResult = await pool.query(
-      `INSERT INTO fila_atendimentos (nome,tel,tel_documentos,cpf,tipo,triagem,status,queixa,idade,sexo,alergias,cronicas,medicacoes,data_nascimento)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14) RETURNING id`,
-      [nome||"-",tel||"-",tel_documentos||tel||"-",cpf||"-",tipoConsulta,triagem||"",statusInicial,
-       campos.queixa||triagem||"",campos.idade||"",campos.sexo||"",campos.alergias||"",campos.cronicas||"",campos.medicacoes||"",data_nascimento||""]
+      `INSERT INTO fila_atendimentos (nome,tel,tel_documentos,cpf,tipo,triagem,status,queixa,idade,sexo,alergias,cronicas,medicacoes,data_nascimento,email)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id`,
+      [nomeLimpo||"Paciente",telLimpo||"-",telDocLimpo||telLimpo||"-",cpfLimpo||"",tipoConsulta,triagemTexto,statusInicial,
+       campos.queixa||triagemTexto||"",campos.idade||"",campos.sexo||"",campos.alergias||"",campos.cronicas||"",campos.medicacoes||"",dataNascLimpa||"",emailLimpo]
     );
-    const atendimentoId = insertResult.rows[0]?.id;
-    const linkRetorno = `${SITE_URL}/triagem.html?consulta=${atendimentoId}`;
+    const novoAtendimentoId = insertResult.rows[0]?.id;
+    const linkRetorno = `${SITE_URL}/triagem.html?consulta=${novoAtendimentoId}`;
     const agora = new Date().toLocaleString("pt-BR",{timeZone:"America/Fortaleza"});
-    appendToSheet("Atendimentos",[agora,nome||"",tel||"",cpf||"",statusInicial,"",triagem||"",tipoConsulta||"","",String(atendimentoId)]).catch(e=>console.error("[Sheets]",e));
+    if (!triagemPlaceholder) {
+      appendToSheet("Atendimentos",[agora,nomeLimpo||"",telLimpo||"",cpfLimpo||"",statusInicial,"",triagemTexto,tipoConsulta||"","",String(novoAtendimentoId)]).catch(e=>console.error("[Sheets]",e));
+    } else {
+      console.log("[SHEETS] Pre-registro suprimido em Atendimentos — atendimento #" + novoAtendimentoId);
+    }
 
     // Email NÃO é disparado aqui — o /api/atendimento/atualizar-triagem dispara após triagem real concluída
     // Isso evita email duplicado quando notify recebe triagem real diretamente
-    if (!ehPlaceholder(triagem)) {
+    if (!triagemPlaceholder) {
       console.log("[EMAIL-NOTIFY] Triagem real recebida via notify — email será disparado pelo atualizar-triagem");
     } else {
       console.log("[EMAIL-NOTIFY] Pre-registro, email suprimido. Status:", statusInicial);
     }
 
-    return res.json({ ok: true, atendimentoId, linkRetorno });
+    return res.json({ ok: true, atendimentoId: novoAtendimentoId, linkRetorno });
   } catch (e) {
     console.error("Notify error:", e);
     if (!res.headersSent) return res.status(500).json({ ok: false });
@@ -5131,7 +5229,13 @@ app.post("/api/plantao/sair", async (req, res) => {
 app.get("/relatorio", checkAdmin, async (req, res) => {
   try {
     const [atenRes, idRes, consRes] = await Promise.all([
-      pool.query(`SELECT id,nome,tel,cpf,tipo,triagem,status,medico_nome,documentos_emitidos,criado_em,encerrado_em FROM fila_atendimentos ORDER BY criado_em DESC`),
+      pool.query(`SELECT id,nome,tel,cpf,tipo,triagem,status,medico_nome,documentos_emitidos,criado_em,encerrado_em
+                    FROM fila_atendimentos
+                   WHERE NOT (
+                     status = 'pagamento_pendente'
+                     OR (pagamento_status = 'pendente' AND LOWER(TRIM(COALESCE(nome,''))) IN ('','-','paciente','paciente whatsapp'))
+                   )
+                   ORDER BY criado_em DESC`),
       pool.query(`SELECT nome,tel,data,ip FROM identificacoes ORDER BY id DESC LIMIT 200`),
       pool.query(`SELECT nome,tel,versao,data,ip FROM consentimentos ORDER BY id DESC LIMIT 200`),
     ]);
