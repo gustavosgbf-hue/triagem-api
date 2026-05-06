@@ -750,9 +750,23 @@ if (!PAGBANK_TOKEN) console.error("[PAGBANK] Token não configurado");
 
 app.post("/api/pagbank/order", async (req, res) => {
   try {
-    const { nome, email, cpf } = req.body || {};
+    const { nome, email, cpf, atendimentoId } = req.body || {};
     if (!nome || !cpf) return res.status(400).json({ ok: false, error: "nome e cpf obrigatorios" });
     if (!PAGBANK_TOKEN) return res.status(503).json({ ok: false, error: "Gateway de pagamento indisponivel" });
+    const atendimentoIdNum = parseInt(atendimentoId, 10) || null;
+
+    if (atendimentoIdNum) {
+      const atCheck = await pool.query(
+        `SELECT id, pagamento_status FROM fila_atendimentos WHERE id = $1`,
+        [atendimentoIdNum]
+      );
+      if (atCheck.rowCount === 0) {
+        return res.status(404).json({ ok: false, error: "Atendimento nao encontrado para gerar PIX" });
+      }
+      if (atCheck.rows[0].pagamento_status === "confirmado") {
+        return res.status(409).json({ ok: false, error: "Atendimento ja esta pago" });
+      }
+    }
 
     const expiracao    = new Date(Date.now() + 30 * 60 * 1000);
     const expiracaoISO = expiracao.toISOString().replace("Z", "-03:00");
@@ -763,7 +777,7 @@ app.post("/api/pagbank/order", async (req, res) => {
     }
 
     const orderBody = {
-      reference_id: "CJ-" + Date.now() + "-" + Math.random().toString(36).slice(2,6).toUpperCase(),
+      reference_id: "CJ-" + (atendimentoIdNum || Date.now()) + "-" + Math.random().toString(36).slice(2,6).toUpperCase(),
       customer: {
         name:   (nomeClean.length > 1 && nomeClean !== '-') ? nomeClean : 'Paciente',
         email:  email || `paciente.${cpf.replace(/\D/g,"")}@consultaja24h.com.br`,
@@ -794,6 +808,21 @@ app.post("/api/pagbank/order", async (req, res) => {
     if (!qrCode?.text) {
       console.error("[PAGBANK] QR Code ausente:", JSON.stringify(data));
       return res.status(502).json({ ok: false, error: "PagBank nao retornou QR Code. Verifique chave PIX cadastrada na conta." });
+    }
+
+    if (atendimentoIdNum) {
+      const vinc = await pool.query(
+        `UPDATE fila_atendimentos
+            SET pagbank_order_id = $2
+          WHERE id = $1
+            AND pagamento_status = 'pendente'
+          RETURNING id`,
+        [atendimentoIdNum, data.id]
+      );
+      if (vinc.rowCount === 0) {
+        return res.status(409).json({ ok: false, error: "Nao foi possivel vincular PIX ao atendimento" });
+      }
+      console.log("[PAGBANK] Order vinculada no ato — atendimento #" + atendimentoIdNum + " <- " + data.id);
     }
 
     return res.json({ ok: true, order_id: data.id, qr_code_text: qrCode.text });
@@ -857,7 +886,16 @@ app.post("/api/pagbank/webhook", async (req, res) => {
       console.log("[PAGBANK-WEBHOOK] Order " + orderId + " nao encontrado pelo pagbank_order_id — tentando fallback por fila_atendimentos.");
 
       const fbFila = await pool.query(
-        `UPDATE fila_atendimentos
+        `WITH candidato AS (
+           SELECT id
+             FROM fila_atendimentos
+            WHERE pagbank_order_id IS NULL
+              AND pagamento_status = 'pendente'
+              AND criado_em > NOW() - INTERVAL '2 hours'
+            ORDER BY criado_em DESC
+            LIMIT 1
+         )
+         UPDATE fila_atendimentos
             SET pagamento_status        = 'confirmado',
                 pagamento_confirmado_em = NOW(),
                 pagbank_order_id        = $1,
@@ -882,11 +920,8 @@ app.post("/api/pagbank/webhook", async (req, res) => {
                     END
                   ELSE status
                 END
-          WHERE pagbank_order_id IS NULL
-            AND pagamento_status  = 'pendente'
-            AND criado_em > NOW() - INTERVAL '2 hours'
-          ORDER BY criado_em DESC
-          LIMIT 1
+          FROM candidato
+         WHERE fila_atendimentos.id = candidato.id
           RETURNING id, nome, tel, cpf, tipo, triagem, status`,
         [orderId]
       ).catch(e => { console.warn("[PAGBANK-WEBHOOK] Fallback fila_atendimentos:", e.message); return { rowCount: 0, rows: [] }; });
