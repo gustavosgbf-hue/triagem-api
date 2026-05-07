@@ -966,6 +966,7 @@ app.get("/api/pagbank/order/:id", async (req, res) => {
 function montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno, linkAssumir, medicoNome, horarioAgendado, isLembrete }) {
   const tipoLabel = tipo === "video" ? "Video" : "Chat";
   const telLimpo = String(tel||"").replace(/\D/g,"");
+  const nomeEmail = normalizarNomePaciente(nome) || "Nome não informado";
   const tituloEmail = isLembrete
     ? "Lembrete de atendimento — ConsultaJá24h"
     : (horarioAgendado ? "Agendamento pronto para atendimento — ConsultaJá24h" : "Paciente novo na fila — ConsultaJá24h");
@@ -975,7 +976,7 @@ function montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno, linkAssumir, m
   const avisoTexto = isLembrete
     ? "Este atendimento está próximo do horário agendado. Confira os dados e entre no painel para acompanhar."
     : "Um paciente acabou de concluir a triagem e está aguardando médico. Clique em Assumir atendimento para vincular este paciente ao seu nome.";
-  const preheader = `${avisoTitulo}: ${nome || "Paciente"} aguardando atendimento ${tipoLabel}.`;
+  const preheader = `${avisoTitulo}: ${nomeEmail} aguardando atendimento ${tipoLabel}.`;
   function montarTabelaTriagem(texto) {
     if (!texto) return '<tr><td colspan="2">-</td></tr>';
     return texto.split(/[;\n]/).map(item => {
@@ -994,7 +995,7 @@ function montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno, linkAssumir, m
         ${linkAssumir ? `<div style="margin-top:8px;font-size:12px;color:rgba(255,255,255,.52)">O primeiro médico a clicar assume o atendimento. Link válido por 2h.</div>` : ""}
       </div>
       <table style="width:100%;border-collapse:collapse;margin-bottom:24px">
-        <tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px;width:140px">Paciente</td><td style="padding:8px 0;font-weight:600">${nome||"-"}</td></tr>
+        <tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px;width:140px">Paciente</td><td style="padding:8px 0;font-weight:600">${nomeEmail}</td></tr>
         <tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">WhatsApp</td><td style="padding:8px 0;font-weight:600">${telLimpo}</td></tr>
         <tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">Modalidade</td><td style="padding:8px 0;font-weight:600">${tipoLabel}</td></tr>
         ${horarioAgendado ? `<tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">📅 Horário</td><td style="padding:8px 0;font-weight:700;color:#b4e05a;font-size:15px">${horarioAgendado}</td></tr>` : ''}
@@ -1365,6 +1366,51 @@ function normalizarNomePaciente(nome) {
   return n;
 }
 
+async function garantirNomePacienteParaFila(at) {
+  if (!at || !at.id) return at;
+  const nomeAtual = normalizarNomePaciente(at.nome);
+  if (nomeAtual) return { ...at, nome: nomeAtual };
+
+  const telBusca = String(at.tel || "").replace(/\D/g, "");
+  if (telBusca) {
+    const historico = await pool.query(
+      `SELECT nome, data_nascimento, email
+         FROM fila_atendimentos
+        WHERE id <> $1
+          AND regexp_replace(COALESCE(tel,''), '\\D', '', 'g') LIKE $2
+          AND LOWER(TRIM(COALESCE(nome,''))) NOT IN ('','-','paciente','paciente whatsapp')
+        ORDER BY criado_em DESC
+        LIMIT 1`,
+      [at.id, `%${telBusca}`]
+    );
+    const nomeHistorico = normalizarNomePaciente(historico.rows[0]?.nome);
+    if (nomeHistorico) {
+      const upd = await pool.query(
+        `UPDATE fila_atendimentos
+            SET nome=$2,
+                data_nascimento=CASE WHEN COALESCE(data_nascimento,'')='' AND COALESCE($3,'')<>'' THEN $3 ELSE data_nascimento END,
+                email=CASE WHEN COALESCE(email,'')='' AND COALESCE($4,'')<>'' THEN $4 ELSE email END
+          WHERE id=$1
+          RETURNING id,nome,tel,cpf,tipo,triagem,status,tel_documentos`,
+        [at.id, nomeHistorico, historico.rows[0]?.data_nascimento || "", historico.rows[0]?.email || ""]
+      );
+      console.log(`[PACIENTE-NOME] Atendimento #${at.id} corrigido com nome do historico: ${nomeHistorico}`);
+      return upd.rows[0] || { ...at, nome: nomeHistorico };
+    }
+  }
+
+  await pool.query(
+    `UPDATE fila_atendimentos SET status='triagem'
+      WHERE id=$1 AND status='aguardando'`,
+    [at.id]
+  ).catch(e => console.warn("[PACIENTE-NOME] Falha ao devolver atendimento para triagem:", e.message));
+
+  const err = new Error("nome_paciente_obrigatorio");
+  err.code = "NOME_PACIENTE_OBRIGATORIO";
+  err.atendimentoId = at.id;
+  throw err;
+}
+
 function normalizarCpf(cpf) {
   const c = String(cpf || "").replace(/\D/g, "");
   return c.length === 11 ? c : null;
@@ -1377,21 +1423,23 @@ function normalizarEmail(email) {
 
 // Notificacao centralizada: unica fonte de verdade para envio de email aos medicos
 async function notificarMedicos(at) {
+  at = await garantirNomePacienteParaFila(at);
+  const nomeFila = normalizarNomePaciente(at.nome) || "Nome não informado";
   const SITE_URL = process.env.SITE_URL || "https://consultaja24h.com.br";
   const linkRetorno = SITE_URL + "/triagem.html?consulta=" + at.id;
   const agora = new Date().toLocaleString("pt-BR", { timeZone: "America/Fortaleza" });
 
   appendToSheet("Atendimentos", [
-    agora, at.nome||"", at.tel||"", at.cpf||"",
+    agora, nomeFila, at.tel||"", at.cpf||"",
     "Aguardando", "", at.triagem||"", at.tipo||"", "", String(at.id)
   ]).catch(() => {});
 
   await enviarEmailMedicos({
-    nome: at.nome, tel: at.tel, tipo: at.tipo,
+    nome: nomeFila, tel: at.tel, tipo: at.tipo,
     triagem: at.triagem, linkRetorno,
     atendimentoId: at.id,
     horarioAgendado: null, horarioAgendadoRaw: null,
-    subject: "PACIENTE NOVO NA FILA - " + (at.nome || "Paciente")
+    subject: "PACIENTE NOVO NA FILA - " + nomeFila
   });
 
   console.log("[NOTIFICACAO] Medicos notificados — atendimento #" + at.id);
@@ -1408,25 +1456,31 @@ async function liberarAtendimentoParaMedicos(atendimentoId) {
     console.log(`[APROVACAO] #${atendimentoId} já foi liberado ou cancelado — ignorando.`);
     return;
   }
-  const at = r.rows[0];
+  const at = await garantirNomePacienteParaFila(r.rows[0]);
+  const nomeFila = normalizarNomePaciente(at.nome) || "Nome não informado";
   const SITE_URL = process.env.SITE_URL || "https://consultaja24h.com.br";
   const linkRetorno = `${SITE_URL}/triagem.html?consulta=${at.id}`;
   const tipoLabel = at.tipo === "video" ? "Video" : "Chat";
   const agora = new Date().toLocaleString("pt-BR", { timeZone: "America/Fortaleza" });
-  appendToSheet("Atendimentos",[agora,at.nome||"",at.tel||"",at.cpf||"","Aguardando","",at.triagem||"",at.tipo||"","",String(at.id)]).catch(()=>{});
+  appendToSheet("Atendimentos",[agora,nomeFila,at.tel||"",at.cpf||"","Aguardando","",at.triagem||"",at.tipo||"","",String(at.id)]).catch(()=>{});
   await enviarEmailMedicos({
-    nome: at.nome, tel: at.tel, tipo: at.tipo, triagem: at.triagem, linkRetorno,
+    nome: nomeFila, tel: at.tel, tipo: at.tipo, triagem: at.triagem, linkRetorno,
     atendimentoId: at.id, horarioAgendado: null, horarioAgendadoRaw: null,
-    subject: `Nova triagem - ${at.nome||"Paciente"} (${tipoLabel})`
+    subject: `Nova triagem - ${nomeFila} (${tipoLabel})`
   });
   console.log(`[LIBERADO] Atendimento #${atendimentoId} liberado para médicos.`);
 }
 
 app.post("/api/atendimento/atualizar-triagem", async (req, res) => {
   try {
-    const { atendimentoId, triagem, agendamentoId } = req.body || {};
+    const { atendimentoId, triagem, agendamentoId, nome, tel, cpf, data_nascimento, email } = req.body || {};
     if (!atendimentoId || !triagem) return res.status(400).json({ ok: false, error: "atendimentoId e triagem sao obrigatorios" });
     const campos = parsearTriagem(triagem);
+    const nomeLimpo = normalizarNomePaciente(nome);
+    const telLimpo = normalizarTexto(tel);
+    const cpfLimpo = normalizarCpf(cpf);
+    const dataNascLimpa = normalizarTexto(data_nascimento);
+    const emailLimpo = normalizarEmail(email);
 
     // ── AGENDAMENTO: fluxo original sem interceptação ──────────────────────
     if (agendamentoId) {
@@ -1436,7 +1490,8 @@ app.post("/api/atendimento/atualizar-triagem", async (req, res) => {
         [atendimentoId,triagem,campos.queixa||triagem,campos.idade||"",campos.sexo||"",campos.alergias||"",campos.cronicas||"",campos.medicacoes||"",campos.solicita||""]
       );
       if (result.rowCount === 0) return res.status(404).json({ ok: false, error: "Atendimento nao encontrado ou ja em andamento" });
-      const at = result.rows[0];
+      const at = await garantirNomePacienteParaFila(result.rows[0]);
+      const nomeFila = normalizarNomePaciente(at.nome) || "Nome não informado";
       const SITE_URL = process.env.SITE_URL || "https://consultaja24h.com.br";
       const linkRetorno = `${SITE_URL}/triagem.html?consulta=${at.id}`;
       const tipoLabel = at.tipo === "video" ? "Video" : "Chat";
@@ -1448,12 +1503,12 @@ app.post("/api/atendimento/atualizar-triagem", async (req, res) => {
         horarioAgendado = new Date(horarioAgendadoRaw).toLocaleString("pt-BR",{timeZone:"America/Fortaleza",day:"2-digit",month:"2-digit",year:"numeric",hour:"2-digit",minute:"2-digit"});
         await pool.query(`UPDATE fila_atendimentos SET horario_agendado=$1, agendamento_id=$2 WHERE id=$3`,[horarioAgendadoRaw, agendamentoId, atendimentoId]);
       }
-      appendToSheet("Atendimentos",[agora,at.nome||"",at.tel||"",at.cpf||"","Aguardando","",triagem,at.tipo||"","",String(at.id)]).catch(e=>console.error("[Sheets]",e));
+      appendToSheet("Atendimentos",[agora,nomeFila,at.tel||"",at.cpf||"","Aguardando","",triagem,at.tipo||"","",String(at.id)]).catch(e=>console.error("[Sheets]",e));
       if (!isTriagemPlaceholder(triagem)) {
         await enviarEmailMedicos({
-          nome: at.nome, tel: at.tel, tipo: at.tipo, triagem, linkRetorno,
+          nome: nomeFila, tel: at.tel, tipo: at.tipo, triagem, linkRetorno,
           atendimentoId: at.id, horarioAgendado, horarioAgendadoRaw,
-          subject: "Agendamento - " + (at.nome||"Paciente") + " (" + tipoLabel + ") - " + horarioAgendado
+          subject: "Agendamento - " + nomeFila + " (" + tipoLabel + ") - " + horarioAgendado
         });
       } else {
         console.warn(`[TRIAGEM-AGEND] triagem placeholder detectada em agendamento #${at.id} — e-mail suprimido`);
@@ -1499,12 +1554,17 @@ app.post("/api/atendimento/atualizar-triagem", async (req, res) => {
     const result = await pool.query(
       `UPDATE fila_atendimentos
           SET triagem=$2, queixa=$3, idade=$4, sexo=$5, alergias=$6, cronicas=$7,
-              medicacoes=$8, solicita=$9, status=$10, aprovacao_token=NULL
+              medicacoes=$8, solicita=$9, status=$10, aprovacao_token=NULL,
+              nome=COALESCE($11,nome),
+              tel=COALESCE($12,tel),
+              cpf=COALESCE($13,cpf),
+              data_nascimento=COALESCE($14,data_nascimento),
+              email=COALESCE($15,email)
         WHERE id=$1 AND status IN ('triagem','aguardando','aguardando_aprovacao','pagamento_pendente')
         RETURNING id,nome,tel,cpf,tipo,triagem,tel_documentos`,
       [atendimentoId, triagem, campos.queixa||triagem, campos.idade||"", campos.sexo||"",
        campos.alergias||"", campos.cronicas||"", campos.medicacoes||"", campos.solicita||"",
-       novoStatus]
+       novoStatus, nomeLimpo, telLimpo, cpfLimpo, dataNascLimpa, emailLimpo]
     );
     if (result.rowCount === 0) return res.status(404).json({ ok: false, error: "Atendimento nao encontrado" });
     const at = result.rows[0];
@@ -1520,6 +1580,13 @@ app.post("/api/atendimento/atualizar-triagem", async (req, res) => {
 
   } catch (e) {
     console.error("Erro em /api/atendimento/atualizar-triagem:", e);
+    if (e.code === "NOME_PACIENTE_OBRIGATORIO") {
+      return res.status(400).json({
+        ok: false,
+        error: "nome_paciente_obrigatorio",
+        atendimentoId: e.atendimentoId || null
+      });
+    }
     return res.status(500).json({ ok: false, error: "Erro ao atualizar triagem" });
   }
 });
@@ -1757,6 +1824,9 @@ app.post("/api/notify", rlTriagem, async (req, res) => {
     // 'pagamento_pendente' = pré-registro antes do pagamento confirmado — invisível para o painel médico
     // 'triagem' = pagamento confirmado, triagem em andamento
     // 'aguardando' = triagem concluída + pagamento confirmado — visível para médicos
+    if (!triagemPlaceholder && !nomeLimpo) {
+      return res.status(400).json({ ok: false, error: "nome_paciente_obrigatorio" });
+    }
     const statusInicial = triagemPlaceholder ? 'pagamento_pendente' : 'aguardando';
     const insertResult = await pool.query(
       `INSERT INTO fila_atendimentos (nome,tel,tel_documentos,cpf,tipo,triagem,status,queixa,idade,sexo,alergias,cronicas,medicacoes,data_nascimento,email)
@@ -5003,7 +5073,20 @@ app.get("/api/fila", checkMedico, async (req, res) => {
       query = `SELECT id,nome,tel,cpf,tipo,triagem,status,medico_id,medico_nome,meet_link,criado_em,data_nascimento,idade,sexo,alergias,cronicas,medicacoes,queixa,solicita,horario_agendado FROM fila_atendimentos WHERE status IN ('aguardando','assumido') AND tipo NOT LIKE 'renovacao%' AND (horario_agendado IS NULL OR horario_agendado <= NOW() + INTERVAL '15 minutes') ORDER BY criado_em ASC`;
     }
     const result = await pool.query(query, params || []);
-    return res.json({ ok: true, fila: result.rows });
+    const fila = [];
+    for (const row of result.rows) {
+      try {
+        if (row.status === "aguardando") fila.push(await garantirNomePacienteParaFila(row));
+        else fila.push({ ...row, nome: normalizarNomePaciente(row.nome) || "Nome não informado" });
+      } catch (e) {
+        if (e.code === "NOME_PACIENTE_OBRIGATORIO") {
+          console.warn(`[FILA] Atendimento #${row.id} sem nome real removido da fila ate paciente confirmar dados.`);
+          continue;
+        }
+        throw e;
+      }
+    }
+    return res.json({ ok: true, fila });
   } catch (err) { return res.status(500).json({ ok: false, error: "Erro ao carregar fila" }); }
 });
 
@@ -5860,7 +5943,12 @@ app.post("/api/efi/cartao/webhook", async (req, res) => {
 
       // Notifica médicos se triagem real já estava preenchida
       if (at.status === "aguardando" && !isTriagemPlaceholder(at.triagem)) {
-        await notificarMedicos(at);
+        try {
+          await notificarMedicos(at);
+        } catch (e) {
+          if (e.code === "NOME_PACIENTE_OBRIGATORIO") console.warn(`[EFI-WEBHOOK] Atendimento #${at.id} sem nome real — aguardando paciente confirmar dados.`);
+          else throw e;
+        }
       }
     }
 
@@ -7589,7 +7677,12 @@ async function juliePromoverAtendimento(at, orderId) {
         [at.id]
       ).catch(() => ({ rowCount: 0, rows: [] }));
       if (upd.rowCount > 0) {
-        await notificarMedicos(upd.rows[0]);
+        try {
+          await notificarMedicos(upd.rows[0]);
+        } catch (e) {
+          if (e.code === "NOME_PACIENTE_OBRIGATORIO") console.warn(`[JULIE] Atendimento #${upd.rows[0].id} sem nome real — aguardando paciente confirmar dados.`);
+          else throw e;
+        }
         if (upd.rows[0].tel) {
           sendWhatsAppMessage(upd.rows[0].tel,
             "Pagamento confirmado ✅\nSeu atendimento já vai começar."
@@ -7597,7 +7690,12 @@ async function juliePromoverAtendimento(at, orderId) {
         }
       }
     } else {
-      await notificarMedicos(at);
+      try {
+        await notificarMedicos(at);
+      } catch (e) {
+        if (e.code === "NOME_PACIENTE_OBRIGATORIO") console.warn(`[JULIE] Atendimento #${at.id} sem nome real — aguardando paciente confirmar dados.`);
+        else throw e;
+      }
       if (at.tel) {
         sendWhatsAppMessage(at.tel,
           "Pagamento confirmado ✅\nSeu atendimento já vai começar."
