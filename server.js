@@ -929,6 +929,7 @@ app.post("/api/pagbank/webhook", async (req, res) => {
       if (fbFila.rowCount > 0) {
         const atFb = fbFila.rows[0];
         console.log("[PAGBANK-WEBHOOK] Fallback fila_atendimentos: atendimento #" + atFb.id + " atualizado via race-condition recovery.");
+        console.log("PAGAMENTO_CONFIRMADO_REDIRECT_CONFIRMADO", { consultaId: String(atFb.id), tipo: atFb.tipo || "chat", metodo: "pix" });
         await juliePromoverAtendimento(atFb, orderId);
         return;
       }
@@ -939,6 +940,7 @@ app.post("/api/pagbank/webhook", async (req, res) => {
 
     const at = rows[0];
     console.log("[PAGBANK-WEBHOOK] Pagamento confirmado — atendimento #" + at.id + " status:" + at.status);
+    console.log("PAGAMENTO_CONFIRMADO_REDIRECT_CONFIRMADO", { consultaId: String(at.id), tipo: at.tipo || "chat", metodo: "pix" });
     await juliePromoverAtendimento(at, orderId);
 
   } catch (e) {
@@ -5832,6 +5834,7 @@ app.post("/api/efi/cartao/cobrar", rlGeral, async (req, res) => {
         ).catch(e => console.warn("[EFI-CARTAO] Salvar confirmação síncrona falhou:", e.message));
 
         console.log(`[EFI-CARTAO] Atendimento #${atendimentoId} — pagamento confirmado (paid síncrono). Notificação pendente até triagem.`);
+        console.log("PAGAMENTO_CONFIRMADO_REDIRECT_CONFIRMADO", { consultaId: String(atendimentoId), tipo: "chat", metodo: "cartao" });
       }
 
       console.log(`[EFI-CARTAO] charge_id ${chargeId} — status: ${status} — aguardando webhook para confirmação final`);
@@ -5940,6 +5943,7 @@ app.post("/api/efi/cartao/webhook", async (req, res) => {
 
       const at = atRows[0];
       console.log(`[EFI-WEBHOOK] Atendimento #${at.id} confirmado via webhook — status: ${at.status}`);
+      console.log("PAGAMENTO_CONFIRMADO_REDIRECT_CONFIRMADO", { consultaId: String(at.id), tipo: at.tipo || "chat", metodo: "cartao" });
 
       // Notifica médicos se triagem real já estava preenchida
       if (at.status === "aguardando" && !isTriagemPlaceholder(at.triagem)) {
@@ -7661,7 +7665,8 @@ function julieExtrairNomeCPF(texto) {
 
 async function juliePromoverAtendimento(at, orderId) {
   const SITE_URL = process.env.SITE_URL || "https://consultaja24h.com.br";
-  const linkTriagem = `${SITE_URL}/triagem.html?consulta=${at.id}`;
+  const tipo = at.tipo || "chat";
+  const linkConfirmado = `${SITE_URL}/confirmado?consulta=${encodeURIComponent(String(at.id))}&tipo=${encodeURIComponent(tipo)}`;
 
   if (at.tel) {
     appendToSheet("Julie", [new Date().toISOString(), at.tel, "imediata", "pago", orderId]).catch(() => {});
@@ -7707,7 +7712,7 @@ async function juliePromoverAtendimento(at, orderId) {
       sendWhatsAppMessage(at.tel,
         "Pagamento confirmado ✅\n" +
         "Conclua sua triagem para o médico te atender mais rápido 👇\n" +
-        linkTriagem
+        linkConfirmado
       ).catch(() => {});
     }
   }
