@@ -62,6 +62,26 @@ app.post("/api/tracking/confirmado-view", rlGeral, (req, res) => {
   const gclid = String(body.gclid || "");
   const gbraid = String(body.gbraid || "");
   const wbraid = String(body.wbraid || "");
+  const consultaId = parseInt(body.consultaId, 10) || null;
+  if (consultaId) {
+    const ads = normalizarAdsAttribution({
+      gclid,
+      gbraid,
+      wbraid,
+      href: body.href,
+      referrer: body.referrer,
+      checkout_session_id: body.checkoutSessionId
+    }, req);
+    salvarAdsAttribution(consultaId, ads, req).catch(() => {});
+    pool.query(
+      `UPDATE fila_atendimentos
+          SET confirmado_pageview_em = COALESCE(confirmado_pageview_em, NOW()),
+              confirmado_has_ads_id = COALESCE(confirmado_has_ads_id, false) OR $2,
+              confirmado_href = COALESCE(NULLIF($3,''), confirmado_href)
+        WHERE id = $1`,
+      [consultaId, !!(gclid || gbraid || wbraid), limitarTexto(body.href, 700)]
+    ).catch(e => console.warn("[CONFIRMADO-PAGEVIEW] Falha ao salvar:", e.message));
+  }
   console.log("CONFIRMADO_PAGEVIEW", {
     consultaId: String(body.consultaId || ""),
     tipo: String(body.tipo || ""),
@@ -79,6 +99,100 @@ app.post("/api/tracking/confirmado-view", rlGeral, (req, res) => {
   });
   res.json({ ok: true });
 });
+
+function limitarTexto(valor, max = 500) {
+  return String(valor || "").trim().slice(0, max);
+}
+
+function normalizarAdsAttribution(input = {}, req) {
+  const src = input && typeof input === "object" ? input : {};
+  const gclid = limitarTexto(src.gclid, 220);
+  const gbraid = limitarTexto(src.gbraid, 220);
+  const wbraid = limitarTexto(src.wbraid, 220);
+  const utm = {};
+  ["utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content"].forEach(k => {
+    const v = limitarTexto(src[k], 220);
+    if (v) utm[k] = v;
+  });
+  const landingUrl = limitarTexto(src.landing_url || src.landingUrl || src.href, 700);
+  const referrer = limitarTexto(src.referrer, 700);
+  const checkoutSessionId = limitarTexto(src.checkout_session_id || src.checkoutSessionId, 120);
+  const userAgent = limitarTexto(src.user_agent || src.userAgent || req?.get?.("user-agent"), 300);
+  const hasAny = !!(gclid || gbraid || wbraid || Object.keys(utm).length || landingUrl || referrer || checkoutSessionId);
+  return { gclid, gbraid, wbraid, utm, landingUrl, referrer, checkoutSessionId, userAgent, hasAny };
+}
+
+async function salvarAdsAttribution(atendimentoId, attribution, req) {
+  const id = parseInt(atendimentoId, 10);
+  if (!id) return;
+  const ads = attribution?.hasAny ? attribution : normalizarAdsAttribution(attribution || {}, req);
+  if (!ads.hasAny) return;
+  await pool.query(
+    `UPDATE fila_atendimentos
+        SET ads_gclid = COALESCE(NULLIF($2,''), ads_gclid),
+            ads_gbraid = COALESCE(NULLIF($3,''), ads_gbraid),
+            ads_wbraid = COALESCE(NULLIF($4,''), ads_wbraid),
+            ads_utm = CASE WHEN $5::jsonb <> '{}'::jsonb THEN COALESCE(ads_utm, '{}'::jsonb) || $5::jsonb ELSE ads_utm END,
+            ads_landing_url = COALESCE(NULLIF($6,''), ads_landing_url),
+            ads_referrer = COALESCE(NULLIF($7,''), ads_referrer),
+            ads_checkout_session_id = COALESCE(NULLIF($8,''), ads_checkout_session_id),
+            ads_user_agent = COALESCE(NULLIF($9,''), ads_user_agent),
+            ads_capturado_em = COALESCE(ads_capturado_em, NOW())
+      WHERE id = $1`,
+    [
+      id,
+      ads.gclid,
+      ads.gbraid,
+      ads.wbraid,
+      JSON.stringify(ads.utm || {}),
+      ads.landingUrl,
+      ads.referrer,
+      ads.checkoutSessionId,
+      ads.userAgent
+    ]
+  ).catch(e => console.warn("[ADS-ATTR] Falha ao salvar attribution:", e.message));
+}
+
+async function logarCandidatoConversaoOffline(atendimentoId, metodo, origem, externalId) {
+  const id = parseInt(atendimentoId, 10);
+  if (!id) return;
+  const { rows } = await pool.query(
+    `SELECT id, tipo, nome, tel, cpf, email, pagamento_confirmado_em,
+            ads_gclid, ads_gbraid, ads_wbraid, ads_utm, ads_checkout_session_id,
+            confirmado_pageview_em, confirmado_has_ads_id
+       FROM fila_atendimentos
+      WHERE id = $1`,
+    [id]
+  ).catch(e => {
+    console.warn("[ADS-OFFLINE] Falha ao buscar atendimento:", e.message);
+    return { rows: [] };
+  });
+  const at = rows[0];
+  if (!at) return;
+  const hasClickId = !!(at.ads_gclid || at.ads_gbraid || at.ads_wbraid);
+  const hasUserData = !!(at.email || at.tel || at.cpf);
+  console.log("GOOGLE_ADS_OFFLINE_CONVERSION_CANDIDATE", {
+    consultaId: String(at.id),
+    tipo: at.tipo || "chat",
+    metodo: metodo || "",
+    origem: origem || "",
+    externalId: String(externalId || ""),
+    conversionTime: at.pagamento_confirmado_em || new Date().toISOString(),
+    value: 49.90,
+    currency: "BRL",
+    hasGclid: !!at.ads_gclid,
+    hasGbraid: !!at.ads_gbraid,
+    hasWbraid: !!at.ads_wbraid,
+    hasUserData,
+    canImportOffline: hasClickId || hasUserData,
+    confirmedPageview: !!at.confirmado_pageview_em,
+    confirmedPageviewHadAdsId: !!at.confirmado_has_ads_id,
+    gclidTail: at.ads_gclid ? String(at.ads_gclid).slice(-10) : "",
+    gbraidTail: at.ads_gbraid ? String(at.ads_gbraid).slice(-10) : "",
+    wbraidTail: at.ads_wbraid ? String(at.ads_wbraid).slice(-10) : "",
+    checkoutSessionId: at.ads_checkout_session_id || ""
+  });
+}
 
 const OPENAI_KEY = process.env.OPENAI_API_KEY;
 const JWT_SECRET = process.env.JWT_SECRET;
@@ -380,6 +494,18 @@ async function initDB() {
       ['frete_servico_id','TEXT'],
       ['frete_prazo_dias','INTEGER'],
       ['questionario','JSONB'],
+      ['ads_gclid','TEXT'],
+      ['ads_gbraid','TEXT'],
+      ['ads_wbraid','TEXT'],
+      ['ads_utm','JSONB DEFAULT \'{}\'::jsonb'],
+      ['ads_landing_url','TEXT'],
+      ['ads_referrer','TEXT'],
+      ['ads_checkout_session_id','TEXT'],
+      ['ads_user_agent','TEXT'],
+      ['ads_capturado_em','TIMESTAMPTZ'],
+      ['confirmado_pageview_em','TIMESTAMPTZ'],
+      ['confirmado_has_ads_id','BOOLEAN'],
+      ['confirmado_href','TEXT'],
     ];
     // Coluna para controle de lembrete de agendamento
     await pool.query(`ALTER TABLE agendamentos ADD COLUMN IF NOT EXISTS lembrete_enviado BOOLEAN DEFAULT false`).catch(()=>{});
@@ -774,6 +900,7 @@ if (!PAGBANK_TOKEN) console.error("[PAGBANK] Token não configurado");
 app.post("/api/pagbank/order", async (req, res) => {
   try {
     const { nome, email, cpf, atendimentoId } = req.body || {};
+    const adsAttribution = normalizarAdsAttribution(req.body?.ads || req.body?.attribution || {}, req);
     if (!nome || !cpf) return res.status(400).json({ ok: false, error: "nome e cpf obrigatorios" });
     if (!PAGBANK_TOKEN) return res.status(503).json({ ok: false, error: "Gateway de pagamento indisponivel" });
     const atendimentoIdNum = parseInt(atendimentoId, 10) || null;
@@ -845,6 +972,7 @@ app.post("/api/pagbank/order", async (req, res) => {
       if (vinc.rowCount === 0) {
         return res.status(409).json({ ok: false, error: "Nao foi possivel vincular PIX ao atendimento" });
       }
+      await salvarAdsAttribution(atendimentoIdNum, adsAttribution, req);
       console.log("[PAGBANK] Order vinculada no ato — atendimento #" + atendimentoIdNum + " <- " + data.id);
     }
 
@@ -953,6 +1081,7 @@ app.post("/api/pagbank/webhook", async (req, res) => {
         const atFb = fbFila.rows[0];
         console.log("[PAGBANK-WEBHOOK] Fallback fila_atendimentos: atendimento #" + atFb.id + " atualizado via race-condition recovery.");
         console.log("PAGAMENTO_CONFIRMADO_REDIRECT_CONFIRMADO", { consultaId: String(atFb.id), tipo: atFb.tipo || "chat", metodo: "pix" });
+        await logarCandidatoConversaoOffline(atFb.id, "pix", "pagbank_webhook_fallback", orderId);
         await juliePromoverAtendimento(atFb, orderId);
         return;
       }
@@ -964,6 +1093,7 @@ app.post("/api/pagbank/webhook", async (req, res) => {
     const at = rows[0];
     console.log("[PAGBANK-WEBHOOK] Pagamento confirmado — atendimento #" + at.id + " status:" + at.status);
     console.log("PAGAMENTO_CONFIRMADO_REDIRECT_CONFIRMADO", { consultaId: String(at.id), tipo: at.tipo || "chat", metodo: "pix" });
+    await logarCandidatoConversaoOffline(at.id, "pix", "pagbank_webhook", orderId);
     await juliePromoverAtendimento(at, orderId);
 
   } catch (e) {
@@ -1566,6 +1696,7 @@ app.post("/api/atendimento/atualizar-triagem", async (req, res) => {
           );
           pagamentoConfirmado = true;
           console.log("[TRIAGEM] Pagamento confirmado via consulta direta PagBank — atendimento #" + atendimentoId);
+          await logarCandidatoConversaoOffline(atendimentoId, "pix", "triagem_pagbank_consulta_direta", check.rows[0].pagbank_order_id);
         }
       } catch (e) {
         console.warn("[TRIAGEM] Falha ao consultar PagBank diretamente:", e.message);
@@ -1792,6 +1923,7 @@ app.get("/api/paciente/buscar", rlGeral, async (req, res) => {
 app.post("/api/notify", rlTriagem, async (req, res) => {
   try {
     const { atendimentoId, nome, tel, tel_documentos, cpf, triagem, tipo, data_nascimento, email } = req.body || {};
+    const adsAttribution = normalizarAdsAttribution(req.body?.ads || req.body?.attribution || {}, req);
     const tipoConsulta = tipo === "video" ? "video" : "chat";
     const SITE_URL = process.env.SITE_URL || "https://consultaja24h.com.br";
     const triagemTexto = String(triagem || "");
@@ -1836,6 +1968,7 @@ app.post("/api/notify", rlTriagem, async (req, res) => {
       if (updateResult.rowCount === 0) {
         return res.status(404).json({ ok: false, error: "Atendimento nao encontrado" });
       }
+      await salvarAdsAttribution(updateResult.rows[0].id, adsAttribution, req);
 
       console.log(`[NOTIFY-UPDATE] atendimento #${atendimentoId} atualizado — nome: ${updateResult.rows[0].nome || "-"}`);
       return res.json({
@@ -1860,6 +1993,7 @@ app.post("/api/notify", rlTriagem, async (req, res) => {
        campos.queixa||triagemTexto||"",campos.idade||"",campos.sexo||"",campos.alergias||"",campos.cronicas||"",campos.medicacoes||"",dataNascLimpa||"",emailLimpo]
     );
     const novoAtendimentoId = insertResult.rows[0]?.id;
+    await salvarAdsAttribution(novoAtendimentoId, adsAttribution, req);
     const linkRetorno = `${SITE_URL}/triagem.html?consulta=${novoAtendimentoId}`;
     const agora = new Date().toLocaleString("pt-BR",{timeZone:"America/Fortaleza"});
     if (!triagemPlaceholder) {
@@ -1972,6 +2106,7 @@ app.get("/api/atendimento/status/:id", async (req, res) => {
           at.pagamento_status = 'confirmado';
           if (at.status === 'pagamento_pendente') at.status = 'triagem';
           console.log(`[STATUS-FALLBACK] Atendimento #${at.id} confirmado via consulta PagBank direta`);
+          await logarCandidatoConversaoOffline(at.id, "pix", "status_pagbank_consulta_direta", at.pagbank_order_id);
         }
       } catch (e) {
         console.warn('[STATUS-FALLBACK] Falha ao consultar PagBank:', e.message);
@@ -5727,6 +5862,7 @@ app.post("/api/efi/cartao/cobrar", rlGeral, async (req, res) => {
       parcelas = 1,
       atendimentoId
     } = req.body || {};
+    const adsAttribution = normalizarAdsAttribution(req.body?.ads || req.body?.attribution || {}, req);
 
     // ── Validação ────────────────────────────────────────────────────────────
     if (!payment_token)
@@ -5836,6 +5972,7 @@ app.post("/api/efi/cartao/cobrar", rlGeral, async (req, res) => {
             WHERE id = $1 AND (efi_charge_id IS NULL OR efi_charge_id = '')`,
           [atendimentoId, String(chargeId)]
         ).catch(e => console.warn("[EFI-CARTAO] Salvar charge_id falhou:", e.message));
+        await salvarAdsAttribution(atendimentoId, adsAttribution, req);
       }
 
       // Se já veio "paid" (ex: sandbox), confirma pagamento na hora.
@@ -5858,6 +5995,7 @@ app.post("/api/efi/cartao/cobrar", rlGeral, async (req, res) => {
 
         console.log(`[EFI-CARTAO] Atendimento #${atendimentoId} — pagamento confirmado (paid síncrono). Notificação pendente até triagem.`);
         console.log("PAGAMENTO_CONFIRMADO_REDIRECT_CONFIRMADO", { consultaId: String(atendimentoId), tipo: "chat", metodo: "cartao" });
+        await logarCandidatoConversaoOffline(atendimentoId, "cartao", "efi_cartao_sincrono", chargeId);
       }
 
       console.log(`[EFI-CARTAO] charge_id ${chargeId} — status: ${status} — aguardando webhook para confirmação final`);
@@ -5967,6 +6105,7 @@ app.post("/api/efi/cartao/webhook", async (req, res) => {
       const at = atRows[0];
       console.log(`[EFI-WEBHOOK] Atendimento #${at.id} confirmado via webhook — status: ${at.status}`);
       console.log("PAGAMENTO_CONFIRMADO_REDIRECT_CONFIRMADO", { consultaId: String(at.id), tipo: at.tipo || "chat", metodo: "cartao" });
+      await logarCandidatoConversaoOffline(at.id, "cartao", "efi_webhook", chargeId);
 
       // Notifica médicos se triagem real já estava preenchida
       if (at.status === "aguardando" && !isTriagemPlaceholder(at.triagem)) {
