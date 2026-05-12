@@ -57,6 +57,29 @@ const rlTriagem = rateLimit({ windowMs: 60*1000, max: 30, standardHeaders: true,
 const rlGeral = rateLimit({ windowMs: 60*1000, max: 120, standardHeaders: true, legacyHeaders: false,
   message: { ok: false, error: "Muitas requisições. Aguarde." }});
 
+app.post("/api/tracking/confirmado-view", rlGeral, (req, res) => {
+  const body = req.body || {};
+  const gclid = String(body.gclid || "");
+  const gbraid = String(body.gbraid || "");
+  const wbraid = String(body.wbraid || "");
+  console.log("CONFIRMADO_PAGEVIEW", {
+    consultaId: String(body.consultaId || ""),
+    tipo: String(body.tipo || ""),
+    paymentMethod: String(body.paymentMethod || ""),
+    hasGclid: !!gclid,
+    hasGbraid: !!gbraid,
+    hasWbraid: !!wbraid,
+    gclidTail: gclid ? gclid.slice(-10) : "",
+    gbraidTail: gbraid ? gbraid.slice(-10) : "",
+    wbraidTail: wbraid ? wbraid.slice(-10) : "",
+    href: String(body.href || "").slice(0, 300),
+    referrer: String(body.referrer || "").slice(0, 300),
+    ip: req.ip,
+    ua: String(req.get("user-agent") || "").slice(0, 160)
+  });
+  res.json({ ok: true });
+});
+
 const OPENAI_KEY = process.env.OPENAI_API_KEY;
 const JWT_SECRET = process.env.JWT_SECRET;
 
