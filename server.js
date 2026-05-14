@@ -11,7 +11,7 @@ import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import multer from "multer";
-import { randomUUID } from "crypto";
+import { createHash, randomUUID } from "crypto";
 import rateLimit from "express-rate-limit";
 const { Pool } = pg;
 
@@ -153,13 +153,250 @@ async function salvarAdsAttribution(atendimentoId, attribution, req) {
   ).catch(e => console.warn("[ADS-ATTR] Falha ao salvar attribution:", e.message));
 }
 
+function envBool(name, fallback = false) {
+  const raw = process.env[name];
+  if (raw == null || raw === "") return fallback;
+  return /^(1|true|yes|sim|on)$/i.test(String(raw).trim());
+}
+
+function normalizarGoogleAdsCustomerId(value) {
+  return String(value || "").replace(/\D/g, "");
+}
+
+function googleAdsOfflineConfig() {
+  const customerId = normalizarGoogleAdsCustomerId(process.env.GOOGLE_ADS_CUSTOMER_ID);
+  const conversionCustomerId = normalizarGoogleAdsCustomerId(process.env.GOOGLE_ADS_CONVERSION_CUSTOMER_ID || customerId);
+  const conversionActionResource = limitarTexto(process.env.GOOGLE_ADS_CONVERSION_ACTION_RESOURCE, 180);
+  const conversionActionId = limitarTexto(process.env.GOOGLE_ADS_CONVERSION_ACTION_ID, 80);
+  const missing = [];
+
+  if (!process.env.GOOGLE_ADS_DEVELOPER_TOKEN) missing.push("GOOGLE_ADS_DEVELOPER_TOKEN");
+  if (!process.env.GOOGLE_ADS_CLIENT_ID) missing.push("GOOGLE_ADS_CLIENT_ID");
+  if (!process.env.GOOGLE_ADS_CLIENT_SECRET) missing.push("GOOGLE_ADS_CLIENT_SECRET");
+  if (!process.env.GOOGLE_ADS_REFRESH_TOKEN) missing.push("GOOGLE_ADS_REFRESH_TOKEN");
+  if (!customerId) missing.push("GOOGLE_ADS_CUSTOMER_ID");
+  if (!conversionActionResource && !conversionActionId) missing.push("GOOGLE_ADS_CONVERSION_ACTION_ID");
+
+  const actionResource = conversionActionResource ||
+    (conversionActionId && conversionCustomerId ? `customers/${conversionCustomerId}/conversionActions/${conversionActionId}` : "");
+
+  return {
+    configured: missing.length === 0,
+    missing,
+    customerId,
+    loginCustomerId: normalizarGoogleAdsCustomerId(process.env.GOOGLE_ADS_LOGIN_CUSTOMER_ID),
+    actionResource,
+    apiVersion: limitarTexto(process.env.GOOGLE_ADS_API_VERSION || "v22", 8),
+    value: Number(process.env.GOOGLE_ADS_CONVERSION_VALUE || "49.90") || 49.90,
+    currency: limitarTexto(process.env.GOOGLE_ADS_CONVERSION_CURRENCY || "BRL", 3).toUpperCase(),
+    validateOnly: envBool("GOOGLE_ADS_VALIDATE_ONLY", false),
+    sendUserData: envBool("GOOGLE_ADS_SEND_USER_DATA", false)
+  };
+}
+
+let googleAdsTokenCache = { token: "", expiresAt: 0 };
+
+async function obterGoogleAdsAccessToken() {
+  const agora = Date.now();
+  if (googleAdsTokenCache.token && googleAdsTokenCache.expiresAt > agora + 60000) {
+    return googleAdsTokenCache.token;
+  }
+  const body = new URLSearchParams({
+    client_id: process.env.GOOGLE_ADS_CLIENT_ID,
+    client_secret: process.env.GOOGLE_ADS_CLIENT_SECRET,
+    refresh_token: process.env.GOOGLE_ADS_REFRESH_TOKEN,
+    grant_type: "refresh_token"
+  });
+  const res = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.access_token) {
+    throw new Error("oauth_google_ads_" + (data.error_description || data.error || res.status));
+  }
+  googleAdsTokenCache = {
+    token: data.access_token,
+    expiresAt: agora + Math.max(60, Number(data.expires_in || 3600) - 30) * 1000
+  };
+  return googleAdsTokenCache.token;
+}
+
+function formatarGoogleAdsDateTime(value) {
+  const d = value instanceof Date ? value : new Date(value || Date.now());
+  const pad = n => String(n).padStart(2, "0");
+  return [
+    d.getUTCFullYear(),
+    "-",
+    pad(d.getUTCMonth() + 1),
+    "-",
+    pad(d.getUTCDate()),
+    " ",
+    pad(d.getUTCHours()),
+    ":",
+    pad(d.getUTCMinutes()),
+    ":",
+    pad(d.getUTCSeconds()),
+    "+00:00"
+  ].join("");
+}
+
+function sha256Hex(value) {
+  return createHash("sha256").update(String(value || "")).digest("hex");
+}
+
+function normalizarTelefoneE164Brasil(tel) {
+  let d = String(tel || "").replace(/\D/g, "");
+  if (!d) return "";
+  if (d.length === 10 || d.length === 11) d = "55" + d;
+  if (d.length >= 12 && d.length <= 13 && d.startsWith("55")) return "+" + d;
+  return "";
+}
+
+function montarGoogleAdsUserIdentifiers(at) {
+  const ids = [];
+  const email = String(at.email || "").trim().toLowerCase();
+  if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) ids.push({ hashedEmail: sha256Hex(email) });
+  const phone = normalizarTelefoneE164Brasil(at.tel || "");
+  if (phone) ids.push({ hashedPhoneNumber: sha256Hex(phone) });
+  return ids.slice(0, 5);
+}
+
+function selecionarGoogleAdsClickIds(at) {
+  if (at.ads_gclid) return { field: "gclid", value: String(at.ads_gclid), payload: { gclid: String(at.ads_gclid) } };
+  if (at.ads_wbraid) return { field: "wbraid", value: String(at.ads_wbraid), payload: { wbraid: String(at.ads_wbraid) } };
+  if (at.ads_gbraid) return { field: "gbraid", value: String(at.ads_gbraid), payload: { gbraid: String(at.ads_gbraid) } };
+  return { field: "", value: "", payload: {} };
+}
+
+async function marcarGoogleAdsOffline(atendimentoId, status, detalhes = {}) {
+  const id = parseInt(atendimentoId, 10);
+  if (!id) return;
+  await pool.query(
+    `UPDATE fila_atendimentos
+        SET google_ads_offline_status = $2,
+            google_ads_offline_tentativas = COALESCE(google_ads_offline_tentativas, 0) + 1,
+            google_ads_offline_job_id = COALESCE(NULLIF($3,''), google_ads_offline_job_id),
+            google_ads_offline_erro = $4,
+            google_ads_offline_order_id = COALESCE(NULLIF($5,''), google_ads_offline_order_id),
+            google_ads_offline_enviado_em = CASE WHEN $2 IN ('sent','validated') THEN NOW() ELSE google_ads_offline_enviado_em END
+      WHERE id = $1`,
+    [
+      id,
+      limitarTexto(status, 40),
+      limitarTexto(detalhes.jobId, 120),
+      limitarTexto(detalhes.error, 900),
+      limitarTexto(detalhes.orderId, 120)
+    ]
+  ).catch(e => console.warn("[GOOGLE-ADS-OFFLINE] Falha ao marcar status:", e.message));
+}
+
+async function enviarConversaoOfflineGoogleAds(at, metodo, origem, externalId, opts = {}) {
+  if (!at || !at.id) return { ok: false, skipped: "sem_atendimento" };
+  if (at.google_ads_offline_enviado_em && !opts.force) {
+    return { ok: true, skipped: "ja_enviado" };
+  }
+
+  const cfg = googleAdsOfflineConfig();
+  if (!cfg.configured) {
+    console.log("GOOGLE_ADS_OFFLINE_NOT_CONFIGURED", {
+      consultaId: String(at.id),
+      missing: cfg.missing.join(",")
+    });
+    await marcarGoogleAdsOffline(at.id, "unconfigured", { error: cfg.missing.join(",") });
+    return { ok: false, skipped: "unconfigured", missing: cfg.missing };
+  }
+
+  const click = selecionarGoogleAdsClickIds(at);
+  const userIdentifiers = cfg.sendUserData ? montarGoogleAdsUserIdentifiers(at) : [];
+  if (!click.field && userIdentifiers.length === 0) {
+    console.log("GOOGLE_ADS_OFFLINE_SKIP_NO_MATCH_DATA", { consultaId: String(at.id) });
+    await marcarGoogleAdsOffline(at.id, "no_match_data", { error: "sem_gclid_gbraid_wbraid" });
+    return { ok: false, skipped: "no_match_data" };
+  }
+
+  const orderId = limitarTexto(`CJ24H-${at.id}`, 64);
+  const conversion = {
+    ...click.payload,
+    conversionAction: cfg.actionResource,
+    conversionDateTime: formatarGoogleAdsDateTime(at.pagamento_confirmado_em || new Date()),
+    conversionValue: cfg.value,
+    currencyCode: cfg.currency,
+    orderId,
+    conversionEnvironment: "WEB"
+  };
+  if (userIdentifiers.length) conversion.userIdentifiers = userIdentifiers;
+
+  const consentUserData = limitarTexto(process.env.GOOGLE_ADS_AD_USER_DATA_CONSENT, 20).toUpperCase();
+  const consentPersonalization = limitarTexto(process.env.GOOGLE_ADS_AD_PERSONALIZATION_CONSENT, 20).toUpperCase();
+  if (consentUserData || consentPersonalization) {
+    conversion.consent = {};
+    if (consentUserData) conversion.consent.adUserData = consentUserData;
+    if (consentPersonalization) conversion.consent.adPersonalization = consentPersonalization;
+  }
+
+  const token = await obterGoogleAdsAccessToken();
+  const headers = {
+    Authorization: `Bearer ${token}`,
+    "developer-token": process.env.GOOGLE_ADS_DEVELOPER_TOKEN,
+    "Content-Type": "application/json"
+  };
+  if (cfg.loginCustomerId) headers["login-customer-id"] = cfg.loginCustomerId;
+
+  const endpoint = `https://googleads.googleapis.com/${cfg.apiVersion}/customers/${cfg.customerId}:uploadClickConversions`;
+  const body = {
+    conversions: [conversion],
+    partialFailure: true,
+    validateOnly: cfg.validateOnly
+  };
+
+  console.log("GOOGLE_ADS_OFFLINE_UPLOAD_START", {
+    consultaId: String(at.id),
+    metodo: metodo || "",
+    origem: origem || "",
+    externalId: String(externalId || ""),
+    clickIdType: click.field || "user_identifiers",
+    clickIdTail: click.value ? click.value.slice(-10) : "",
+    orderId,
+    validateOnly: cfg.validateOnly
+  });
+
+  const res = await fetch(endpoint, { method: "POST", headers, body: JSON.stringify(body) });
+  const text = await res.text();
+  let data = {};
+  try { data = text ? JSON.parse(text) : {}; } catch (_) { data = { raw: text }; }
+  const partialError = data.partialFailureError || data.partial_failure_error;
+  if (!res.ok || partialError) {
+    const msg = partialError?.message || data.error?.message || text || `HTTP ${res.status}`;
+    console.warn("GOOGLE_ADS_OFFLINE_UPLOAD_FAILED", {
+      consultaId: String(at.id),
+      status: res.status,
+      error: msg.slice(0, 500)
+    });
+    await marcarGoogleAdsOffline(at.id, "failed", { error: msg, orderId, jobId: data.jobId });
+    return { ok: false, error: msg, response: data };
+  }
+
+  const status = cfg.validateOnly ? "validated" : "sent";
+  console.log("GOOGLE_ADS_OFFLINE_UPLOAD_OK", {
+    consultaId: String(at.id),
+    jobId: String(data.jobId || ""),
+    status,
+    orderId
+  });
+  await marcarGoogleAdsOffline(at.id, status, { jobId: data.jobId, orderId, error: "" });
+  return { ok: true, status, response: data };
+}
+
 async function logarCandidatoConversaoOffline(atendimentoId, metodo, origem, externalId) {
   const id = parseInt(atendimentoId, 10);
   if (!id) return;
   const { rows } = await pool.query(
     `SELECT id, tipo, nome, tel, cpf, email, pagamento_confirmado_em,
             ads_gclid, ads_gbraid, ads_wbraid, ads_utm, ads_checkout_session_id,
-            confirmado_pageview_em, confirmado_has_ads_id
+            confirmado_pageview_em, confirmado_has_ads_id,
+            google_ads_offline_enviado_em
        FROM fila_atendimentos
       WHERE id = $1`,
     [id]
@@ -191,6 +428,9 @@ async function logarCandidatoConversaoOffline(atendimentoId, metodo, origem, ext
     gbraidTail: at.ads_gbraid ? String(at.ads_gbraid).slice(-10) : "",
     wbraidTail: at.ads_wbraid ? String(at.ads_wbraid).slice(-10) : "",
     checkoutSessionId: at.ads_checkout_session_id || ""
+  });
+  await enviarConversaoOfflineGoogleAds(at, metodo, origem, externalId).catch(e => {
+    console.warn("[GOOGLE-ADS-OFFLINE] Erro inesperado:", e.message);
   });
 }
 
@@ -506,6 +746,12 @@ async function initDB() {
       ['confirmado_pageview_em','TIMESTAMPTZ'],
       ['confirmado_has_ads_id','BOOLEAN'],
       ['confirmado_href','TEXT'],
+      ['google_ads_offline_status','TEXT'],
+      ['google_ads_offline_enviado_em','TIMESTAMPTZ'],
+      ['google_ads_offline_tentativas','INTEGER DEFAULT 0'],
+      ['google_ads_offline_job_id','TEXT'],
+      ['google_ads_offline_erro','TEXT'],
+      ['google_ads_offline_order_id','TEXT'],
     ];
     // Coluna para controle de lembrete de agendamento
     await pool.query(`ALTER TABLE agendamentos ADD COLUMN IF NOT EXISTS lembrete_enviado BOOLEAN DEFAULT false`).catch(()=>{});
@@ -845,6 +1091,48 @@ function checkAdmin(req, res, next) {
   if (!senha || senha !== senhaAdmin) return res.status(403).send("Acesso negado");
   next();
 }
+
+app.post("/api/admin/google-ads/offline/retry", checkAdmin, async (req, res) => {
+  const limit = Math.min(100, Math.max(1, parseInt(req.body?.limit || req.query.limit || "25", 10) || 25));
+  const force = /^(1|true|yes|sim)$/i.test(String(req.body?.force || req.query.force || ""));
+  const cfg = googleAdsOfflineConfig();
+  if (!cfg.configured) return res.status(400).json({ ok: false, error: "google_ads_offline_nao_configurado", missing: cfg.missing });
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, tipo, nome, tel, cpf, email, pagamento_confirmado_em,
+              ads_gclid, ads_gbraid, ads_wbraid, ads_utm, ads_checkout_session_id,
+              confirmado_pageview_em, confirmado_has_ads_id,
+              google_ads_offline_enviado_em, pagbank_order_id, efi_charge_id
+         FROM fila_atendimentos
+        WHERE pagamento_status = 'confirmado'
+          AND pagamento_confirmado_em IS NOT NULL
+          AND ($1::boolean OR google_ads_offline_enviado_em IS NULL)
+          AND (
+            COALESCE(ads_gclid,'') <> ''
+            OR COALESCE(ads_gbraid,'') <> ''
+            OR COALESCE(ads_wbraid,'') <> ''
+            OR $2::boolean
+          )
+        ORDER BY pagamento_confirmado_em DESC
+        LIMIT $3`,
+      [force, cfg.sendUserData, limit]
+    );
+    const resultados = [];
+    for (const at of rows) {
+      const r = await enviarConversaoOfflineGoogleAds(
+        at,
+        "manual",
+        "admin_retry",
+        at.pagbank_order_id || at.efi_charge_id || "",
+        { force }
+      ).catch(e => ({ ok: false, error: e.message }));
+      resultados.push({ id: at.id, ok: !!r.ok, status: r.status || "", skipped: r.skipped || "", error: r.error || "" });
+    }
+    res.json({ ok: true, total: resultados.length, resultados });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
 
 function checkMedico(req, res, next) {
   const auth = req.headers["authorization"] || "";
