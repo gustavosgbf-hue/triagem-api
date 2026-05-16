@@ -878,6 +878,7 @@ async function initDB() {
     await pool.query(`ALTER TABLE especialistas ADD COLUMN IF NOT EXISTS foto_url TEXT`).catch(()=>{});
     await pool.query(`ALTER TABLE especialistas ADD COLUMN IF NOT EXISTS bio TEXT`).catch(()=>{});
     await pool.query(`ALTER TABLE especialistas ADD COLUMN IF NOT EXISTS disponibilidade JSONB`).catch(()=>{});
+    await pool.query(`ALTER TABLE especialistas ADD COLUMN IF NOT EXISTS rqe TEXT`).catch(()=>{});
     await pool.query(`
       ALTER TABLE especialistas
       ALTER COLUMN disponibilidade TYPE JSONB
@@ -4300,11 +4301,11 @@ function normalizarDisponibilidadeEspecialista(disponibilidadeBruta) {
 // Wildcard — deve ficar DEPOIS das rotas específicas
 app.get('/api/especialistas/:especialidade', rlGeral, async (req, res) => {
   try {
-    const { rows } = await pool.query(
-      `SELECT id, nome_exibicao, especialidade, crm, uf, valor_consulta, foto_url, bio, disponibilidade
-         FROM especialistas
-        WHERE LOWER(especialidade) = LOWER($1) AND ativo = true AND (visivel = true OR visivel IS NULL)
-        ORDER BY id ASC`,
+const { rows } = await pool.query(
+      `SELECT id, nome_exibicao, especialidade, crm, rqe, uf, valor_consulta, foto_url, bio, disponibilidade
+          FROM especialistas
+         WHERE LOWER(especialidade) = LOWER($1) AND ativo = true AND (visivel = true OR visivel IS NULL)
+         ORDER BY id ASC`,
       [req.params.especialidade]
     );
     const especialistas = rows.map((esp) => ({
@@ -4504,17 +4505,18 @@ app.get('/api/especialistas/agendamento/:id/status', rlGeral, async (req, res) =
 // ── ESPECIALISTAS: admin — cadastrar especialista ─────────────────────────────
 app.post('/api/admin/especialista/criar', checkAdmin, async (req, res) => {
   try {
-    const { nome, nome_exibicao, especialidade, crm, uf, valor_consulta, email, bio, foto_url } = req.body || {};
+    const { nome, nome_exibicao, especialidade, crm, rqe, uf, valor_consulta, email, bio, foto_url } = req.body || {};
     if (!nome || !especialidade || !crm || !uf) {
       return res.status(400).json({ ok: false, error: 'nome, especialidade, crm e uf são obrigatórios' });
     }
     const valorNum = valor_consulta ? parseFloat(String(valor_consulta).replace(',','.')) : 0;
     const emailNorm = email ? email.trim().toLowerCase() : null;
+    const rqeNorm = rqe ? rqe.trim() : null;
     const { rows } = await pool.query(
-      `INSERT INTO especialistas (nome, nome_exibicao, especialidade, crm, uf, valor_consulta, email, bio, foto_url)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id, nome_exibicao, especialidade`,
+      `INSERT INTO especialistas (nome, nome_exibicao, especialidade, crm, rqe, uf, valor_consulta, email, bio, foto_url)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id, nome_exibicao, especialidade`,
       [nome.trim(), (nome_exibicao||nome).trim(), especialidade.trim().toLowerCase(),
-       crm.trim().toUpperCase(), uf.trim().toUpperCase(),
+       crm.trim().toUpperCase(), rqeNorm, uf.trim().toUpperCase(),
        valorNum, emailNorm, bio||'', foto_url||'']
     );
     console.log('[ESP-ADMIN] Especialista criado #'+rows[0].id+' — '+rows[0].especialidade);
@@ -4525,9 +4527,9 @@ app.post('/api/admin/especialista/criar', checkAdmin, async (req, res) => {
 // ── ESPECIALISTAS: admin — listar todos ──────────────────────────────────────
 app.get('/api/admin/especialistas', checkAdmin, async (req, res) => {
   try {
-    const { rows } = await pool.query(
-      `SELECT id, nome_exibicao, especialidade, crm, uf, valor_consulta, ativo, created_at
-         FROM especialistas ORDER BY especialidade, id`
+const { rows } = await pool.query(
+      `SELECT id, nome_exibicao, especialidade, crm, rqe, uf, valor_consulta, ativo, created_at
+          FROM especialistas ORDER BY especialidade, id`
     );
     return res.json({ ok: true, especialistas: rows });
   } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
@@ -4684,7 +4686,7 @@ app.put('/api/admin/especialista/:id', checkAdmin, async (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
     if (!id) return res.status(400).json({ ok: false, error: 'ID inválido' });
-    const { email, nome_exibicao, bio, valor_consulta, crm, uf, ativo, visivel, foto_url } = req.body || {};
+    const { email, nome_exibicao, bio, valor_consulta, crm, rqe, uf, ativo, visivel, foto_url } = req.body || {};
     const updates = [];
     const params = [];
     let idx = 1;
@@ -4694,6 +4696,7 @@ app.put('/api/admin/especialista/:id', checkAdmin, async (req, res) => {
     if (foto_url !== undefined) { updates.push(`foto_url = $${idx++}`); params.push(foto_url?.trim() || null); }
     if (valor_consulta !== undefined) { updates.push(`valor_consulta = $${idx++}`); params.push(parseFloat(valor_consulta)); }
     if (crm !== undefined) { updates.push(`crm = $${idx++}`); params.push(crm?.trim().toUpperCase()); }
+    if (rqe !== undefined) { updates.push(`rqe = $${idx++}`); params.push(rqe?.trim() || null); }
     if (uf !== undefined) { updates.push(`uf = $${idx++}`); params.push(uf?.trim().toUpperCase()); }
     if (ativo !== undefined) { updates.push(`ativo = $${idx++}`); params.push(!!ativo); }
     if (visivel !== undefined) { updates.push(`visivel = $${idx++}`); params.push(!!visivel); }
