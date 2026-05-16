@@ -4528,7 +4528,8 @@ app.post('/api/admin/especialista/criar', checkAdmin, async (req, res) => {
 app.get('/api/admin/especialistas', checkAdmin, async (req, res) => {
   try {
 const { rows } = await pool.query(
-      `SELECT id, nome_exibicao, especialidade, crm, rqe, uf, valor_consulta, ativo, created_at
+      `SELECT id, nome, nome_exibicao, email, especialidade, crm, rqe, uf, valor_consulta,
+              foto_url, bio, disponibilidade, ativo, visivel, created_at
           FROM especialistas ORDER BY especialidade, id`
     );
     return res.json({ ok: true, especialistas: rows });
@@ -4729,7 +4730,7 @@ app.patch('/api/admin/especialista/:id/disponibilidade', checkAdmin, async (req,
 app.get('/api/especialista/me', authEspecialista, async (req, res) => {
   try {
     const { rows } = await pool.query(
-      `SELECT id, nome, nome_exibicao, especialidade, crm, uf, valor_consulta, foto_url, bio, ativo, disponibilidade, visivel
+      `SELECT id, nome, nome_exibicao, especialidade, crm, rqe, uf, valor_consulta, foto_url, bio, ativo, disponibilidade, visivel
          FROM especialistas WHERE id = $1`,
       [req.especialistaId]
     );
@@ -4741,7 +4742,7 @@ app.get('/api/especialista/me', authEspecialista, async (req, res) => {
 // ── ESPECIALISTA: atualizar perfil ─────────────────────────────────────────
 app.patch('/api/especialista/perfil', authEspecialista, async (req, res) => {
   try {
-    const { nome_exibicao, bio, valor_consulta, crm, uf } = req.body || {};
+    const { nome_exibicao, bio, valor_consulta, crm, rqe, uf } = req.body || {};
     const updates = [];
     const params = [];
     let idx = 1;
@@ -4749,6 +4750,7 @@ app.patch('/api/especialista/perfil', authEspecialista, async (req, res) => {
     if (bio !== undefined) { updates.push(`bio = $${idx++}`); params.push(bio.trim()); }
     if (valor_consulta !== undefined) { updates.push(`valor_consulta = $${idx++}`); params.push(parseFloat(valor_consulta)); }
     if (crm !== undefined) { updates.push(`crm = $${idx++}`); params.push(crm.trim().toUpperCase()); }
+    if (rqe !== undefined) { updates.push(`rqe = $${idx++}`); params.push(rqe.trim() || null); }
     if (uf !== undefined) { updates.push(`uf = $${idx++}`); params.push(uf.trim().toUpperCase()); }
     if (!updates.length) return res.status(400).json({ ok: false, error: 'Nenhum campo para atualizar' });
     params.push(req.especialistaId);
