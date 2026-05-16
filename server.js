@@ -3573,6 +3573,7 @@ app.post('/api/psicologia/efi/cartao/cobrar', rlGeral, async (req, res) => {
     if (!chargeId) return res.status(502).json({ ok: false, error: 'Efí não retornou charge_id' });
 
     // Passo 2: associar payment_token
+    const nascimentoEfiPsi = normalizarNascimentoEfi(nascimento);
     const payPayload = {
       payment: {
         credit_card: {
@@ -3580,7 +3581,7 @@ app.post('/api/psicologia/efi/cartao/cobrar', rlGeral, async (req, res) => {
             name: nome.trim(), cpf: cpfLimpo,
             email: String(email).trim(),
             phone_number: telefoneLimpoPsi,
-            ...(nascimento ? { birth: nascimento } : {})
+            ...(nascimentoEfiPsi ? { birth: nascimentoEfiPsi } : {})
           },
           installments:  Math.max(1, parseInt(parcelas) || 1),
           payment_token: payment_token.trim(),
@@ -5044,7 +5045,8 @@ app.post('/api/especialistas/efi/cartao/cobrar', rlGeral, async (req, res) => {
     const chargeId = chargeRes.data?.data?.charge_id;
     if (!chargeId) return res.status(502).json({ ok: false, error: 'Efí não retornou charge_id' });
     const customer = { name: nome.trim(), cpf: cpfLimpo, email: String(email).trim(), phone_number: telLimpo };
-    if (nascimento) customer.birth = nascimento;
+    const nascimentoEfiEsp = normalizarNascimentoEfi(nascimento);
+    if (nascimentoEfiEsp) customer.birth = nascimentoEfiEsp;
     const payRes = await axios.post(`${EFI_BASE_URL}/v1/charge/${chargeId}/pay`, {
       payment: {
         credit_card: {
@@ -6138,6 +6140,26 @@ app.get("/api/efi/test", checkAdmin, async (req, res) => {
 
 const EFI_VALOR_CENTAVOS = 4990; // R$ 49,90 — fixo no backend, igual ao PagBank
 
+function normalizarNascimentoEfi(valor) {
+  const raw = String(valor || "").trim();
+  if (!raw) return "";
+
+  let ano, mes, dia;
+  let m = raw.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (m) {
+    [, ano, mes, dia] = m;
+  } else {
+    m = raw.match(/^(\d{2})\/(\d{2})\/(\d{4})$/) || raw.match(/^(\d{2})(\d{2})(\d{4})$/);
+    if (!m) return "";
+    [, dia, mes, ano] = m;
+  }
+
+  const dt = new Date(`${ano}-${mes}-${dia}T00:00:00Z`);
+  if (Number.isNaN(dt.getTime())) return "";
+  if (dt.getUTCFullYear() !== Number(ano) || dt.getUTCMonth() + 1 !== Number(mes) || dt.getUTCDate() !== Number(dia)) return "";
+  return `${ano}-${mes}-${dia}`;
+}
+
 app.post("/api/efi/cartao/cobrar", rlGeral, async (req, res) => {
   try {
     const {
@@ -6206,13 +6228,14 @@ app.post("/api/efi/cartao/cobrar", rlGeral, async (req, res) => {
 
     // ── PASSO 2: Associar o payment_token ao charge_id ────────────────────────
     // Endpoint: POST /v1/charge/:id/pay
+    const nascimentoEfi = normalizarNascimentoEfi(nascimento);
     const customer = {
       name:         nome.trim(),
       cpf:          cpfLimpo,
       email:        String(email).trim(),
       phone_number: telefoneLimpoEfi
     };
-    if (nascimento) customer.birth = nascimento; // "YYYY-MM-DD"
+    if (nascimentoEfi) customer.birth = nascimentoEfi;
 
     const payPayload = {
       payment: {
@@ -7664,6 +7687,17 @@ function renovacaoValorCentavos(row) {
   return Math.round(total * 100);
 }
 
+function normalizarObjetoJson(valor) {
+  if (!valor) return {};
+  if (typeof valor === "object") return valor;
+  try {
+    const parsed = JSON.parse(valor);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
 function fallbackFreteRenovacao(cepDestino) {
   const prefixo = parseInt(String(cepDestino || "").replace(/\D/g, "").slice(0, 2), 10) || 0;
   let tabela;
@@ -7895,9 +7929,18 @@ app.post("/api/renovacao/pagbank/webhook", async (req, res) => {
 app.post("/api/renovacao/efi/cartao/cobrar", rlGeral, async (req, res) => {
   try {
     const { payment_token, nome, cpf, email, telefone, nascimento, parcelas = 1, atendimentoId } = req.body || {};
-    if (!payment_token || !nome || !cpf || !email || !telefone || !atendimentoId) return res.status(400).json({ ok: false, error: "Dados obrigatórios faltando" });
+    if (!payment_token) return res.status(400).json({ ok: false, error: "payment_token obrigatório" });
+    if (!nome) return res.status(400).json({ ok: false, error: "nome obrigatório" });
+    if (!cpf) return res.status(400).json({ ok: false, error: "cpf obrigatório" });
+    if (!email) return res.status(400).json({ ok: false, error: "email obrigatório" });
+    if (!telefone) return res.status(400).json({ ok: false, error: "telefone obrigatório" });
+    if (!atendimentoId) return res.status(400).json({ ok: false, error: "atendimentoId obrigatório" });
     const cpfLimpo = String(cpf).replace(/\D/g, "");
+    if (cpfLimpo.length !== 11) return res.status(400).json({ ok: false, error: "CPF inválido" });
+    const emailLimpo = String(email).trim();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailLimpo)) return res.status(400).json({ ok: false, error: "Informe um e-mail válido para pagamento no cartão" });
     const telLimpo = String(telefone).replace(/\D/g, "");
+    if (telLimpo.length < 10 || telLimpo.length > 11) return res.status(400).json({ ok: false, error: "Telefone com DDD obrigatório para pagamento no cartão" });
     const atRes = await pool.query(`SELECT id,tipo,frete_valor,endereco_envio FROM fila_atendimentos WHERE id=$1 AND tipo LIKE 'renovacao_%'`, [atendimentoId]);
     if (!atRes.rowCount) return res.status(404).json({ ok: false, error: "Renovação não encontrada" });
     const at = atRes.rows[0];
@@ -7911,10 +7954,13 @@ app.post("/api/renovacao/efi/cartao/cobrar", rlGeral, async (req, res) => {
     }, { httpsAgent, headers });
     const chargeId = chargeRes.data?.data?.charge_id;
     if (!chargeId) return res.status(502).json({ ok: false, error: "Efí não retornou charge_id" });
-    const endereco = at.endereco_envio || {};
+    const endereco = normalizarObjetoJson(at.endereco_envio);
+    const customer = { name: nome.trim(), cpf: cpfLimpo, email: emailLimpo, phone_number: telLimpo };
+    const nascimentoEfi = normalizarNascimentoEfi(nascimento);
+    if (nascimentoEfi) customer.birth = nascimentoEfi;
     const payRes = await axios.post(`${EFI_BASE_URL}/v1/charge/${chargeId}/pay`, {
       payment: { credit_card: {
-        customer: { name: nome.trim(), cpf: cpfLimpo, email: email.trim(), phone_number: telLimpo, ...(nascimento ? { birth: nascimento } : {}) },
+        customer,
         installments: Math.max(1, parseInt(parcelas) || 1),
         payment_token: payment_token.trim(),
         billing_address: { street: endereco.rua || "Rua da Consulta", number: endereco.numero || "1", neighborhood: endereco.bairro || "Centro", zipcode: String(endereco.cep || ME_FROM_CEP || "65000000").replace(/\D/g, ""), city: endereco.cidade || "São Luís", complement: endereco.complemento || "", state: endereco.uf || "MA" }
