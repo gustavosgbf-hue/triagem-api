@@ -1669,10 +1669,11 @@ async function enviarEmailLembretePaciente({ nome, email, horarioFormatado, moda
 }
 
 // ── E-MAIL: confirmação para especialista ───────────────────────────────────────
-async function enviarEmailConfirmacaoEspecialista({ especialista, especialidade, paciente, email, horario }) {
+async function enviarEmailConfirmacaoEspecialista({ especialista, especialidade, paciente, email, horario, modalidade }) {
   const RESEND_KEY = process.env.RESEND_API_KEY;
   if (!RESEND_KEY || !email) return;
   try {
+    const modalidadeLabel = modalidade === "chat" ? "Chat" : "Vídeo";
     const html = `<div style="background:#faf8f5;padding:32px 20px;font-family:'DM Sans',sans-serif">
       <div style="max-width:500px;margin:0 auto;background:#fff;border:1px solid rgba(26,22,18,.08);border-radius:16px;overflow:hidden">
         <div style="padding:24px;border-bottom:1px solid rgba(26,22,18,.08)">
@@ -1687,6 +1688,7 @@ async function enviarEmailConfirmacaoEspecialista({ especialista, especialidade,
             <div style="font-size:1rem;font-weight:600;color:#1b5e20">${paciente}</div>
           </div>
           <div style="font-size:.88rem;color:#4a4540;margin-bottom:8px"><strong>Especialidade:</strong> ${especialidade}</div>
+          <div style="font-size:.88rem;color:#4a4540;margin-bottom:8px"><strong>Modalidade:</strong> ${modalidadeLabel}</div>
           <div style="font-size:.88rem;color:#4a4540"><strong>Horário:</strong> ${horario}</div>
         </div>
       </div></div>`;
@@ -1701,12 +1703,13 @@ async function enviarEmailConfirmacaoEspecialista({ especialista, especialidade,
 }
 
 // ── E-MAIL: notificação para admin ────────────────────────────────────────────────
-async function enviarEmailConfirmacaoAdmin({ especialidade, especialista, paciente, email, horario, status }) {
+async function enviarEmailConfirmacaoAdmin({ especialidade, especialista, paciente, email, horario, modalidade, status }) {
   const ADMIN_EMAIL = "gustavosgbf@gmail.com";
   const RESEND_KEY = process.env.RESEND_API_KEY;
   if (!RESEND_KEY) return;
   try {
     const statusLabel = status === "confirmado" ? "✅ Confirmado" : status === "cancelado" ? "❌ Cancelado" : "ℹ️ " + status;
+    const modalidadeLabel = modalidade === "chat" ? "Chat" : "Vídeo";
     const html = `<div style="background:#faf8f5;padding:32px 20px;font-family:'DM Sans',sans-serif">
       <div style="max-width:500px;margin:0 auto;background:#fff;border:1px solid rgba(26,22,18,.08);border-radius:16px;overflow:hidden">
         <div style="padding:24px;border-bottom:1px solid rgba(26,22,18,.08);background:#1a1612">
@@ -1722,6 +1725,7 @@ async function enviarEmailConfirmacaoAdmin({ especialidade, especialista, pacien
               <div style="color:#8a857f">Profissional</div><div>${especialista}</div>
               <div style="color:#8a857f">Paciente</div><div>${paciente}</div>
               <div style="color:#8a857f">E-mail</div><div>${email||'-'}</div>
+              <div style="color:#8a857f">Modalidade</div><div>${modalidadeLabel}</div>
               <div style="color:#8a857f">Horário</div><div>${horario}</div>
             </div>
           </div>
@@ -4377,7 +4381,8 @@ async function notificarAgendamentoEspecialistaConfirmado(agendamentoId) {
       especialidade: ag.especialidade,
       paciente: ag.paciente_nome,
       email: ag.especialista_email,
-      horario: horarioFmt
+      horario: horarioFmt,
+      modalidade: ag.modalidade || 'video'
     }),
     enviarEmailConfirmacaoAdmin({
       especialidade: ag.especialidade,
@@ -4385,6 +4390,7 @@ async function notificarAgendamentoEspecialistaConfirmado(agendamentoId) {
       paciente: ag.paciente_nome,
       email: ag.paciente_email,
       horario: horarioFmt,
+      modalidade: ag.modalidade || 'video',
       status: 'confirmado'
     })
   ]);
@@ -4393,7 +4399,7 @@ async function notificarAgendamentoEspecialistaConfirmado(agendamentoId) {
 // ── ESPECIALISTAS: criar agendamento ─────────────────────────────────────────
 app.post('/api/especialistas/agendamento/criar', rlGeral, async (req, res) => {
   try {
-    const { especialistaId, horario_agendado, paciente_nome, paciente_email, paciente_tel, paciente_cpf } = req.body || {};
+    const { especialistaId, horario_agendado, paciente_nome, paciente_email, paciente_tel, paciente_cpf, modalidade } = req.body || {};
     if (!especialistaId || !horario_agendado || !paciente_nome || !paciente_email) {
       return res.status(400).json({ ok: false, error: 'Dados obrigatórios faltando' });
     }
@@ -4418,6 +4424,7 @@ app.post('/api/especialistas/agendamento/criar', rlGeral, async (req, res) => {
       return res.status(400).json({ ok: false, error: 'Especialista temporariamente indisponível.' });
     }
     const esp = espRes.rows[0];
+    const modalidadeFinal = String(modalidade || 'video').toLowerCase() === 'chat' ? 'chat' : 'video';
     const slotStart = new Date(horario_agendado);
     if (isNaN(slotStart.getTime())) return res.status(400).json({ ok: false, error: 'Horário inválido' });
     const slotEnd = new Date(slotStart.getTime() + 60 * 60 * 1000);
@@ -4434,11 +4441,11 @@ app.post('/api/especialistas/agendamento/criar', rlGeral, async (req, res) => {
     const result = await pool.query(
       `INSERT INTO agendamentos_especialistas
         (especialista_id, especialista_nome, especialidade, paciente_nome, paciente_email,
-         paciente_tel, paciente_cpf, horario_agendado, valor_cobrado, paciente_id)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+         paciente_tel, paciente_cpf, horario_agendado, valor_cobrado, paciente_id, modalidade)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
        RETURNING id, valor_cobrado`,
       [especialistaId, esp.nome_exibicao, esp.especialidade, paciente_nome, paciente_email,
-       paciente_tel||'', paciente_cpf||'', slotStart.toISOString(), esp.valor_consulta, pacienteId]
+       paciente_tel||'', paciente_cpf||'', slotStart.toISOString(), esp.valor_consulta, pacienteId, modalidadeFinal]
     );
     const ag = result.rows[0];
     console.log('[ESP-AGEND] Criado #'+ag.id+' — '+esp.especialidade+'/'+esp.nome_exibicao+(pacienteId?' pac#'+pacienteId:''));
