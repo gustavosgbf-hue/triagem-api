@@ -5681,9 +5681,16 @@ app.get("/api/fila", checkMedico, async (req, res) => {
     let query, params;
     if (isAdmin) {
       await reconciliarRenovacoesPendentes().catch(e => console.warn("[RENOVACAO-RECONCILIAR]", e.message));
-      query = `SELECT id,nome,tel,cpf,tipo,triagem,status,medico_id,medico_nome,meet_link,criado_em,data_nascimento,idade,sexo,alergias,cronicas,medicacoes,queixa,solicita,horario_agendado FROM fila_atendimentos WHERE status IN ('aguardando','assumido') ORDER BY criado_em ASC`;
+      query = `SELECT id,nome,tel,cpf,tipo,triagem,status,pagamento_status,medico_id,medico_nome,meet_link,criado_em,data_nascimento,idade,sexo,alergias,cronicas,medicacoes,queixa,solicita,horario_agendado
+                 FROM fila_atendimentos
+                WHERE tipo NOT LIKE 'renovacao%'
+                  AND (
+                    status IN ('aguardando','assumido')
+                    OR (pagamento_status='confirmado' AND status IN ('triagem','pagamento_pendente'))
+                  )
+                ORDER BY criado_em ASC`;
     } else {
-      query = `SELECT id,nome,tel,cpf,tipo,triagem,status,medico_id,medico_nome,meet_link,criado_em,data_nascimento,idade,sexo,alergias,cronicas,medicacoes,queixa,solicita,horario_agendado FROM fila_atendimentos WHERE status IN ('aguardando','assumido') AND tipo NOT LIKE 'renovacao%' AND (horario_agendado IS NULL OR horario_agendado <= NOW() + INTERVAL '15 minutes') ORDER BY criado_em ASC`;
+      query = `SELECT id,nome,tel,cpf,tipo,triagem,status,pagamento_status,medico_id,medico_nome,meet_link,criado_em,data_nascimento,idade,sexo,alergias,cronicas,medicacoes,queixa,solicita,horario_agendado FROM fila_atendimentos WHERE status IN ('aguardando','assumido') AND tipo NOT LIKE 'renovacao%' AND (horario_agendado IS NULL OR horario_agendado <= NOW() + INTERVAL '15 minutes') ORDER BY criado_em ASC`;
     }
     const result = await pool.query(query, params || []);
     const fila = [];
