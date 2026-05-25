@@ -5680,6 +5680,7 @@ app.get("/api/fila", checkMedico, async (req, res) => {
     const isAdmin = req.medico.email === "gustavosgbf@gmail.com";
     let query, params;
     if (isAdmin) {
+      await reconciliarRenovacoesPendentes().catch(e => console.warn("[RENOVACAO-RECONCILIAR]", e.message));
       query = `SELECT id,nome,tel,cpf,tipo,triagem,status,medico_id,medico_nome,meet_link,criado_em,data_nascimento,idade,sexo,alergias,cronicas,medicacoes,queixa,solicita,horario_agendado FROM fila_atendimentos WHERE status IN ('aguardando','assumido') AND tipo LIKE 'renovacao%' ORDER BY criado_em ASC`;
     } else {
       query = `SELECT id,nome,tel,cpf,tipo,triagem,status,medico_id,medico_nome,meet_link,criado_em,data_nascimento,idade,sexo,alergias,cronicas,medicacoes,queixa,solicita,horario_agendado FROM fila_atendimentos WHERE status IN ('aguardando','assumido') AND tipo NOT LIKE 'renovacao%' AND (horario_agendado IS NULL OR horario_agendado <= NOW() + INTERVAL '15 minutes') ORDER BY criado_em ASC`;
@@ -7953,6 +7954,61 @@ async function confirmarRenovacao(at) {
   enviarEmailRenovacaoAdmin(at).catch(e => console.error("[RENOVACAO-EMAIL]", e.message));
 }
 
+async function pagBankOrderEstaPaga(orderId) {
+  if (!orderId || !PAGBANK_TOKEN) return false;
+  const response = await fetch(`${PAGBANK_URL}/orders/${encodeURIComponent(String(orderId))}`, {
+    headers: { Authorization: `Bearer ${PAGBANK_TOKEN}`, accept: "application/json" }
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(formatPagBankError(data.error_messages || data.message || data.error || data));
+  }
+  return Array.isArray(data.charges) && data.charges.some(c => c.status === "PAID");
+}
+
+async function confirmarRenovacaoPorId(id, origem = "manual") {
+  const upd = await pool.query(
+    `UPDATE fila_atendimentos
+        SET pagamento_status='confirmado',
+            pagamento_confirmado_em=COALESCE(pagamento_confirmado_em, NOW()),
+            status='aguardando'
+      WHERE id=$1
+        AND tipo LIKE 'renovacao_%'
+        AND pagamento_status='pendente'
+      RETURNING id,nome,tel,cpf,tipo,medicacoes,questionario,anexos_urls,endereco_envio,frete_modalidade,frete_valor,email`,
+    [id]
+  );
+  if (upd.rowCount) {
+    console.log(`[RENOVACAO-CONFIRMADA] #${id} via ${origem}`);
+    await confirmarRenovacao(upd.rows[0]);
+    return true;
+  }
+  return false;
+}
+
+async function reconciliarRenovacoesPendentes() {
+  if (!PAGBANK_TOKEN) return;
+  const pendentes = await pool.query(
+    `SELECT id,pagbank_order_id
+       FROM fila_atendimentos
+      WHERE tipo LIKE 'renovacao_%'
+        AND pagamento_status='pendente'
+        AND pagbank_order_id IS NOT NULL
+        AND criado_em > NOW() - INTERVAL '7 days'
+      ORDER BY criado_em DESC
+      LIMIT 12`
+  );
+  for (const row of pendentes.rows) {
+    try {
+      if (await pagBankOrderEstaPaga(row.pagbank_order_id)) {
+        await confirmarRenovacaoPorId(row.id, "reconciliacao_pagbank");
+      }
+    } catch (e) {
+      console.warn(`[RENOVACAO-RECONCILIAR] #${row.id}:`, e.message);
+    }
+  }
+}
+
 app.post("/api/correios/calcular-frete", rlGeral, async (req, res) => {
   try {
     const cepDestino = String(req.body?.cep_destino || "").replace(/\D/g, "");
@@ -8080,15 +8136,24 @@ app.post("/api/renovacao/pagbank/webhook", async (req, res) => {
   try {
     const orderId = String(req.body?.data?.id || req.body?.id || "");
     const charges = req.body?.data?.charges || req.body?.charges || [];
-    const pago = charges.some(c => c.status === "PAID");
+    let pago = charges.some(c => c.status === "PAID");
+    if (orderId && !pago) {
+      pago = await pagBankOrderEstaPaga(orderId).catch(e => {
+        console.warn("[RENOVACAO-PIX-WH] Consulta direta PagBank falhou:", e.message);
+        return false;
+      });
+    }
     if (!orderId || !pago) return;
-    const upd = await pool.query(
-      `UPDATE fila_atendimentos SET pagamento_status='confirmado', pagamento_confirmado_em=NOW(), status='aguardando'
-       WHERE pagbank_order_id=$1 AND tipo LIKE 'renovacao_%' AND pagamento_status='pendente'
-       RETURNING id,nome,tel,cpf,tipo,medicacoes,questionario,anexos_urls,endereco_envio,frete_modalidade,frete_valor,email`,
+    const at = await pool.query(
+      `SELECT id
+         FROM fila_atendimentos
+        WHERE pagbank_order_id=$1
+          AND tipo LIKE 'renovacao_%'
+          AND pagamento_status='pendente'
+        LIMIT 1`,
       [orderId]
     );
-    if (upd.rowCount) await confirmarRenovacao(upd.rows[0]);
+    if (at.rowCount) await confirmarRenovacaoPorId(at.rows[0].id, "pagbank_webhook");
   } catch (e) {
     console.error("[RENOVACAO-PIX-WH]", e.message);
   }
@@ -8183,9 +8248,21 @@ app.get("/api/renovacao/:id/status", rlGeral, async (req, res) => {
   try {
     const id = parseInt(req.params.id, 10);
     if (!id) return res.status(400).json({ ok: false });
-    const q = await pool.query(`SELECT id,status,pagamento_status FROM fila_atendimentos WHERE id=$1 AND tipo LIKE 'renovacao_%'`, [id]);
+    const q = await pool.query(`SELECT id,status,pagamento_status,pagbank_order_id FROM fila_atendimentos WHERE id=$1 AND tipo LIKE 'renovacao_%'`, [id]);
     if (!q.rowCount) return res.status(404).json({ ok: false });
-    return res.json({ ok: true, ...q.rows[0] });
+    const at = q.rows[0];
+    if (at.pagamento_status === "pendente" && at.pagbank_order_id) {
+      try {
+        if (await pagBankOrderEstaPaga(at.pagbank_order_id)) {
+          await confirmarRenovacaoPorId(at.id, "status_pagbank_fallback");
+          at.pagamento_status = "confirmado";
+          at.status = "aguardando";
+        }
+      } catch (e) {
+        console.warn(`[RENOVACAO-STATUS] Consulta PagBank falhou #${at.id}:`, e.message);
+      }
+    }
+    return res.json({ ok: true, id: at.id, status: at.status, pagamento_status: at.pagamento_status });
   } catch (e) {
     return res.status(500).json({ ok: false });
   }
