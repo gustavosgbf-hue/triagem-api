@@ -5720,6 +5720,28 @@ app.get("/api/fila", checkMedico, async (req, res) => {
   } catch (err) { return res.status(500).json({ ok: false, error: "Erro ao carregar fila" }); }
 });
 
+app.get("/api/renovacoes/fila", checkMedico, async (req, res) => {
+  try {
+    const isAdmin = req.medico.email === "gustavosgbf@gmail.com";
+    if (!isAdmin) return res.status(403).json({ ok: false, error: "Acesso restrito" });
+    await reconciliarRenovacoesPendentes().catch(e => console.warn("[RENOVACAO-RECONCILIAR]", e.message));
+    const result = await pool.query(
+      `SELECT id,nome,tel,cpf,tipo,triagem,status,pagamento_status,medico_id,medico_nome,meet_link,criado_em,
+              data_nascimento,idade,sexo,alergias,cronicas,medicacoes,queixa,solicita,horario_agendado,
+              anexos_urls,endereco_envio,frete_modalidade,frete_valor,email
+         FROM fila_atendimentos
+        WHERE tipo LIKE 'renovacao_%'
+          AND pagamento_status='confirmado'
+          AND status IN ('aguardando','assumido')
+        ORDER BY criado_em ASC`
+    );
+    return res.json({ ok: true, renovacoes: result.rows });
+  } catch (err) {
+    console.error("[RENOVACOES-FILA]", err.message);
+    return res.status(500).json({ ok: false, error: "Erro ao carregar renovações" });
+  }
+});
+
 // ── BUSCA DE PACIENTES (médico) ───────────────────────────────────────────────
 app.get("/api/pacientes/busca", checkMedico, async (req, res) => {
   try {
