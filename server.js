@@ -5686,7 +5686,17 @@ app.get("/api/fila", checkMedico, async (req, res) => {
                 WHERE tipo NOT LIKE 'renovacao%'
                   AND (
                     status IN ('aguardando','assumido')
-                    OR (pagamento_status='confirmado' AND status IN ('triagem','pagamento_pendente'))
+                    OR (
+                      pagamento_status='confirmado'
+                      AND status IN ('triagem','pagamento_pendente')
+                      AND criado_em > NOW() - INTERVAL '2 hours'
+                      AND (
+                        LOWER(TRIM(COALESCE(triagem,''))) LIKE '(aguardando pagamento)%'
+                        OR LOWER(TRIM(COALESCE(triagem,''))) LIKE '(pagamento confirmado%'
+                        OR LOWER(TRIM(COALESCE(triagem,''))) LIKE '(triagem em andamento)%'
+                        OR LOWER(TRIM(COALESCE(triagem,''))) LIKE '(aguardando triagem%'
+                      )
+                    )
                   )
                 ORDER BY criado_em ASC`;
     } else {
