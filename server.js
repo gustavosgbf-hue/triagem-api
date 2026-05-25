@@ -541,7 +541,7 @@ setInterval(async () => {
       const linkRetorno = `${SITE_URL}/triagem.html?consulta=${ag.fila_id}`;
       // Busca médicos e envia e-mail com novo token válido por 3h
       const medicosResult = await pool.query(`SELECT id,nome,email FROM medicos WHERE ativo=true AND status='aprovado'`);
-      const medicos = medicosResult.rows.filter(m=>m.email);
+      const medicos = filtrarMedicosAtivos(medicosResult.rows);
       if (!medicos.find(m=>m.email==="gustavosgbf@gmail.com")) medicos.push({id:0,nome:"Gustavo",email:"gustavosgbf@gmail.com"});
       // Marca ANTES do loop para evitar reprocessamento se job rodar novamente
       await pool.query(`UPDATE agendamentos SET lembrete_enviado=true WHERE id=$1`,[ag.id]);
@@ -710,6 +710,13 @@ async function initDB() {
     await pool.query(`ALTER TABLE medicos ADD COLUMN IF NOT EXISTS data_nascimento_medico TEXT`);
     await pool.query(`ALTER TABLE medicos ADD COLUMN IF NOT EXISTS memed_token TEXT`);
     await pool.query(`ALTER TABLE medicos ADD COLUMN IF NOT EXISTS memed_external_id TEXT`);
+    await pool.query(
+      `UPDATE medicos
+          SET ativo = false,
+              status = 'bloqueado',
+              status_online = false
+        WHERE LOWER(COALESCE(nome,'') || ' ' || COALESCE(nome_exibicao,'') || ' ' || COALESCE(email,'')) LIKE '%magali%'`
+    ).catch(e => console.warn("[DB] Bloqueio Magali:", e.message));
     const cols = [
       ['status_atendimento','TEXT'],['documentos_emitidos','TEXT'],['meet_link','TEXT'],
       ['tel_documentos','TEXT'],['idade','TEXT'],['sexo','TEXT'],['alergias','TEXT'],
@@ -1141,6 +1148,7 @@ function checkMedico(req, res, next) {
   if (!token) return res.status(401).json({ ok: false, error: "Token nao fornecido" });
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
+    if (medicoBloqueado(decoded)) return res.status(403).json({ ok: false, error: "Acesso desativado." });
     req.medico = decoded; req.medicoId = decoded.id; next();
   } catch(e) {
     return res.status(401).json({ ok: false, error: "Token invalido ou expirado" });
@@ -1148,6 +1156,16 @@ function checkMedico(req, res, next) {
 }
 
 const autenticarMedico = checkMedico;
+
+function medicoBloqueado(medico = {}) {
+  const nome = String(medico.nome || medico.nome_exibicao || "").toLowerCase();
+  const email = String(medico.email || "").toLowerCase();
+  return nome.includes("magali") || email.includes("magali");
+}
+
+function filtrarMedicosAtivos(medicos = []) {
+  return medicos.filter(m => m && m.email && !medicoBloqueado(m));
+}
 
 app.post("/api/triage", rlTriagem, handleChat);
 app.post("/api/doctor", handleChat);
@@ -1468,7 +1486,7 @@ async function enviarEmailMedicos({ nome, tel, tipo, triagem, linkRetorno, subje
   if (!RESEND_KEY) { console.warn("[EMAIL] RESEND_API_KEY nao definida."); return; }
   try {
     const medicosResult = await pool.query(`SELECT id,nome,email FROM medicos WHERE ativo=true AND status='aprovado' ORDER BY status_online DESC`);
-    const medicos = medicosResult.rows.filter(m=>m.email);
+    const medicos = filtrarMedicosAtivos(medicosResult.rows);
     // Garante que o admin sempre recebe
     // Admin sempre primeiro
     const adminEmail = "gustavosgbf@gmail.com";
@@ -5648,10 +5666,11 @@ app.post("/api/medico/login", rlLogin, async (req, res) => {
     const result = await pool.query("SELECT id,nome,nome_exibicao,email,crm,senha_hash,ativo,precisa_trocar_senha,status_online FROM medicos WHERE email=$1 LIMIT 1",[email.trim().toLowerCase()]);
     if (result.rowCount===0) return res.status(401).json({ ok: false, error: "Credenciais invalidas" });
     const med = result.rows[0];
+    if (medicoBloqueado(med)) return res.status(403).json({ ok: false, error: "Acesso desativado." });
     if (!med.ativo) return res.status(403).json({ ok: false, error: "Seu cadastro ainda esta em analise pela equipe da plataforma." });
     const senhaOk = await bcrypt.compare(senha, med.senha_hash);
     if (!senhaOk) return res.status(401).json({ ok: false, error: "Credenciais invalidas" });
-    const token = jwt.sign({ id: med.id, nome: med.nome, crm: med.crm }, JWT_SECRET, { expiresIn: "8h" });
+    const token = jwt.sign({ id: med.id, nome: med.nome, email: med.email, crm: med.crm }, JWT_SECRET, { expiresIn: "8h" });
     return res.json({ ok: true, token, precisa_trocar_senha: !!med.precisa_trocar_senha, medico: { id: med.id, nome: med.nome_exibicao||med.nome, email: med.email, crm: med.crm, status_online: !!med.status_online } });
   } catch (err) { return res.status(500).json({ ok: false, error: "Erro interno no login" }); }
 });
