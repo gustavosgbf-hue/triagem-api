@@ -4756,16 +4756,18 @@ app.post('/api/especialista/login', rlLogin, async (req, res) => {
 // ── ESPECIALISTA: esqueci senha ──────────────────────────────────────────────
 app.post('/api/especialista/esqueci-senha', rlLogin, async (req, res) => {
   // Sempre responde ok=true — não expõe se e-mail existe
-  res.json({ ok: true });
   try {
     const { email } = req.body || {};
-    if (!email) return;
+    if (!email) return res.json({ ok: true });
     const { rows } = await pool.query(
       `SELECT id, nome, nome_exibicao, email FROM especialistas
         WHERE LOWER(email) = LOWER($1) AND ativo = true LIMIT 1`,
       [email.trim()]
     );
-    if (!rows.length) return;
+    if (!rows.length) {
+      console.warn(`[ESP-RECOVERY] E-mail nao encontrado/ativo: ${String(email).trim().toLowerCase()}`);
+      return res.json({ ok: true });
+    }
     const esp = rows[0];
     const chars = 'abcdefghjkmnpqrstuvwxyz23456789';
     let senhaTemp = '';
@@ -4777,7 +4779,11 @@ app.post('/api/especialista/esqueci-senha', rlLogin, async (req, res) => {
     );
     const nome = esp.nome_exibicao || esp.nome;
     const RESEND_KEY = process.env.RESEND_API_KEY;
-    if (!RESEND_KEY) return;
+    if (!RESEND_KEY) {
+      console.error('[ESP-RECOVERY] RESEND_API_KEY ausente; senha atualizada, email nao enviado.');
+      return res.json({ ok: true });
+    }
+    const adminBcc = process.env.ESPECIALISTA_RECOVERY_BCC || process.env.RENOVACAO_ADMIN_EMAIL || 'gustavosgbf@gmail.com';
     const html = `<div style="background:#f5f5f5;padding:32px;font-family:sans-serif">
       <div style="max-width:480px;margin:0 auto;background:#fff;border-radius:12px;padding:28px">
         <h2 style="color:#1a1612;margin:0 0 12px">Acesso ao Painel do Especialista</h2>
@@ -4794,7 +4800,13 @@ app.post('/api/especialista/esqueci-senha', rlLogin, async (req, res) => {
     const resendRes = await fetch('https://api.resend.com/emails', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${RESEND_KEY}` },
-      body: JSON.stringify({ from: 'ConsultaJá24h <contato@consultaja24h.com.br>', to: [esp.email], subject: 'Sua senha temporária — ConsultaJá24h', html }),
+      body: JSON.stringify({
+        from: 'ConsultaJá24h <contato@consultaja24h.com.br>',
+        to: [esp.email],
+        bcc: adminBcc && adminBcc !== esp.email ? [adminBcc] : undefined,
+        subject: 'Sua senha temporária — ConsultaJá24h',
+        html,
+      }),
     });
     const resendData = await resendRes.json().catch(() => ({}));
     if (resendRes.ok) {
@@ -4802,8 +4814,10 @@ app.post('/api/especialista/esqueci-senha', rlLogin, async (req, res) => {
     } else {
       console.error(`[ESP-RECOVERY] ERRO Resend status ${resendRes.status}:`, JSON.stringify(resendData));
     }
+    return res.json({ ok: true });
   } catch (e) {
     console.error('[ESP-RECOVERY] Erro (silencioso):', e.message);
+    return res.json({ ok: true });
   }
 });
 
