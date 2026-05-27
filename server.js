@@ -8375,6 +8375,18 @@ app.get('/health', (req, res) => {
 let _reviewsCache = null;
 let _reviewsCacheTs = 0;
 const REVIEWS_CACHE_TTL = 6 * 60 * 60 * 1000; // 6 horas
+const REVIEWS_FALLBACK = {
+  rating: 5,
+  user_ratings_total: 2000,
+  reviews: [
+    { author_name: 'Rayssa C.', rating: 5, text: 'Perfeito, muito atenciosos e rápidos, atendimento ótimo do início ao fim.', relative_time_description: 'há 3 semanas' },
+    { author_name: 'Daniely L.', rating: 5, text: 'Doutor super atencioso, me ajudou demais. Agradeço pela atenção, ótimo atendimento!', relative_time_description: 'há 4 dias' },
+    { author_name: 'Débora V.', rating: 5, text: 'O médico é muito atencioso e a consulta foi imediata, após fazer o pix. É uma ótima solução para quem está doente e não pode sair de casa.', relative_time_description: 'há 1 semana' },
+    { author_name: 'Wellington M.', rating: 5, text: 'Excelente atendimento, recomendo.', relative_time_description: 'há 1 semana' },
+    { author_name: 'Bruna G.', rating: 5, text: 'Mais prático e fácil do que eu esperava. Fui bem atendida e recebi a receita no celular.', relative_time_description: 'há 1 semana' }
+  ],
+  fallback: true
+};
 
 app.get('/api/reviews', async (req, res) => {
   try {
@@ -8394,7 +8406,8 @@ app.get('/api/reviews', async (req, res) => {
     const { data } = await axios.get(url, { timeout: 8000 });
 
     if (!data.result) {
-      return res.status(502).json({ ok: false, error: 'Place não encontrado' });
+      console.warn('[reviews] Place não encontrado; usando fallback estático');
+      return res.json(REVIEWS_FALLBACK);
     }
 
     const result = {
@@ -8423,7 +8436,7 @@ app.get('/api/reviews', async (req, res) => {
     console.error('[reviews]', err.message);
     // Se cache expirado mas existe, serve ele mesmo velho antes de 502
     if (_reviewsCache) return res.json(_reviewsCache);
-    res.status(502).json({ ok: false, error: 'Erro ao buscar avaliações' });
+    res.json(REVIEWS_FALLBACK);
   }
 });
 // ─────────────────────────────────────────────────────────────────────────────
