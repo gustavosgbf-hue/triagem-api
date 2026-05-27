@@ -2036,7 +2036,7 @@ app.post("/api/atendimento/atualizar-triagem", async (req, res) => {
           headers: { "Authorization": `Bearer ${PAGBANK_TOKEN}`, "accept": "application/json" }
         });
         const pbData = await pbRes.json();
-        const pagoNaPagBank = pbData.charges?.some(c => c.status === "PAID") || false;
+        const pagoNaPagBank = pagbankOrderPago(pbData);
         if (pagoNaPagBank) {
           // Confirma no banco para não depender do webhook atrasado
           await pool.query(
@@ -2439,7 +2439,7 @@ app.get("/api/atendimento/status/:id", async (req, res) => {
           headers: { Authorization: `Bearer ${PAGBANK_TOKEN}`, accept: 'application/json' }
         });
         const pbData = await pbRes.json();
-        const pago   = pbData.charges?.some(c => c.status === 'PAID') || false;
+        const pago   = pagbankOrderPago(pbData);
         if (pago) {
           await pool.query(
             `UPDATE fila_atendimentos
