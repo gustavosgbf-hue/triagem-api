@@ -1408,6 +1408,20 @@ app.post("/api/pagbank/webhook", async (req, res) => {
   }
 });
 
+function pagbankOrderPago(data) {
+  const statusPago = new Set(["PAID", "COMPLETED"]);
+  const status = String(data?.status || "").toUpperCase();
+  if (statusPago.has(status)) return true;
+  const charges = Array.isArray(data?.charges) ? data.charges : [];
+  if (charges.some(c => statusPago.has(String(c?.status || "").toUpperCase()))) return true;
+  const qrCodes = Array.isArray(data?.qr_codes) ? data.qr_codes : [];
+  return qrCodes.some(qr => {
+    if (statusPago.has(String(qr?.status || "").toUpperCase())) return true;
+    const payments = Array.isArray(qr?.payments) ? qr.payments : [];
+    return payments.some(p => statusPago.has(String(p?.status || "").toUpperCase()));
+  });
+}
+
 // Consultar status de uma order PagBank — usado como fallback de polling
 app.get("/api/pagbank/order/:id", async (req, res) => {
   try {
@@ -1416,8 +1430,32 @@ app.get("/api/pagbank/order/:id", async (req, res) => {
       headers: { "Authorization": `Bearer ${PAGBANK_TOKEN}`, "accept": "application/json" }
     });
     const data = await response.json();
-    // Verifica pagamento tanto em charges quanto em qr_codes
-    const pago = data.charges?.some(c => c.status === "PAID") || false;
+    const pago = pagbankOrderPago(data);
+    if (pago) {
+      const { rows } = await pool.query(
+        `UPDATE fila_atendimentos
+            SET pagamento_status        = 'confirmado',
+                pagamento_confirmado_em = COALESCE(pagamento_confirmado_em, NOW()),
+                status = CASE
+                  WHEN status = 'pagamento_pendente' THEN 'triagem'
+                  ELSE status
+                END
+          WHERE pagbank_order_id = $1
+            AND pagamento_status = 'pendente'
+          RETURNING id, nome, tel, cpf, tipo, triagem, status`,
+        [req.params.id]
+      ).catch(e => {
+        console.warn("[PAGBANK-STATUS] Falha ao promover atendimento:", e.message);
+        return { rows: [] };
+      });
+      if (rows.length > 0) {
+        const at = rows[0];
+        console.log(`[PAGBANK-STATUS] Atendimento #${at.id} confirmado via polling PagBank`);
+        console.log("PAGAMENTO_CONFIRMADO_REDIRECT_CONFIRMADO", { consultaId: String(at.id), tipo: at.tipo || "chat", metodo: "pix" });
+        await logarCandidatoConversaoOffline(at.id, "pix", "pagbank_polling_status", req.params.id);
+        await juliePromoverAtendimento(at, req.params.id);
+      }
+    }
     return res.json({ ok: true, status: data.status, pago });
   } catch (e) {
     return res.status(500).json({ ok: false, error: e.message });
