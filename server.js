@@ -5380,6 +5380,101 @@ app.patch("/api/admin/medico/:id/rejeitar", checkAdmin, async (req, res) => {
   } catch (err) { return res.status(500).json({ ok: false, error: err.message }); }
 });
 
+app.patch("/api/admin/medico/:id/mover-especialista", checkAdmin, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).json({ ok: false, error: "ID invalido" });
+    const especialidadeReq = String(req.body?.especialidade || "").trim().toLowerCase();
+    if (!especialidadeReq) return res.status(400).json({ ok: false, error: "Especialidade obrigatoria" });
+    const valorReq = req.body?.valor_consulta;
+    const valorPadrao = especialidadeReq.includes("psiqu") ? 350 : especialidadeReq.includes("dermat") ? 220 : 250;
+    const valorConsulta = Number.isFinite(Number(valorReq)) && Number(valorReq) > 0 ? Number(valorReq) : valorPadrao;
+
+    await client.query("BEGIN");
+    const medRes = await client.query(
+      `SELECT id,nome,nome_exibicao,email,senha_hash,crm,uf,telefone,especialidade
+         FROM medicos WHERE id=$1 FOR UPDATE`,
+      [id]
+    );
+    if (!medRes.rowCount) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ ok: false, error: "Medico nao encontrado" });
+    }
+    const med = medRes.rows[0];
+    const emailNorm = med.email ? med.email.trim().toLowerCase() : null;
+    if (!emailNorm) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({ ok: false, error: "Cadastro sem email" });
+    }
+
+    let espRes = await client.query(`SELECT id FROM especialistas WHERE LOWER(email)=LOWER($1) LIMIT 1`, [emailNorm]);
+    if (espRes.rowCount) {
+      espRes = await client.query(
+        `UPDATE especialistas
+            SET nome=$1,
+                nome_exibicao=$2,
+                especialidade=$3,
+                crm=$4,
+                uf=$5,
+                valor_consulta=$6,
+                email=$7,
+                senha_hash=COALESCE(senha_hash,$8),
+                ativo=true,
+                visivel=false
+          WHERE id=$9
+          RETURNING id,nome_exibicao,email,especialidade,ativo,visivel`,
+        [
+          med.nome,
+          med.nome_exibicao || med.nome,
+          especialidadeReq,
+          med.crm,
+          med.uf,
+          valorConsulta,
+          emailNorm,
+          med.senha_hash || null,
+          espRes.rows[0].id,
+        ]
+      );
+    } else {
+      espRes = await client.query(
+        `INSERT INTO especialistas
+          (nome,nome_exibicao,especialidade,crm,uf,valor_consulta,email,senha_hash,precisa_trocar_senha,ativo,visivel,bio)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,false,true,false,$9)
+         RETURNING id,nome_exibicao,email,especialidade,ativo,visivel`,
+        [
+          med.nome,
+          med.nome_exibicao || med.nome,
+          especialidadeReq,
+          med.crm,
+          med.uf,
+          valorConsulta,
+          emailNorm,
+          med.senha_hash || null,
+          "",
+        ]
+      );
+    }
+
+    const bloqueioTag = `movido_especialista:${especialidadeReq}`;
+    await client.query(
+      `UPDATE medicos
+          SET ativo=false,
+              status=$1,
+              status_online=false
+        WHERE id=$2`,
+      [bloqueioTag, id]
+    );
+    await client.query("COMMIT");
+    return res.json({ ok: true, especialista: espRes.rows[0] });
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    return res.status(500).json({ ok: false, error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
 app.get("/api/admin/medicos/pendentes", checkAdmin, async (req, res) => {
   try {
     const result = await pool.query(`SELECT id,nome,nome_exibicao,email,crm,uf,telefone,especialidade,cnpj,tem_assinatura_digital,provedor_assinatura,tem_memed,memed_email,status,ativo,created_at FROM medicos WHERE status='pendente' ORDER BY created_at DESC`);
