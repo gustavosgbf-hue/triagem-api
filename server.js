@@ -715,8 +715,12 @@ async function initDB() {
           SET ativo = false,
               status = 'bloqueado',
               status_online = false
-        WHERE LOWER(COALESCE(nome,'') || ' ' || COALESCE(nome_exibicao,'') || ' ' || COALESCE(email,'')) LIKE '%magali%'`
-    ).catch(e => console.warn("[DB] Bloqueio Magali:", e.message));
+        WHERE LOWER(COALESCE(nome,'') || ' ' || COALESCE(nome_exibicao,'') || ' ' || COALESCE(email,'')) LIKE '%magali%'
+           OR (
+             LOWER(COALESCE(nome,'') || ' ' || COALESCE(nome_exibicao,'') || ' ' || COALESCE(email,'')) LIKE '%danielle%'
+             AND LOWER(COALESCE(nome,'') || ' ' || COALESCE(nome_exibicao,'') || ' ' || COALESCE(email,'')) LIKE '%lourdes%'
+           )`
+    ).catch(e => console.warn("[DB] Bloqueio medicos fora do fluxo normal:", e.message));
     const cols = [
       ['status_atendimento','TEXT'],['documentos_emitidos','TEXT'],['meet_link','TEXT'],
       ['tel_documentos','TEXT'],['idade','TEXT'],['sexo','TEXT'],['alergias','TEXT'],
@@ -1157,10 +1161,30 @@ function checkMedico(req, res, next) {
 
 const autenticarMedico = checkMedico;
 
+function normalizarBloqueioMedico(valor = "") {
+  return String(valor)
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .trim();
+}
+
+const MEDICOS_FLUXO_NORMAL_BLOQUEADOS = [
+  "magali",
+  "danielle lourdes",
+  ...(process.env.MEDICOS_FLUXO_NORMAL_BLOQUEADOS || "")
+    .split(",")
+    .map(normalizarBloqueioMedico)
+    .filter(Boolean),
+];
+
 function medicoBloqueado(medico = {}) {
-  const nome = String(medico.nome || medico.nome_exibicao || "").toLowerCase();
-  const email = String(medico.email || "").toLowerCase();
-  return nome.includes("magali") || email.includes("magali");
+  const texto = normalizarBloqueioMedico([
+    medico.nome,
+    medico.nome_exibicao,
+    medico.email,
+  ].filter(Boolean).join(" "));
+  return MEDICOS_FLUXO_NORMAL_BLOQUEADOS.some(termo => texto.includes(termo));
 }
 
 function filtrarMedicosAtivos(medicos = []) {
