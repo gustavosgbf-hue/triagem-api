@@ -45,6 +45,40 @@ app.use(cors({
 }));
 app.use(express.json({ limit: "1mb" }));
 
+const RESEND_DEFAULT_FROM = process.env.RESEND_DEFAULT_FROM || "ConsultaJá24h <contato@consultaja24h.com.br>";
+const RESEND_FILA_FROM = process.env.RESEND_FILA_FROM || "ConsultaJá24h Fila <fila@consultaja24h.com.br>";
+
+async function enviarResendComFallback({ apiKey, from, fallbackFrom = RESEND_DEFAULT_FROM, to, subject, html, tag }) {
+  const payload = { from, to, subject, html };
+  if (tag) payload.tags = [{ name: "tipo", value: tag }];
+
+  const enviar = async (body) => {
+    const res = await fetch("https://api.resend.com/emails", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+      body: JSON.stringify(body)
+    });
+    const data = await res.json().catch(() => ({}));
+    return { res, data };
+  };
+
+  const primeira = await enviar(payload);
+  if (primeira.res.ok && primeira.data?.id) return { ...primeira, fromUsado: from, fallback: false };
+
+  const mesmoFrom = String(from || "").trim() === String(fallbackFrom || "").trim();
+  if (!fallbackFrom || mesmoFrom) return { ...primeira, fromUsado: from, fallback: false };
+
+  console.warn("[RESEND] Remetente principal recusado; tentando fallback.", {
+    from,
+    fallbackFrom,
+    status: primeira.res.status,
+    error: JSON.stringify(primeira.data).slice(0, 500)
+  });
+
+  const segunda = await enviar({ ...payload, from: fallbackFrom });
+  return { ...segunda, fromUsado: fallbackFrom, fallback: true, erroPrincipal: primeira.data };
+}
+
 // ── RATE LIMITING ─────────────────────────────────────────────────────────────
 const rlLogin = rateLimit({ windowMs: 60*1000, max: 10, standardHeaders: true, legacyHeaders: false,
   message: { ok: false, error: "Muitas tentativas de login. Tente novamente em 1 minuto." }});
@@ -1573,14 +1607,19 @@ async function enviarEmailMedicos({ nome, tel, tipo, triagem, linkRetorno, subje
       const token = jwt.sign(tokenPayload, JWT_SECRET, tokenOpts);
       const linkAssumir = `${API_URL}/api/atendimento/assumir-email?token=${token}`;
       const html = montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno, linkAssumir, medicoNome: med.nome, horarioAgendado });
-      const resendRes = await fetch("https://api.resend.com/emails", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${RESEND_KEY}` },
-        body: JSON.stringify({ from: "ConsultaJa24h <contato@consultaja24h.com.br>", to: [med.email], subject, html })
+      const envio = await enviarResendComFallback({
+        apiKey: RESEND_KEY,
+        from: RESEND_FILA_FROM,
+        fallbackFrom: RESEND_DEFAULT_FROM,
+        to: [med.email],
+        subject,
+        html,
+        tag: horarioAgendado ? "agendamento-pronto" : "paciente-fila"
       });
-      const resendData = await resendRes.json();
+      const resendData = envio.data || {};
       if (resendData.id) console.log("[EMAIL] Enviado para:", med.email, "| ID:", resendData.id);
       else console.error("[EMAIL] Resend recusou para", med.email, ":", JSON.stringify(resendData));
+      if (resendData.id) console.log("[EMAIL] Remetente usado:", envio.fromUsado, envio.fallback ? "(fallback)" : "");
       // Delay para respeitar rate limit do Resend (max 2 req/s)
       await new Promise(r => setTimeout(r, 600));
     }
