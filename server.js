@@ -46,7 +46,7 @@ app.use(cors({
 app.use(express.json({ limit: "1mb" }));
 
 const RESEND_DEFAULT_FROM = process.env.RESEND_DEFAULT_FROM || "ConsultaJá24h <contato@consultaja24h.com.br>";
-const RESEND_FILA_FROM = process.env.RESEND_FILA_FROM || "ConsultaJá24h Fila <fila@consultaja24h.com.br>";
+const RESEND_FILA_FROM = process.env.RESEND_FILA_FROM || RESEND_DEFAULT_FROM;
 
 async function enviarResendComFallback({ apiKey, from, fallbackFrom = RESEND_DEFAULT_FROM, to, subject, html, tag }) {
   const payload = { from, to, subject, html };
