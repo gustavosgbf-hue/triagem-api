@@ -90,6 +90,8 @@ const rlTriagem = rateLimit({ windowMs: 60*1000, max: 30, standardHeaders: true,
   message: { ok: false, error: "Muitas requisições de triagem. Aguarde." }});
 const rlGeral = rateLimit({ windowMs: 60*1000, max: 120, standardHeaders: true, legacyHeaders: false,
   message: { ok: false, error: "Muitas requisições. Aguarde." }});
+const rlCadastroMedico = rateLimit({ windowMs: 60*60*1000, max: 5, standardHeaders: true, legacyHeaders: false,
+  message: { ok: false, error: "Muitos cadastros enviados. Tente novamente mais tarde." }});
 
 app.post("/api/tracking/confirmado-view", rlGeral, (req, res) => {
   const body = req.body || {};
@@ -755,6 +757,22 @@ async function initDB() {
              AND LOWER(COALESCE(nome,'') || ' ' || COALESCE(nome_exibicao,'') || ' ' || COALESCE(email,'')) LIKE '%lourdes%'
            )`
     ).catch(e => console.warn("[DB] Bloqueio medicos fora do fluxo normal:", e.message));
+    await pool.query(
+      `UPDATE medicos
+          SET ativo = false,
+              status = 'rejeitado',
+              status_online = false
+        WHERE status = 'pendente'
+          AND (
+            LOWER(COALESCE(nome,'') || ' ' || COALESCE(nome_exibicao,'') || ' ' || COALESCE(email,'') || ' ' || COALESCE(especialidade,'') || ' ' || COALESCE(crm,'')) LIKE '%pentest%'
+            OR LOWER(COALESCE(nome,'') || ' ' || COALESCE(nome_exibicao,'') || ' ' || COALESCE(email,'') || ' ' || COALESCE(especialidade,'') || ' ' || COALESCE(crm,'')) LIKE '%proto pollution%'
+            OR LOWER(COALESCE(nome,'') || ' ' || COALESCE(nome_exibicao,'') || ' ' || COALESCE(email,'') || ' ' || COALESCE(especialidade,'') || ' ' || COALESCE(crm,'')) LIKE '%autoaprovado%'
+            OR LOWER(COALESCE(nome,'') || ' ' || COALESCE(nome_exibicao,'') || ' ' || COALESCE(email,'') || ' ' || COALESCE(especialidade,'') || ' ' || COALESCE(crm,'')) LIKE '%auto aprovado%'
+            OR LOWER(COALESCE(nome,'') || ' ' || COALESCE(nome_exibicao,'') || ' ' || COALESCE(email,'') || ' ' || COALESCE(especialidade,'') || ' ' || COALESCE(crm,'')) LIKE '%test banking%'
+            OR LOWER(COALESCE(nome,'') || ' ' || COALESCE(nome_exibicao,'') || ' ' || COALESCE(email,'') || ' ' || COALESCE(especialidade,'') || ' ' || COALESCE(crm,'')) LIKE '%banktest%'
+            OR LOWER(COALESCE(email,'')) LIKE '%@test.com'
+          )`
+    ).catch(e => console.warn("[DB] Limpeza cadastros pentest:", e.message));
     const cols = [
       ['status_atendimento','TEXT'],['documentos_emitidos','TEXT'],['meet_link','TEXT'],
       ['tel_documentos','TEXT'],['idade','TEXT'],['sexo','TEXT'],['alergias','TEXT'],
@@ -1195,12 +1213,59 @@ function checkMedico(req, res, next) {
 
 const autenticarMedico = checkMedico;
 
+function decodificarMedicoRequest(req) {
+  const auth = req.headers["authorization"] || "";
+  const token = auth.replace(/^Bearer\s+/i, "").trim();
+  if (!token) return null;
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    if (medicoBloqueado(decoded)) return null;
+    return decoded;
+  } catch {
+    return null;
+  }
+}
+
+function medicoPodeEscreverNoAtendimento(medico, atendimento) {
+  const medicoIdAtendimento = String(atendimento?.medico_id || "");
+  if (medicoIdAtendimento && medicoIdAtendimento === String(medico?.id || "")) return true;
+  return medicoIdAtendimento === "0" && String(medico?.email || "").toLowerCase() === "gustavosgbf@gmail.com";
+}
+
+function origemPacientePermitida(req) {
+  const origem = String(req.headers.origin || req.headers.referer || "").toLowerCase();
+  return origem.startsWith("https://consultaja24h.com.br")
+      || origem.startsWith("https://www.consultaja24h.com.br")
+      || /^https:\/\/[^/]+\.pages\.dev/.test(origem);
+}
+
 function normalizarBloqueioMedico(valor = "") {
   return String(valor)
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
     .toLowerCase()
     .trim();
+}
+
+function cadastroMedicoSuspeito(dados = {}) {
+  const combinado = normalizarBloqueioMedico([
+    dados.nome,
+    dados.nome_exibicao,
+    dados.email,
+    dados.crm,
+    dados.especialidade,
+    dados.telefone,
+    dados.cnpj
+  ].filter(Boolean).join(" "));
+  return [
+    "pentest",
+    "proto pollution",
+    "auto aprovado",
+    "autoaprovado",
+    "test banking",
+    "banktest",
+    "@test.com"
+  ].some(sinal => combinado.includes(sinal));
 }
 
 const MEDICOS_FLUXO_NORMAL_BLOQUEADOS = [
@@ -2434,6 +2499,19 @@ app.post("/api/chat/upload", rlUpload, upload.single("arquivo"), async (req, res
     if (!req.file) return res.status(400).json({ ok: false, error: "Nenhum arquivo enviado" });
     const { atendimentoId, autor, autorId } = req.body || {};
     if (!atendimentoId || !autor) return res.status(400).json({ ok: false, error: "atendimentoId e autor obrigatorios" });
+    if (!["paciente","medico"].includes(autor)) return res.status(400).json({ ok: false, error: "autor deve ser paciente ou medico" });
+    const atendimento = await pool.query(`SELECT id,status,medico_id FROM fila_atendimentos WHERE id=$1`, [atendimentoId]);
+    if (!atendimento.rowCount) return res.status(404).json({ ok: false, error: "Atendimento nao encontrado" });
+    if (autor === "medico") {
+      const med = decodificarMedicoRequest(req);
+      if (!med) return res.status(401).json({ ok: false, error: "Token de medico obrigatorio" });
+      if (!medicoPodeEscreverNoAtendimento(med, atendimento.rows[0])) return res.status(403).json({ ok: false, error: "Medico nao vinculado ao atendimento" });
+      req.body.autorId = med.id;
+    } else if (!["assumido","encerrado"].includes(atendimento.rows[0].status)) {
+      return res.status(403).json({ ok: false, error: "Chat ainda nao liberado para este atendimento" });
+    } else if (!origemPacientePermitida(req)) {
+      return res.status(403).json({ ok: false, error: "Origem nao autorizada" });
+    }
     const ext = req.file.originalname.split(".").pop().toLowerCase();
     const tipo = req.file.mimetype.startsWith("image/") ? "imagem" : "pdf";
     const key = `chat/${randomUUID()}.${ext}`;
@@ -2448,7 +2526,7 @@ app.post("/api/chat/upload", rlUpload, upload.single("arquivo"), async (req, res
     const arquivoNome = String(req.file.originalname || '').replace(/[\r\n\t]/g,' ').slice(0,120) || ('arquivo.'+ext);
     const result = await pool.query(
       `INSERT INTO mensagens (atendimento_id,autor,autor_id,texto,arquivo_url,arquivo_tipo,arquivo_nome) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id,atendimento_id,autor,texto,arquivo_url,arquivo_tipo,arquivo_nome,criado_em`,
-      [atendimentoId, autor, autorId || null, "", url, tipo, arquivoNome]
+      [atendimentoId, autor, req.body.autorId || autorId || null, "", url, tipo, arquivoNome]
     );
     return res.json({ ok: true, mensagem: result.rows[0] });
   } catch (e) { console.error("Erro em /api/chat/upload:", e); return res.status(500).json({ ok: false, error: "Erro ao fazer upload" }); }
@@ -2459,9 +2537,23 @@ app.post("/api/chat/enviar", rlMensagem, async (req, res) => {
     const { atendimentoId, autor, autorId, texto, arquivo_url, arquivo_tipo } = req.body || {};
     if (!atendimentoId||!autor||(!texto&&!arquivo_url)) return res.status(400).json({ ok: false, error: "Campos obrigatorios: atendimentoId, autor, texto ou arquivo" });
     if (!["paciente","medico"].includes(autor)) return res.status(400).json({ ok: false, error: "autor deve ser paciente ou medico" });
+    const atendimento = await pool.query(`SELECT id,status,medico_id FROM fila_atendimentos WHERE id=$1`, [atendimentoId]);
+    if (!atendimento.rowCount) return res.status(404).json({ ok: false, error: "Atendimento nao encontrado" });
+    let autorIdSeguro = autorId || null;
+    if (autor === "medico") {
+      const med = decodificarMedicoRequest(req);
+      if (!med) return res.status(401).json({ ok: false, error: "Token de medico obrigatorio" });
+      if (!medicoPodeEscreverNoAtendimento(med, atendimento.rows[0])) return res.status(403).json({ ok: false, error: "Medico nao vinculado ao atendimento" });
+      autorIdSeguro = med.id;
+    } else if (!["assumido","encerrado"].includes(atendimento.rows[0].status)) {
+      return res.status(403).json({ ok: false, error: "Chat ainda nao liberado para este atendimento" });
+    } else if (!origemPacientePermitida(req)) {
+      return res.status(403).json({ ok: false, error: "Origem nao autorizada" });
+    }
+    const textoSeguro = String(texto || "").trim().slice(0, 3000);
     const result = await pool.query(
       `INSERT INTO mensagens (atendimento_id,autor,autor_id,texto,arquivo_url,arquivo_tipo) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id,atendimento_id,autor,texto,arquivo_url,arquivo_tipo,arquivo_nome,criado_em`,
-      [atendimentoId,autor,autorId||null,(texto||"").trim(),arquivo_url||null,arquivo_tipo||null]
+      [atendimentoId,autor,autorIdSeguro,textoSeguro,arquivo_url||null,arquivo_tipo||null]
     );
     return res.json({ ok: true, mensagem: result.rows[0] });
   } catch (e) { console.error("Erro em /api/chat/enviar:", e); return res.status(500).json({ ok: false, error: "Erro ao enviar mensagem" }); }
@@ -2628,12 +2720,16 @@ app.get("/atender", async (req, res) => {
   } catch (e) { return res.status(500).send("Erro ao assumir atendimento"); }
 });
 
-app.post("/api/medico/cadastro", async (req, res) => {
+app.post("/api/medico/cadastro", rlCadastroMedico, async (req, res) => {
   try {
     const { nome, nome_exibicao, email, senha, crm, uf, telefone, especialidade,
             cnpj, tem_assinatura_digital, provedor_assinatura, tem_memed, memed_email } = req.body || {};
     if (!nome||!email||!senha||!crm||!uf) return res.status(400).json({ ok: false, error: "Todos os campos obrigatorios devem ser preenchidos" });
     if (senha.length<6) return res.status(400).json({ ok: false, error: "Senha deve ter ao menos 6 caracteres" });
+    if (cadastroMedicoSuspeito({ nome, nome_exibicao, email, crm, telefone, especialidade, cnpj })) {
+      console.warn("[MEDICO-CADASTRO] Cadastro suspeito bloqueado:", { nome, email, crm, telefone });
+      return res.status(400).json({ ok: false, error: "Cadastro não aceito para análise." });
+    }
     const senha_hash = await bcrypt.hash(senha, 10);
     const result = await pool.query(
       `INSERT INTO medicos (nome,nome_exibicao,email,senha_hash,crm,uf,telefone,especialidade,
