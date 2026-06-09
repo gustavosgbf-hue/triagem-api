@@ -46,10 +46,13 @@ app.use(cors({
 app.use(express.json({ limit: "1mb" }));
 
 const RESEND_DEFAULT_FROM = process.env.RESEND_DEFAULT_FROM || "ConsultaJá24h <contato@consultaja24h.com.br>";
-const RESEND_FILA_FROM = process.env.RESEND_FILA_FROM || RESEND_DEFAULT_FROM;
+const RESEND_FILA_FROM = RESEND_DEFAULT_FROM;
 
-async function enviarResendComFallback({ apiKey, from, fallbackFrom = RESEND_DEFAULT_FROM, to, subject, html, tag }) {
+async function enviarResendComFallback({ apiKey, from, fallbackFrom = RESEND_DEFAULT_FROM, to, subject, html, text, headers, replyTo, tag }) {
   const payload = { from, to, subject, html };
+  if (text) payload.text = text;
+  if (headers) payload.headers = headers;
+  if (replyTo) payload.reply_to = replyTo;
   if (tag) payload.tags = [{ name: "tipo", value: tag }];
 
   const enviar = async (body) => {
@@ -1672,6 +1675,14 @@ async function enviarEmailMedicos({ nome, tel, tipo, triagem, linkRetorno, subje
       const token = jwt.sign(tokenPayload, JWT_SECRET, tokenOpts);
       const linkAssumir = `${API_URL}/api/atendimento/assumir-email?token=${token}`;
       const html = montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno, linkAssumir, medicoNome: med.nome, horarioAgendado });
+      const tipoLabel = tipo === "video" ? "video" : "chat";
+      const text = [
+        `${nome} está aguardando atendimento por ${tipoLabel}.`,
+        tel ? `WhatsApp: ${String(tel).replace(/\D/g, "")}` : "",
+        triagem ? `Triagem: ${triagem}` : "",
+        `Assumir atendimento: ${linkAssumir}`,
+        `Painel: ${PAINEL_URL}`
+      ].filter(Boolean).join("\n\n");
       const envio = await enviarResendComFallback({
         apiKey: RESEND_KEY,
         from: RESEND_FILA_FROM,
@@ -1679,6 +1690,14 @@ async function enviarEmailMedicos({ nome, tel, tipo, triagem, linkRetorno, subje
         to: [med.email],
         subject,
         html,
+        text,
+        replyTo: "consultaja24@gmail.com",
+        headers: {
+          "X-Priority": "1",
+          "Priority": "urgent",
+          "Importance": "high",
+          "X-MSMail-Priority": "High"
+        },
         tag: horarioAgendado ? "agendamento-pronto" : "paciente-fila"
       });
       const resendData = envio.data || {};
@@ -2071,7 +2090,7 @@ async function notificarMedicos(at) {
     triagem: at.triagem, linkRetorno,
     atendimentoId: at.id,
     horarioAgendado: null, horarioAgendadoRaw: null,
-    subject: "PACIENTE NOVO NA FILA - " + nomeFila
+    subject: "Paciente aguardando atendimento — " + nomeFila
   });
 
   console.log("[NOTIFICACAO] Medicos notificados — atendimento #" + at.id);
@@ -2098,7 +2117,7 @@ async function liberarAtendimentoParaMedicos(atendimentoId) {
   await enviarEmailMedicos({
     nome: nomeFila, tel: at.tel, tipo: at.tipo, triagem: at.triagem, linkRetorno,
     atendimentoId: at.id, horarioAgendado: null, horarioAgendadoRaw: null,
-    subject: `Nova triagem - ${nomeFila} (${tipoLabel})`
+    subject: `Paciente aguardando atendimento — ${nomeFila} (${tipoLabel})`
   });
   console.log(`[LIBERADO] Atendimento #${atendimentoId} liberado para médicos.`);
 }
