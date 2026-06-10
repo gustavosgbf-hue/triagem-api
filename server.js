@@ -46,7 +46,7 @@ app.use(cors({
 app.use(express.json({ limit: "1mb" }));
 
 const RESEND_DEFAULT_FROM = process.env.RESEND_DEFAULT_FROM || "ConsultaJá24h <contato@consultaja24h.com.br>";
-const RESEND_FILA_FROM = RESEND_DEFAULT_FROM;
+const RESEND_FILA_FROM = "Plantão ConsultaJá24h <contato@consultaja24h.com.br>";
 
 async function enviarResendComFallback({ apiKey, from, fallbackFrom = RESEND_DEFAULT_FROM, to, subject, html, text, headers, replyTo, tag }) {
   const payload = { from, to, subject, html };
@@ -1604,54 +1604,46 @@ function montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno, linkAssumir, m
   const telLimpo = String(tel||"").replace(/\D/g,"");
   const nomeEmail = normalizarNomePaciente(nome) || "Nome não informado";
   const tituloEmail = isLembrete
-    ? "Lembrete de atendimento — ConsultaJá24h"
-    : (horarioAgendado ? "Agendamento pronto para atendimento — ConsultaJá24h" : "Paciente novo na fila — ConsultaJá24h");
-  const avisoTitulo = isLembrete
-    ? "LEMBRETE DE ATENDIMENTO"
-    : (horarioAgendado ? "AGENDAMENTO PRONTO" : "PACIENTE NOVO NA FILA");
+    ? "Atendimento próximo"
+    : (horarioAgendado ? "Agendamento disponível" : "Novo paciente aguardando");
+  const saudacao = medicoNome ? `Olá, ${normalizarNomePaciente(medicoNome)}.` : "Olá.";
   const avisoTexto = isLembrete
     ? "Este atendimento está próximo do horário agendado. Confira os dados e entre no painel para acompanhar."
-    : "Um paciente acabou de concluir a triagem e está aguardando médico. Clique em Assumir atendimento para vincular este paciente ao seu nome.";
-  const preheader = `${avisoTitulo}: ${nomeEmail} aguardando atendimento ${tipoLabel}.`;
+    : "Um paciente concluiu a triagem e está aguardando atendimento. O primeiro médico disponível pode assumir pelo botão abaixo.";
+  const preheader = `${nomeEmail} está aguardando atendimento por ${tipoLabel}.`;
   function montarTabelaTriagem(texto) {
     if (!texto) return '<tr><td colspan="2">-</td></tr>';
     return texto.split(/[;\n]/).map(item => {
       const ci = item.indexOf(":");
-      if (ci>0) { const k=item.slice(0,ci).trim(); const v=item.slice(ci+1).trim(); return `<tr><td style="padding:8px 12px;color:rgba(255,255,255,.45);font-size:12px;width:150px">${k}</td><td style="padding:8px 12px;color:#fff;font-size:13px">${v}</td></tr>`; }
-      return `<tr><td colspan="2" style="padding:8px 12px;color:rgba(255,255,255,.7);font-size:13px">${item.trim()}</td></tr>`;
+      if (ci>0) { const k=item.slice(0,ci).trim(); const v=item.slice(ci+1).trim(); return `<tr><td style="padding:8px 12px;border-bottom:1px solid #edf2ef;color:#617068;font-size:12px;width:150px">${k}</td><td style="padding:8px 12px;border-bottom:1px solid #edf2ef;color:#17211d;font-size:13px">${v}</td></tr>`; }
+      return `<tr><td colspan="2" style="padding:8px 12px;border-bottom:1px solid #edf2ef;color:#425049;font-size:13px">${item.trim()}</td></tr>`;
     }).join("");
   }
   return `<span style="display:none!important;visibility:hidden;opacity:0;color:transparent;height:0;width:0;overflow:hidden">${preheader}</span>
-  <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;background:#060d0b;color:#fff;border-radius:12px;overflow:hidden">
-    <div style="background:linear-gradient(135deg,#b4e05a,#5ee0a0);padding:20px 28px"><h2 style="margin:0;color:#051208;font-size:18px">${tituloEmail}</h2></div>
-    <div style="padding:28px">
-      <div style="margin-bottom:18px;padding:14px 16px;background:rgba(255,189,46,.12);border:1px solid rgba(255,189,46,.34);border-radius:12px">
-        <div style="font-size:11px;font-weight:800;letter-spacing:.12em;color:#ffbd2e;margin-bottom:6px">${avisoTitulo}</div>
-        <div style="font-size:14px;line-height:1.5;color:rgba(255,255,255,.92);font-weight:600">${avisoTexto}</div>
-        ${linkAssumir ? `<div style="margin-top:8px;font-size:12px;color:rgba(255,255,255,.52)">O primeiro médico a clicar assume o atendimento. Link válido por 2h.</div>` : ""}
-      </div>
-      <table style="width:100%;border-collapse:collapse;margin-bottom:24px">
-        <tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px;width:140px">Paciente</td><td style="padding:8px 0;font-weight:600">${nomeEmail}</td></tr>
-        <tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">WhatsApp</td><td style="padding:8px 0;font-weight:600">${telLimpo}</td></tr>
-        <tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">Modalidade</td><td style="padding:8px 0;font-weight:600">${tipoLabel}</td></tr>
-        ${horarioAgendado ? `<tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">📅 Horário</td><td style="padding:8px 0;font-weight:700;color:#b4e05a;font-size:15px">${horarioAgendado}</td></tr>` : ''}
-        <tr><td style="padding:8px 0;color:rgba(255,255,255,.5);font-size:13px">WhatsApp</td><td style="padding:8px 0"><a href="https://wa.me/55${telLimpo}" style="background:#25D366;color:#fff;padding:6px 16px;border-radius:999px;text-decoration:none;font-size:13px;font-weight:600">Chamar no WhatsApp</a></td></tr>
-      </table>
-      <table style="width:100%;border-collapse:collapse;border:1px solid rgba(255,255,255,.1);border-radius:10px">${montarTabelaTriagem(triagem)}</table>
-      ${isLembrete ? `<div style="margin:16px 0;padding:12px 16px;background:rgba(255,189,46,.08);border:1px solid rgba(255,189,46,.25);border-radius:10px;font-size:12px;color:rgba(255,189,46,.9)">⚠️ Esta triagem foi feita no momento do agendamento e pode estar desatualizada. Confirme os dados com o paciente no início da consulta.</div>` : ""}
-      <div style="margin-top:24px;text-align:center">
-        ${linkAssumir ? `
-        <a href="${linkAssumir}" style="display:inline-block;padding:14px 32px;border-radius:12px;background:linear-gradient(135deg,#b4e05a,#5ee0a0);color:#051208;font-family:Arial,sans-serif;font-size:15px;font-weight:700;text-decoration:none;margin-bottom:12px">
-          ▶ Assumir atendimento
-        </a>
-        <p style="margin:8px 0 16px;font-size:11px;color:rgba(255,255,255,.3)">Primeiro a clicar assume. Link válido por 2h.</p>` : ''}
-        <a href="https://painel.consultaja24h.com.br" style="display:inline-block;padding:11px 24px;border-radius:10px;border:1px solid rgba(255,255,255,.15);background:rgba(255,255,255,.05);color:rgba(255,255,255,.7);font-family:Arial,sans-serif;font-size:13px;font-weight:600;text-decoration:none">
-          🔑 Acessar o painel
-        </a>
-        <p style="margin:6px 0 0;font-size:11px;color:rgba(255,255,255,.2)">Entre com seu login para atender</p>
-      </div>
-      <p style="margin:20px 0 0;font-size:12px;color:rgba(255,255,255,.3)">Enviado automaticamente pelo sistema ConsultaJá24h</p>
+  <div style="font-family:Arial,sans-serif;max-width:600px;margin:0 auto;color:#17211d">
+    <p style="font-size:15px;line-height:1.5">${saudacao}</p>
+    <h2 style="margin:18px 0 8px;font-size:20px;color:#102019">${tituloEmail}</h2>
+    <p style="margin:0 0 20px;font-size:14px;line-height:1.55;color:#425049">${avisoTexto}</p>
+    <div style="padding:16px;border:1px solid #dfe8e3;border-radius:8px;background:#f8fbf9">
+      <p style="margin:0 0 8px"><strong>Paciente:</strong> ${nomeEmail}</p>
+      <p style="margin:0 0 8px"><strong>Modalidade:</strong> ${tipoLabel}</p>
+      ${horarioAgendado ? `<p style="margin:0 0 8px"><strong>Horário:</strong> ${horarioAgendado}</p>` : ""}
+      <p style="margin:0"><strong>WhatsApp:</strong> <a href="https://wa.me/55${telLimpo}" style="color:#087a49">${telLimpo}</a></p>
     </div>
+    <h3 style="margin:22px 0 10px;font-size:15px">Informações da triagem</h3>
+    <table style="width:100%;border-collapse:collapse;border:1px solid #dfe8e3">${montarTabelaTriagem(triagem)}</table>
+    ${isLembrete ? `<p style="margin:16px 0;font-size:12px;color:#72520b">Esta triagem foi feita no agendamento. Confirme os dados com o paciente no início da consulta.</p>` : ""}
+    <div style="margin-top:24px">
+        ${linkAssumir ? `
+        <a href="${linkAssumir}" style="display:inline-block;padding:13px 24px;border-radius:8px;background:#168653;color:#fff;font-size:15px;font-weight:700;text-decoration:none;margin-right:8px;margin-bottom:10px">
+          Assumir atendimento
+        </a>
+        ` : ''}
+        <a href="https://painel.consultaja24h.com.br" style="display:inline-block;padding:12px 18px;border-radius:8px;border:1px solid #cad8d1;color:#315345;font-size:13px;font-weight:600;text-decoration:none;margin-bottom:10px">
+          Abrir painel
+        </a>
+    </div>
+    <p style="margin:18px 0 0;font-size:12px;line-height:1.5;color:#718078">Equipe ConsultaJá24h</p>
   </div>`;
 }
 
