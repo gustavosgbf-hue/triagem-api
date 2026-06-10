@@ -6289,6 +6289,58 @@ app.post("/api/atendimento/reabrir", autenticarMedico, async (req, res) => {
   }
 });
 
+app.post("/api/atendimento/atualizar-paciente", autenticarMedico, async (req, res) => {
+  try {
+    const { filaId, nome, cpf } = req.body || {};
+    const atendimentoId = Number(filaId);
+    const nomeLimpo = String(nome || "").trim().replace(/\s+/g, " ");
+    const cpfLimpo = String(cpf || "").replace(/\D/g, "");
+
+    if (!Number.isInteger(atendimentoId) || atendimentoId <= 0) {
+      return res.status(400).json({ ok: false, error: "Atendimento inválido." });
+    }
+    if (nomeLimpo.length < 3 || nomeLimpo.length > 160) {
+      return res.status(400).json({ ok: false, error: "Informe o nome completo do paciente." });
+    }
+    if (!julieValidarCPF(cpfLimpo)) {
+      return res.status(400).json({ ok: false, error: "CPF inválido." });
+    }
+
+    const atual = await pool.query(
+      `SELECT id, medico_id, status
+         FROM fila_atendimentos
+        WHERE id=$1`,
+      [atendimentoId]
+    );
+    if (atual.rowCount === 0) {
+      return res.status(404).json({ ok: false, error: "Atendimento não encontrado." });
+    }
+
+    const atendimento = atual.rows[0];
+    const isAdmin = String(req.medico.email || "").toLowerCase() === "gustavosgbf@gmail.com";
+    const isMedicoResponsavel = String(atendimento.medico_id || "") === String(req.medico.id || "");
+    if (!isAdmin && !isMedicoResponsavel) {
+      return res.status(403).json({ ok: false, error: "Apenas o médico responsável pode alterar estes dados." });
+    }
+
+    const result = await pool.query(
+      `UPDATE fila_atendimentos
+          SET nome=$2, cpf=$3
+        WHERE id=$1
+        RETURNING id,nome,cpf,tel,tel_documentos,email,data_nascimento,idade,sexo,
+                  alergias,cronicas,medicacoes,queixa,solicita,tipo,triagem,status,
+                  medico_id,medico_nome,criado_em,assumido_em,encerrado_em`,
+      [atendimentoId, nomeLimpo, cpfLimpo]
+    );
+
+    console.log(`[PACIENTE-UPDATE] Atendimento #${atendimentoId} atualizado por ${req.medico.email}: ${nomeLimpo}`);
+    return res.json({ ok: true, atendimento: result.rows[0] });
+  } catch (e) {
+    console.error("[PACIENTE-UPDATE]", e.message);
+    return res.status(500).json({ ok: false, error: "Erro ao atualizar dados do paciente." });
+  }
+});
+
 app.post("/api/atendimento/prontuario", autenticarMedico, async (req, res) => {
   const { filaId, prontuario } = req.body;
   if (!filaId || prontuario === undefined) {
