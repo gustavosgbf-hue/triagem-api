@@ -1053,6 +1053,11 @@ function parsearTriagem(summary) {
     { chave: 'medicacoes',padroes: ['medicação','medicações','medicacao','medicacoes','medicamento','medicamentos','uso contínuo','uso continuo','faz uso'] },
     { chave: 'solicita',  padroes: ['solicita','solicitação','necessita','precisa','documentos','atestado','receita','pedido'] },
   ];
+  const chaveCorresponde = (chaveRaw, padrao) => (
+    padrao === 'idade'
+      ? /(?:^|\s)idade(?:$|\s)/i.test(chaveRaw)
+      : chaveRaw.includes(padrao)
+  );
 
   // Tenta extrair por linha "Chave: Valor"
   const linhas = summary.split(/[\n;]/);
@@ -1077,12 +1082,12 @@ function parsearTriagem(summary) {
     if (!valor || /^(nega|não|nao|nenhum|sem)$/i.test(valor)) {
       // Guarda negativas também
       for (const { chave, padroes } of mapa) {
-        if (padroes.some(p => chaveRaw.includes(p))) { campos[chave] = campos[chave] || valor || 'Nega'; break; }
+        if (padroes.some(p => chaveCorresponde(chaveRaw, p))) { campos[chave] = campos[chave] || valor || 'Nega'; break; }
       }
       continue;
     }
     for (const { chave, padroes } of mapa) {
-      if (padroes.some(p => chaveRaw.includes(p))) { campos[chave] = campos[chave] || valor; break; }
+      if (padroes.some(p => chaveCorresponde(chaveRaw, p))) { campos[chave] = campos[chave] || valor; break; }
     }
   }
 
@@ -1101,6 +1106,11 @@ function parsearTriagem(summary) {
     else if (/receita/i.test(summary)) campos.solicita = 'Receita';
     else if (/pedido.*exame|exame/i.test(summary)) campos.solicita = 'Pedido de exame';
     else campos.solicita = 'Não informado';
+  }
+  // No novo formato, a primeira resposta literal e a fonte mais fiel para a queixa.
+  if (!campos.queixa) {
+    const respostaLiteral = summary.match(/(?:^|\n)Resposta:\s*(.+)/i);
+    if (respostaLiteral?.[1]) campos.queixa = respostaLiteral[1].trim().slice(0, 500);
   }
   // FIX 2: fallback final para queixa — usa primeira linha não vazia do summary
   if (!campos.queixa) {
