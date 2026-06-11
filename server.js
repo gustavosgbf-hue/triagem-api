@@ -1112,6 +1112,14 @@ function parsearTriagem(summary) {
     const respostaLiteral = summary.match(/(?:^|\n)Resposta:\s*(.+)/i);
     if (respostaLiteral?.[1]) campos.queixa = respostaLiteral[1].trim().slice(0, 500);
   }
+  if (!campos.queixa && summary.includes('RELATO COMPLETO DO PACIENTE (PALAVRAS ORIGINAIS)')) {
+    const blocoLiteral = summary
+      .split('DADOS ORGANIZADOS PELA TRIAGEM')[0]
+      .replace('RELATO COMPLETO DO PACIENTE (PALAVRAS ORIGINAIS)', '')
+      .trim();
+    const primeiraResposta = blocoLiteral.split(/\n+/).map(l => l.trim()).find(Boolean);
+    if (primeiraResposta) campos.queixa = primeiraResposta.slice(0, 500);
+  }
   // FIX 2: fallback final para queixa — usa primeira linha não vazia do summary
   if (!campos.queixa) {
     const primeiraLinha = summary.split(/[\n;]/).map(l => l.trim()).find(l => l.length > 5 && !/^\{/.test(l));
