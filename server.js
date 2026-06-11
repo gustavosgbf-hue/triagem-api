@@ -827,6 +827,16 @@ async function initDB() {
     for (const [col, tipo] of cols) {
       await pool.query(`ALTER TABLE fila_atendimentos ADD COLUMN IF NOT EXISTS ${col} ${tipo}`);
     }
+    await pool.query(
+      `UPDATE fila_atendimentos
+          SET triagem = BTRIM(SPLIT_PART(triagem, 'DADOS ORGANIZADOS PELA TRIAGEM', 2))
+        WHERE triagem LIKE '%RELATO COMPLETO DO PACIENTE%'
+          AND triagem LIKE '%DADOS ORGANIZADOS PELA TRIAGEM%'
+          AND BTRIM(SPLIT_PART(triagem, 'DADOS ORGANIZADOS PELA TRIAGEM', 2)) <> ''`
+    ).then(r => {
+      if (r.rowCount) console.log(`[DB] Triagens extensas compactadas: ${r.rowCount}`);
+    }).catch(e => console.warn("[DB] Falha ao compactar triagens antigas:", e.message));
+    compactarTriagensNaPlanilha().catch(() => {});
     // ── PSICÓLOGOS: tabela e índices ──────────────────────────────────────────
     await pool.query(`CREATE TABLE IF NOT EXISTS psicologos (
       id              SERIAL PRIMARY KEY,
@@ -1039,6 +1049,34 @@ async function appendToSheet(sheetName, values) {
   }
 }
 
+async function compactarTriagensNaPlanilha() {
+  try {
+    const auth = new google.auth.GoogleAuth({ credentials: serviceAccount, scopes: ["https://www.googleapis.com/auth/spreadsheets"] });
+    const sheets = google.sheets({ version: "v4", auth });
+    const atual = await sheets.spreadsheets.values.get({
+      spreadsheetId: SPREADSHEET_ID,
+      range: "Atendimentos!G:G",
+    });
+    const updates = [];
+    (atual.data.values || []).forEach((row, index) => {
+      const original = String(row?.[0] || '');
+      if (!original.includes('RELATO COMPLETO DO PACIENTE') || !original.includes('DADOS ORGANIZADOS PELA TRIAGEM')) return;
+      const compacto = compactarTriagem(original);
+      if (compacto && compacto !== original) {
+        updates.push({ range: `Atendimentos!G${index + 1}`, values: [[compacto]] });
+      }
+    });
+    if (!updates.length) return;
+    await sheets.spreadsheets.values.batchUpdate({
+      spreadsheetId: SPREADSHEET_ID,
+      requestBody: { valueInputOption: "USER_ENTERED", data: updates },
+    });
+    console.log(`[SHEETS] Triagens extensas compactadas: ${updates.length}`);
+  } catch (e) {
+    console.warn("[SHEETS] Falha ao compactar triagens antigas:", e.message);
+  }
+}
+
 function parsearTriagem(summary) {
   if (!summary) return {};
   const campos = {};
@@ -1130,6 +1168,17 @@ function parsearTriagem(summary) {
   if (!campos.medicacoes) campos.medicacoes = 'Nega';
 
   return campos;
+}
+
+function compactarTriagem(summary) {
+  const texto = String(summary || '').trim();
+  if (!texto) return '';
+  const marcador = 'DADOS ORGANIZADOS PELA TRIAGEM';
+  if (texto.includes(marcador)) {
+    const organizado = texto.split(marcador).slice(1).join(marcador).trim();
+    if (organizado) return organizado;
+  }
+  return texto;
 }
 
 async function callOpenAI({ system, messages }) {
@@ -2136,7 +2185,8 @@ app.post("/api/atendimento/atualizar-triagem", async (req, res) => {
   try {
     const { atendimentoId, triagem, agendamentoId, nome, tel, cpf, data_nascimento, email } = req.body || {};
     if (!atendimentoId || !triagem) return res.status(400).json({ ok: false, error: "atendimentoId e triagem sao obrigatorios" });
-    const campos = parsearTriagem(triagem);
+    const triagemCompacta = compactarTriagem(triagem);
+    const campos = parsearTriagem(triagemCompacta);
     const nomeLimpo = normalizarNomePaciente(nome);
     const telLimpo = normalizarTexto(tel);
     const cpfLimpo = normalizarCpf(cpf);
@@ -2148,7 +2198,7 @@ app.post("/api/atendimento/atualizar-triagem", async (req, res) => {
       const result = await pool.query(
         `UPDATE fila_atendimentos SET triagem=$2,queixa=$3,idade=$4,sexo=$5,alergias=$6,cronicas=$7,medicacoes=$8,solicita=$9,status='aguardando'
          WHERE id=$1 AND status IN ('triagem','aguardando') RETURNING id,nome,tel,cpf,tipo,triagem,tel_documentos,medico_nome`,
-        [atendimentoId,triagem,campos.queixa||triagem,campos.idade||"",campos.sexo||"",campos.alergias||"",campos.cronicas||"",campos.medicacoes||"",campos.solicita||""]
+        [atendimentoId,triagemCompacta,campos.queixa||triagemCompacta,campos.idade||"",campos.sexo||"",campos.alergias||"",campos.cronicas||"",campos.medicacoes||"",campos.solicita||""]
       );
       if (result.rowCount === 0) return res.status(404).json({ ok: false, error: "Atendimento nao encontrado ou ja em andamento" });
       const at = await garantirNomePacienteParaFila(result.rows[0]);
@@ -2164,10 +2214,10 @@ app.post("/api/atendimento/atualizar-triagem", async (req, res) => {
         horarioAgendado = new Date(horarioAgendadoRaw).toLocaleString("pt-BR",{timeZone:"America/Fortaleza",day:"2-digit",month:"2-digit",year:"numeric",hour:"2-digit",minute:"2-digit"});
         await pool.query(`UPDATE fila_atendimentos SET horario_agendado=$1, agendamento_id=$2 WHERE id=$3`,[horarioAgendadoRaw, agendamentoId, atendimentoId]);
       }
-      appendToSheet("Atendimentos",[agora,nomeFila,at.tel||"",at.cpf||"","Aguardando","",triagem,at.tipo||"","",String(at.id)]).catch(e=>console.error("[Sheets]",e));
-      if (!isTriagemPlaceholder(triagem)) {
+      appendToSheet("Atendimentos",[agora,nomeFila,at.tel||"",at.cpf||"","Aguardando","",triagemCompacta,at.tipo||"","",String(at.id)]).catch(e=>console.error("[Sheets]",e));
+      if (!isTriagemPlaceholder(triagemCompacta)) {
         await enviarEmailMedicos({
-          nome: nomeFila, tel: at.tel, tipo: at.tipo, triagem, linkRetorno,
+          nome: nomeFila, tel: at.tel, tipo: at.tipo, triagem: triagemCompacta, linkRetorno,
           atendimentoId: at.id, horarioAgendado, horarioAgendadoRaw,
           subject: "Agendamento - " + nomeFila + " (" + tipoLabel + ") - " + horarioAgendado
         });
@@ -2224,7 +2274,7 @@ app.post("/api/atendimento/atualizar-triagem", async (req, res) => {
               email=COALESCE($15,email)
         WHERE id=$1 AND status IN ('triagem','aguardando','aguardando_aprovacao','pagamento_pendente')
         RETURNING id,nome,tel,cpf,tipo,triagem,tel_documentos`,
-      [atendimentoId, triagem, campos.queixa||triagem, campos.idade||"", campos.sexo||"",
+      [atendimentoId, triagemCompacta, campos.queixa||triagemCompacta, campos.idade||"", campos.sexo||"",
        campos.alergias||"", campos.cronicas||"", campos.medicacoes||"", campos.solicita||"",
        novoStatus, nomeLimpo, telLimpo, cpfLimpo, dataNascLimpa, emailLimpo]
     );
