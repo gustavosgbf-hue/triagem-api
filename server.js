@@ -1057,21 +1057,55 @@ async function compactarTriagensNaPlanilha() {
       spreadsheetId: SPREADSHEET_ID,
       range: "Atendimentos!G:G",
     });
+    const metadata = await sheets.spreadsheets.get({
+      spreadsheetId: SPREADSHEET_ID,
+      fields: "sheets.properties",
+    });
+    const sheetId = metadata.data.sheets?.find(s => s.properties?.title === "Atendimentos")?.properties?.sheetId;
     const updates = [];
     (atual.data.values || []).forEach((row, index) => {
       const original = String(row?.[0] || '');
-      if (!original.includes('RELATO COMPLETO DO PACIENTE') || !original.includes('DADOS ORGANIZADOS PELA TRIAGEM')) return;
-      const compacto = compactarTriagem(original);
+      if (!original || (!original.includes('\n') && !/^(?:queixa|problema|motivo)\s*(?:principal)?\s*:/i.test(original))) return;
+      const compacto = triagemParaPlanilha(original);
       if (compacto && compacto !== original) {
         updates.push({ range: `Atendimentos!G${index + 1}`, values: [[compacto]] });
       }
     });
-    if (!updates.length) return;
-    await sheets.spreadsheets.values.batchUpdate({
-      spreadsheetId: SPREADSHEET_ID,
-      requestBody: { valueInputOption: "USER_ENTERED", data: updates },
-    });
-    console.log(`[SHEETS] Triagens extensas compactadas: ${updates.length}`);
+    if (updates.length) {
+      await sheets.spreadsheets.values.batchUpdate({
+        spreadsheetId: SPREADSHEET_ID,
+        requestBody: { valueInputOption: "USER_ENTERED", data: updates },
+      });
+    }
+    if (sheetId !== undefined) {
+      await sheets.spreadsheets.batchUpdate({
+        spreadsheetId: SPREADSHEET_ID,
+        requestBody: {
+          requests: [
+            {
+              repeatCell: {
+                range: { sheetId, startColumnIndex: 6, endColumnIndex: 7 },
+                cell: { userEnteredFormat: { wrapStrategy: "CLIP" } },
+                fields: "userEnteredFormat.wrapStrategy",
+              },
+            },
+            {
+              updateDimensionProperties: {
+                range: {
+                  sheetId,
+                  dimension: "ROWS",
+                  startIndex: 1,
+                  endIndex: Math.max(2, atual.data.values?.length || 2),
+                },
+                properties: { pixelSize: 24 },
+                fields: "pixelSize",
+              },
+            },
+          ],
+        },
+      });
+    }
+    console.log(`[SHEETS] Triagens compactadas: ${updates.length}; formato de linhas restaurado.`);
   } catch (e) {
     console.warn("[SHEETS] Falha ao compactar triagens antigas:", e.message);
   }
@@ -1179,6 +1213,17 @@ function compactarTriagem(summary) {
     if (organizado) return organizado;
   }
   return texto;
+}
+
+function triagemParaPlanilha(summary, queixaPreferencial = '') {
+  const texto = compactarTriagem(summary);
+  if (!texto && !queixaPreferencial) return '';
+  const campos = parsearTriagem(texto);
+  const queixa = String(queixaPreferencial || campos.queixa || texto)
+    .replace(/^(?:queixa|problema|motivo)\s*(?:principal)?\s*:\s*/i, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return queixa.slice(0, 500);
 }
 
 async function callOpenAI({ system, messages }) {
@@ -2141,7 +2186,7 @@ async function notificarMedicos(at) {
 
   appendToSheet("Atendimentos", [
     agora, nomeFila, at.tel||"", at.cpf||"",
-    "Aguardando", "", at.triagem||"", at.tipo||"", "", String(at.id)
+    "Aguardando", "", triagemParaPlanilha(at.triagem, at.queixa), at.tipo||"", "", String(at.id)
   ]).catch(() => {});
 
   await enviarEmailMedicos({
@@ -2172,7 +2217,7 @@ async function liberarAtendimentoParaMedicos(atendimentoId) {
   const linkRetorno = `${SITE_URL}/triagem.html?consulta=${at.id}`;
   const tipoLabel = at.tipo === "video" ? "Video" : "Chat";
   const agora = new Date().toLocaleString("pt-BR", { timeZone: "America/Fortaleza" });
-  appendToSheet("Atendimentos",[agora,nomeFila,at.tel||"",at.cpf||"","Aguardando","",at.triagem||"",at.tipo||"","",String(at.id)]).catch(()=>{});
+  appendToSheet("Atendimentos",[agora,nomeFila,at.tel||"",at.cpf||"","Aguardando","",triagemParaPlanilha(at.triagem, at.queixa),at.tipo||"","",String(at.id)]).catch(()=>{});
   await enviarEmailMedicos({
     nome: nomeFila, tel: at.tel, tipo: at.tipo, triagem: at.triagem, linkRetorno,
     atendimentoId: at.id, horarioAgendado: null, horarioAgendadoRaw: null,
@@ -2214,7 +2259,7 @@ app.post("/api/atendimento/atualizar-triagem", async (req, res) => {
         horarioAgendado = new Date(horarioAgendadoRaw).toLocaleString("pt-BR",{timeZone:"America/Fortaleza",day:"2-digit",month:"2-digit",year:"numeric",hour:"2-digit",minute:"2-digit"});
         await pool.query(`UPDATE fila_atendimentos SET horario_agendado=$1, agendamento_id=$2 WHERE id=$3`,[horarioAgendadoRaw, agendamentoId, atendimentoId]);
       }
-      appendToSheet("Atendimentos",[agora,nomeFila,at.tel||"",at.cpf||"","Aguardando","",triagemCompacta,at.tipo||"","",String(at.id)]).catch(e=>console.error("[Sheets]",e));
+      appendToSheet("Atendimentos",[agora,nomeFila,at.tel||"",at.cpf||"","Aguardando","",triagemParaPlanilha(triagemCompacta, campos.queixa),at.tipo||"","",String(at.id)]).catch(e=>console.error("[Sheets]",e));
       if (!isTriagemPlaceholder(triagemCompacta)) {
         await enviarEmailMedicos({
           nome: nomeFila, tel: at.tel, tipo: at.tipo, triagem: triagemCompacta, linkRetorno,
@@ -2553,7 +2598,7 @@ app.post("/api/notify", rlTriagem, async (req, res) => {
     const linkRetorno = `${SITE_URL}/triagem.html?consulta=${novoAtendimentoId}`;
     const agora = new Date().toLocaleString("pt-BR",{timeZone:"America/Fortaleza"});
     if (!triagemPlaceholder) {
-      appendToSheet("Atendimentos",[agora,nomeLimpo||"",telLimpo||"",cpfLimpo||"",statusInicial,"",triagemTexto,tipoConsulta||"","",String(novoAtendimentoId)]).catch(e=>console.error("[Sheets]",e));
+      appendToSheet("Atendimentos",[agora,nomeLimpo||"",telLimpo||"",cpfLimpo||"",statusInicial,"",triagemParaPlanilha(triagemTexto, campos.queixa),tipoConsulta||"","",String(novoAtendimentoId)]).catch(e=>console.error("[Sheets]",e));
     } else {
       console.log("[SHEETS] Pre-registro suprimido em Atendimentos — atendimento #" + novoAtendimentoId);
     }
@@ -6204,7 +6249,7 @@ app.post("/api/atendimento/assumir", async (req, res) => {
     }
 
     const agora2 = new Date().toLocaleString("pt-BR",{timeZone:"America/Fortaleza"});
-    appendToSheet("Atendimentos",[agora2,at2.nome||"",at2.tel||"",at2.cpf||"","Assumido",medicoNome||"",at2.triagem||"",at2.tipo||"","",String(filaId)]).catch(e=>console.error("[Sheets]",e));
+    appendToSheet("Atendimentos",[agora2,at2.nome||"",at2.tel||"",at2.cpf||"","Assumido",medicoNome||"",triagemParaPlanilha(at2.triagem, at2.queixa),at2.tipo||"","",String(filaId)]).catch(e=>console.error("[Sheets]",e));
     return res.json({ ok: true, atendimento: at2 });
   } catch (err) { return res.status(500).json({ ok: false, error: "Erro ao assumir atendimento" }); }
 });
@@ -6320,7 +6365,7 @@ app.post("/api/atendimento/encerrar", async (req, res) => {
     if (result.rowCount===0) return res.status(404).json({ ok: false, error: "Atendimento nao encontrado" });
     const at = result.rows[0];
     const agora = new Date().toLocaleString("pt-BR",{timeZone:"America/Fortaleza"});
-    appendToSheet("Atendimentos",[agora,at.nome||"",at.tel||"",at.cpf||"","Encerrado",at.medico_nome||"",at.triagem||"",at.tipo||"",at.documentos_emitidos||"",String(at.id)]).catch(e=>console.error("[Sheets]",e));
+    appendToSheet("Atendimentos",[agora,at.nome||"",at.tel||"",at.cpf||"","Encerrado",at.medico_nome||"",triagemParaPlanilha(at.triagem, at.queixa),at.tipo||"",at.documentos_emitidos||"",String(at.id)]).catch(e=>console.error("[Sheets]",e));
     return res.json({ ok: true, atendimento: at });
   } catch (err) { console.error("Erro em /api/atendimento/encerrar:", err); return res.status(500).json({ ok: false, error: "Erro ao encerrar atendimento" }); }
 });
