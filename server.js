@@ -776,6 +776,19 @@ async function initDB() {
             OR LOWER(COALESCE(email,'')) LIKE '%@test.com'
           )`
     ).catch(e => console.warn("[DB] Limpeza cadastros pentest:", e.message));
+    await pool.query(
+      `DELETE FROM medicos
+        WHERE LOWER(TRIM(email)) = ANY($1::text[])
+          AND status IN ('pendente', 'rejeitado', 'bloqueado')`,
+      [[
+        "proto@test.com",
+        "autoaprovado@test.com",
+        "banktest_pentest@proton.me",
+        "pentestmedico@proton.me"
+      ]]
+    ).then(r => {
+      if (r.rowCount) console.log(`[DB] Cadastros de pentest excluidos: ${r.rowCount}`);
+    }).catch(e => console.warn("[DB] Exclusao cadastros pentest:", e.message));
     const cols = [
       ['status_atendimento','TEXT'],['documentos_emitidos','TEXT'],['meet_link','TEXT'],
       ['tel_documentos','TEXT'],['idade','TEXT'],['sexo','TEXT'],['alergias','TEXT'],
