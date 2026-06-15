@@ -8406,17 +8406,17 @@ function normalizarObjetoJson(valor) {
 function fallbackFreteRenovacao(cepDestino) {
   const prefixo = parseInt(String(cepDestino || "").replace(/\D/g, "").slice(0, 2), 10) || 0;
   let tabela;
-  if (prefixo >= 1 && prefixo <= 19) tabela = { sedex: 145, prazoSedex: 5 };
-  else if (prefixo >= 20 && prefixo <= 39) tabela = { sedex: 130, prazoSedex: 5 };
-  else if (prefixo >= 40 && prefixo <= 49) tabela = { sedex: 75, prazoSedex: 4 };
-  else if (prefixo >= 50 && prefixo <= 59) tabela = { sedex: 65, prazoSedex: 3 };
-  else if (prefixo >= 60 && prefixo <= 65) tabela = { sedex: 45, prazoSedex: 3 };
-  else if (prefixo >= 66 && prefixo <= 69) tabela = { sedex: 100, prazoSedex: 6 };
-  else if (prefixo >= 70 && prefixo <= 79) tabela = { sedex: 110, prazoSedex: 6 };
-  else if (prefixo >= 80 && prefixo <= 99) tabela = { sedex: 155, prazoSedex: 7 };
-  else tabela = { sedex: 100, prazoSedex: 6 };
+  if (prefixo >= 1 && prefixo <= 19) tabela = { sedex: 145 };
+  else if (prefixo >= 20 && prefixo <= 39) tabela = { sedex: 130 };
+  else if (prefixo >= 40 && prefixo <= 49) tabela = { sedex: 75 };
+  else if (prefixo >= 50 && prefixo <= 59) tabela = { sedex: 65 };
+  else if (prefixo >= 60 && prefixo <= 65) tabela = { sedex: 45 };
+  else if (prefixo >= 66 && prefixo <= 69) tabela = { sedex: 100 };
+  else if (prefixo >= 70 && prefixo <= 79) tabela = { sedex: 110 };
+  else if (prefixo >= 80 && prefixo <= 99) tabela = { sedex: 155 };
+  else tabela = { sedex: 100 };
   return [
-    { id: "2", nome: "SEDEX", valor: tabela.sedex, prazo: tabela.prazoSedex, transportadora: "Correios" },
+    { id: "2", nome: "SEDEX", valor: tabela.sedex, prazo: 4, transportadora: "Correios" },
     { id: "envelope_comum", nome: "ENVELOPE COMUM", valor: 10, prazo: 15, transportadora: "Correios" }
   ];
 }
