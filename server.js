@@ -8406,7 +8406,7 @@ function normalizarObjetoJson(valor) {
 function fallbackFreteRenovacao(cepDestino) {
   const prefixo = parseInt(String(cepDestino || "").replace(/\D/g, "").slice(0, 2), 10) || 0;
   let tabela;
-  if (prefixo >= 1 && prefixo <= 19) tabela = { sedex: 135, pac: 78, ps: 5, pp: 11 };
+  if (prefixo >= 1 && prefixo <= 19) tabela = { sedex: 145, pac: 80, ps: 5, pp: 12 };
   else if (prefixo >= 20 && prefixo <= 39) tabela = { sedex: 130, pac: 75, ps: 5, pp: 11 };
   else if (prefixo >= 40 && prefixo <= 49) tabela = { sedex: 75, pac: 45, ps: 4, pp: 9 };
   else if (prefixo >= 50 && prefixo <= 59) tabela = { sedex: 65, pac: 40, ps: 3, pp: 8 };
@@ -8549,32 +8549,10 @@ app.post("/api/correios/calcular-frete", rlGeral, async (req, res) => {
   try {
     const cepDestino = String(req.body?.cep_destino || "").replace(/\D/g, "");
     if (cepDestino.length !== 8) return res.status(400).json({ ok: false, error: "CEP inválido" });
-    if (ME_TOKEN) {
-      try {
-        const response = await fetch(`${ME_BASE}/me/shipment/calculate`, {
-          method: "POST",
-          headers: { Authorization: `Bearer ${ME_TOKEN}`, Accept: "application/json", "Content-Type": "application/json", "User-Agent": "ConsultaJa24h (gustavosgbf@gmail.com)" },
-          body: JSON.stringify({
-            from: { postal_code: ME_FROM_CEP },
-            to: { postal_code: cepDestino },
-            package: { height: 2, width: 12, length: 17, weight: 0.1 },
-            options: { receipt: false, own_hand: false, insurance_value: 0 },
-            services: "1,2"
-          })
-        });
-        const data = await response.json();
-        if (response.ok && Array.isArray(data)) {
-          const servicos = data
-            .filter(s => !s.error && s.price && s.delivery_time && ["PAC", "SEDEX"].includes(String(s.name).toUpperCase()))
-            .map(s => ({ id: String(s.id), nome: s.name, valor: parseFloat(s.custom_price || s.price), prazo: parseInt(s.custom_delivery_time || s.delivery_time, 10), transportadora: s.company?.name || "Correios" }))
-            .sort((a, b) => b.valor - a.valor);
-          if (servicos.length) return res.json({ ok: true, fonte: "melhor_envio", servicos, margem_logistica: FRETE_MARGEM_LOGISTICA });
-        }
-      } catch (e) {
-        console.warn("[RENOVACAO-FRETE] Melhor Envio falhou:", e.message);
-      }
-    }
-    return res.json({ ok: true, fonte: "fallback", servicos: fallbackFreteRenovacao(cepDestino), margem_logistica: FRETE_MARGEM_LOGISTICA });
+    // A cotação do Melhor Envio só pode ser oferecida quando a plataforma
+    // também comprar a etiqueta. Até lá, usamos estimativa de postagem no
+    // balcão para não cobrar do paciente um desconto indisponível na agência.
+    return res.json({ ok: true, fonte: "correios_balcao_estimado", servicos: fallbackFreteRenovacao(cepDestino), margem_logistica: FRETE_MARGEM_LOGISTICA });
   } catch (e) {
     console.error("[RENOVACAO-FRETE]", e.message);
     return res.status(500).json({ ok: false, error: "Erro ao calcular frete" });
@@ -8587,6 +8565,15 @@ app.post("/api/renovacao/criar-pre", rlGeral, async (req, res) => {
     if (!nome || !tel || !cpf || !tipo_renovacao || !medicamentos) return res.status(400).json({ ok: false, error: "Campos obrigatórios faltando" });
     if (!["digital", "fisica"].includes(tipo_renovacao)) return res.status(400).json({ ok: false, error: "tipo_renovacao inválido" });
     if (tipo_renovacao === "fisica" && (!endereco_envio || !frete_modalidade || !frete_valor)) return res.status(400).json({ ok: false, error: "Endereço e frete obrigatórios para receita física" });
+    let freteConfirmado = null;
+    if (tipo_renovacao === "fisica") {
+      const cepDestino = String(endereco_envio?.cep || "").replace(/\D/g, "");
+      if (cepDestino.length !== 8) return res.status(400).json({ ok: false, error: "CEP de envio inválido" });
+      const modalidadeSolicitada = String(frete_modalidade || "").toUpperCase();
+      freteConfirmado = fallbackFreteRenovacao(cepDestino)
+        .find(servico => servico.nome === modalidadeSolicitada);
+      if (!freteConfirmado) return res.status(400).json({ ok: false, error: "Modalidade de frete inválida" });
+    }
     const tipoFila = tipo_renovacao === "fisica" ? "renovacao_fisica" : "renovacao_digital";
     const triagem = `RENOVAÇÃO DE RECEITA — ${tipo_renovacao.toUpperCase()}\n\nMedicamentos solicitados:\n${medicamentos}`;
     const result = await pool.query(
@@ -8599,10 +8586,10 @@ app.post("/api/renovacao/criar-pre", rlGeral, async (req, res) => {
         nome.trim(), tel, tel, String(cpf).replace(/\D/g, ""), tipoFila, triagem,
         `Renovação de receita (${tipo_renovacao})`, medicamentos, data_nascimento || "", email || null,
         endereco_envio ? JSON.stringify(endereco_envio) : null,
-        tipo_renovacao === "fisica" ? parseFloat(frete_valor) : null,
-        frete_modalidade || null,
-        frete_servico_id ? String(frete_servico_id) : null,
-        frete_prazo_dias ? parseInt(frete_prazo_dias, 10) : null,
+        freteConfirmado?.valor ?? null,
+        freteConfirmado?.nome || null,
+        freteConfirmado?.id || null,
+        freteConfirmado?.prazo ?? null,
         questionario ? JSON.stringify(questionario) : null
       ]
     );
