@@ -8417,7 +8417,7 @@ function fallbackFreteRenovacao(cepDestino) {
   else tabela = { sedex: 100 };
   return [
     { id: "2", nome: "SEDEX", valor: tabela.sedex, prazo: 4, transportadora: "Correios" },
-    { id: "envelope_comum", nome: "ENVELOPE COMUM", valor: 10, prazo: 15, transportadora: "Correios" }
+    { id: "carta_registrada", nome: "CARTA REGISTRADA", valor: 25, prazo: 15, transportadora: "Correios" }
   ];
 }
 
