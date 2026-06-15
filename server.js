@@ -8406,18 +8406,18 @@ function normalizarObjetoJson(valor) {
 function fallbackFreteRenovacao(cepDestino) {
   const prefixo = parseInt(String(cepDestino || "").replace(/\D/g, "").slice(0, 2), 10) || 0;
   let tabela;
-  if (prefixo >= 1 && prefixo <= 19) tabela = { sedex: 145, pac: 80, ps: 5, pp: 12 };
-  else if (prefixo >= 20 && prefixo <= 39) tabela = { sedex: 130, pac: 75, ps: 5, pp: 11 };
-  else if (prefixo >= 40 && prefixo <= 49) tabela = { sedex: 75, pac: 45, ps: 4, pp: 9 };
-  else if (prefixo >= 50 && prefixo <= 59) tabela = { sedex: 65, pac: 40, ps: 3, pp: 8 };
-  else if (prefixo >= 60 && prefixo <= 65) tabela = { sedex: 45, pac: 28, ps: 3, pp: 7 };
-  else if (prefixo >= 66 && prefixo <= 69) tabela = { sedex: 100, pac: 60, ps: 6, pp: 12 };
-  else if (prefixo >= 70 && prefixo <= 79) tabela = { sedex: 110, pac: 65, ps: 6, pp: 12 };
-  else if (prefixo >= 80 && prefixo <= 99) tabela = { sedex: 155, pac: 90, ps: 7, pp: 13 };
-  else tabela = { sedex: 100, pac: 60, ps: 6, pp: 12 };
+  if (prefixo >= 1 && prefixo <= 19) tabela = { sedex: 145, prazoSedex: 5 };
+  else if (prefixo >= 20 && prefixo <= 39) tabela = { sedex: 130, prazoSedex: 5 };
+  else if (prefixo >= 40 && prefixo <= 49) tabela = { sedex: 75, prazoSedex: 4 };
+  else if (prefixo >= 50 && prefixo <= 59) tabela = { sedex: 65, prazoSedex: 3 };
+  else if (prefixo >= 60 && prefixo <= 65) tabela = { sedex: 45, prazoSedex: 3 };
+  else if (prefixo >= 66 && prefixo <= 69) tabela = { sedex: 100, prazoSedex: 6 };
+  else if (prefixo >= 70 && prefixo <= 79) tabela = { sedex: 110, prazoSedex: 6 };
+  else if (prefixo >= 80 && prefixo <= 99) tabela = { sedex: 155, prazoSedex: 7 };
+  else tabela = { sedex: 100, prazoSedex: 6 };
   return [
-    { id: "2", nome: "SEDEX", valor: tabela.sedex, prazo: tabela.ps, transportadora: "Correios" },
-    { id: "1", nome: "PAC", valor: tabela.pac, prazo: tabela.pp, transportadora: "Correios" }
+    { id: "2", nome: "SEDEX", valor: tabela.sedex, prazo: tabela.prazoSedex, transportadora: "Correios" },
+    { id: "envelope_comum", nome: "ENVELOPE COMUM", valor: 10, prazo: 15, transportadora: "Correios" }
   ];
 }
 
