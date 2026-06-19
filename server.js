@@ -46,7 +46,7 @@ app.use(cors({
 app.use(express.json({ limit: "1mb" }));
 
 const RESEND_DEFAULT_FROM = process.env.RESEND_DEFAULT_FROM || "ConsultaJá24h <contato@consultaja24h.com.br>";
-const RESEND_FILA_FROM = "Plantão ConsultaJá24h <contato@consultaja24h.com.br>";
+const RESEND_FILA_FROM = process.env.RESEND_FILA_FROM || "ConsultaJá24h Fila <fila@consultaja24h.com.br>";
 
 async function enviarResendComFallback({ apiKey, from, fallbackFrom = RESEND_DEFAULT_FROM, to, subject, html, text, headers, replyTo, tag }) {
   const payload = { from, to, subject, html };
@@ -1813,7 +1813,8 @@ async function enviarEmailMedicos({ nome, tel, tipo, triagem, linkRetorno, subje
           "X-Priority": "1",
           "Priority": "urgent",
           "Importance": "high",
-          "X-MSMail-Priority": "High"
+          "X-MSMail-Priority": "High",
+          "X-Entity-Ref-ID": `fila-${atendimentoId || "sem-id"}-${med.id || 0}-${Date.now()}`
         },
         tag: horarioAgendado ? "agendamento-pronto" : "paciente-fila"
       });
@@ -1828,6 +1829,50 @@ async function enviarEmailMedicos({ nome, tel, tipo, triagem, linkRetorno, subje
     console.error("[EMAIL] Erro:", e.message);
   }
 }
+
+async function reenviarEmailsFilaAtual({ limit = 10 } = {}) {
+  const limite = Math.min(20, Math.max(1, parseInt(limit, 10) || 10));
+  const SITE_URL = process.env.SITE_URL || "https://consultaja24h.com.br";
+  const { rows } = await pool.query(
+    `SELECT id,nome,tel,cpf,tipo,triagem,queixa,tel_documentos
+       FROM fila_atendimentos
+      WHERE status = 'aguardando'
+        AND pagamento_status = 'confirmado'
+        AND tipo IN ('chat','video')
+      ORDER BY criado_em ASC
+      LIMIT $1`,
+    [limite]
+  );
+
+  const enviados = [];
+  for (const at of rows) {
+    const nomeFila = normalizarNomePaciente(at.nome) || "Nome não informado";
+    const linkRetorno = `${SITE_URL}/triagem.html?consulta=${at.id}`;
+    await enviarEmailMedicos({
+      nome: nomeFila,
+      tel: at.tel,
+      tipo: at.tipo,
+      triagem: at.triagem,
+      linkRetorno,
+      atendimentoId: at.id,
+      horarioAgendado: null,
+      horarioAgendadoRaw: null,
+      subject: `PACIENTE NOVO NA FILA - ${nomeFila}`
+    });
+    enviados.push({ id: at.id, nome: nomeFila, tipo: at.tipo });
+  }
+  return enviados;
+}
+
+app.post("/api/admin/fila/reenviar-emails", checkAdmin, async (req, res) => {
+  try {
+    const enviados = await reenviarEmailsFilaAtual({ limit: req.body?.limit || req.query.limit || 10 });
+    return res.json({ ok: true, total: enviados.length, enviados });
+  } catch (e) {
+    console.error("[EMAIL-FILA-REENVIAR] Erro:", e.message);
+    return res.status(500).json({ ok: false, error: "erro_ao_reenviar_emails_fila" });
+  }
+});
 
 // ── E-MAIL: novo cadastro de médico (só para o admin) ──────────────────────────
 async function enviarEmailNovoCadastroMedico({ nome, email, crm, uf, especialidade, telefone }) {
@@ -2207,7 +2252,7 @@ async function notificarMedicos(at) {
     triagem: at.triagem, linkRetorno,
     atendimentoId: at.id,
     horarioAgendado: null, horarioAgendadoRaw: null,
-    subject: "Paciente aguardando atendimento — " + nomeFila
+    subject: "PACIENTE NOVO NA FILA - " + nomeFila
   });
 
   console.log("[NOTIFICACAO] Medicos notificados — atendimento #" + at.id);
@@ -2234,7 +2279,7 @@ async function liberarAtendimentoParaMedicos(atendimentoId) {
   await enviarEmailMedicos({
     nome: nomeFila, tel: at.tel, tipo: at.tipo, triagem: at.triagem, linkRetorno,
     atendimentoId: at.id, horarioAgendado: null, horarioAgendadoRaw: null,
-    subject: `Paciente aguardando atendimento — ${nomeFila} (${tipoLabel})`
+    subject: `PACIENTE NOVO NA FILA - ${nomeFila} (${tipoLabel})`
   });
   console.log(`[LIBERADO] Atendimento #${atendimentoId} liberado para médicos.`);
 }
