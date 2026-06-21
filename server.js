@@ -6053,8 +6053,10 @@ app.get("/api/admin/historico", checkAdmin, async (req, res) => {
     if (data_fim) { params.push(data_fim); where += ` AND criado_em < ($${params.length}::date + interval '1 day')`; }
     if (busca) { params.push(`%${busca}%`); where += ` AND (nome ILIKE $${params.length} OR tel ILIKE $${params.length} OR cpf ILIKE $${params.length})`; }
     const result = await pool.query(
-      `SELECT id,nome,tel,cpf,tipo,triagem,status,medico_id,medico_nome,prontuario,
-              criado_em,assumido_em,encerrado_em,data_nascimento,idade,sexo,solicita,status_atendimento
+      `SELECT id,nome,tel,tel_documentos,cpf,email,tipo,triagem,queixa,status,medico_id,medico_nome,prontuario,
+              criado_em,assumido_em,encerrado_em,data_nascimento,idade,sexo,alergias,cronicas,medicacoes,
+              solicita,status_atendimento,documentos_emitidos,questionario,anexos_urls,endereco_envio,
+              frete_modalidade,frete_valor
        FROM fila_atendimentos ${where} ORDER BY criado_em DESC LIMIT 200`,
       params
     );
