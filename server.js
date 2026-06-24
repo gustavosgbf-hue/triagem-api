@@ -800,6 +800,10 @@ async function initDB() {
       ['agendamento_id','INTEGER'],
       ['horario_agendado','TIMESTAMP'],
       ['email','TEXT'],
+      ['atendimento_para_terceiro','BOOLEAN NOT NULL DEFAULT false'],
+      ['pagador_nome','TEXT'],
+      ['pagador_cpf','TEXT'],
+      ['pagador_email','TEXT'],
       ['aprovacao_token','TEXT'],
       ['pagamento_status','TEXT NOT NULL DEFAULT \'pendente\''],
       ['pagbank_order_id','TEXT'],
@@ -1457,7 +1461,10 @@ if (!PAGBANK_TOKEN) console.error("[PAGBANK] Token não configurado");
 
 app.post("/api/pagbank/order", async (req, res) => {
   try {
-    const { nome, email, cpf, atendimentoId } = req.body || {};
+    const {
+      nome, email, cpf, atendimentoId,
+      paciente_nome, paciente_cpf, atendimento_para_terceiro
+    } = req.body || {};
     const adsAttribution = normalizarAdsAttribution(req.body?.ads || req.body?.attribution || {}, req);
     if (!nome || !cpf) return res.status(400).json({ ok: false, error: "nome e cpf obrigatorios" });
     if (!PAGBANK_TOKEN) return res.status(503).json({ ok: false, error: "Gateway de pagamento indisponivel" });
@@ -1521,11 +1528,26 @@ app.post("/api/pagbank/order", async (req, res) => {
     if (atendimentoIdNum) {
       const vinc = await pool.query(
         `UPDATE fila_atendimentos
-            SET pagbank_order_id = $2
+            SET pagbank_order_id = $2,
+                pagador_nome = $3,
+                pagador_cpf = $4,
+                pagador_email = $5,
+                atendimento_para_terceiro = COALESCE($6, atendimento_para_terceiro),
+                nome = COALESCE($7, nome),
+                cpf = COALESCE($8, cpf)
           WHERE id = $1
             AND pagamento_status = 'pendente'
           RETURNING id`,
-        [atendimentoIdNum, data.id]
+        [
+          atendimentoIdNum,
+          data.id,
+          nomeClean || null,
+          normalizarCpf(cpf),
+          normalizarEmail(email),
+          atendimento_para_terceiro === true || atendimento_para_terceiro === "true",
+          normalizarNomePaciente(paciente_nome),
+          normalizarCpf(paciente_cpf)
+        ]
       );
       if (vinc.rowCount === 0) {
         return res.status(409).json({ ok: false, error: "Nao foi possivel vincular PIX ao atendimento" });
@@ -2581,7 +2603,10 @@ app.get("/api/paciente/buscar", rlGeral, async (req, res) => {
 
 app.post("/api/notify", rlTriagem, async (req, res) => {
   try {
-    const { atendimentoId, nome, tel, tel_documentos, cpf, triagem, tipo, data_nascimento, email } = req.body || {};
+    const {
+      atendimentoId, nome, tel, tel_documentos, cpf, triagem, tipo, data_nascimento, email,
+      atendimento_para_terceiro, pagador_nome, pagador_cpf, pagador_email
+    } = req.body || {};
     const adsAttribution = normalizarAdsAttribution(req.body?.ads || req.body?.attribution || {}, req);
     const tipoConsulta = tipo === "video" ? "video" : "chat";
     const SITE_URL = process.env.SITE_URL || "https://consultaja24h.com.br";
@@ -2594,6 +2619,10 @@ app.post("/api/notify", rlTriagem, async (req, res) => {
     const cpfLimpo = normalizarCpf(cpf);
     const dataNascLimpa = normalizarTexto(data_nascimento);
     const emailLimpo = normalizarEmail(email);
+    const atendimentoTerceiro = atendimento_para_terceiro === true || atendimento_para_terceiro === "true";
+    const pagadorNomeLimpo = normalizarNomePaciente(pagador_nome);
+    const pagadorCpfLimpo = normalizarCpf(pagador_cpf);
+    const pagadorEmailLimpo = normalizarEmail(pagador_email);
 
     if (atendimentoId) {
       const updateResult = await pool.query(
@@ -2615,13 +2644,18 @@ app.post("/api/notify", rlTriagem, async (req, res) => {
                 cronicas = CASE WHEN $15 = false THEN $12 ELSE cronicas END,
                 medicacoes = CASE WHEN $15 = false THEN $13 ELSE medicacoes END,
                 data_nascimento = COALESCE($14, data_nascimento),
-                email = COALESCE($16, email)
+                email = COALESCE($16, email),
+                atendimento_para_terceiro = COALESCE($17, atendimento_para_terceiro),
+                pagador_nome = COALESCE($18, pagador_nome),
+                pagador_cpf = COALESCE($19, pagador_cpf),
+                pagador_email = COALESCE($20, pagador_email)
           WHERE id = $1
           RETURNING id, nome, tel, cpf, tipo, triagem, status`,
         [atendimentoId, nomeLimpo, telLimpo, telDocLimpo, cpfLimpo, tipoConsulta,
          triagemTexto, campos.queixa||triagemTexto||"", campos.idade||"", campos.sexo||"",
          campos.alergias||"", campos.cronicas||"", campos.medicacoes||"", dataNascLimpa,
-         triagemPlaceholder, emailLimpo]
+         triagemPlaceholder, emailLimpo, atendimentoTerceiro, pagadorNomeLimpo,
+         pagadorCpfLimpo, pagadorEmailLimpo]
       );
 
       if (updateResult.rowCount === 0) {
@@ -2646,10 +2680,14 @@ app.post("/api/notify", rlTriagem, async (req, res) => {
     }
     const statusInicial = triagemPlaceholder ? 'pagamento_pendente' : 'aguardando';
     const insertResult = await pool.query(
-      `INSERT INTO fila_atendimentos (nome,tel,tel_documentos,cpf,tipo,triagem,status,queixa,idade,sexo,alergias,cronicas,medicacoes,data_nascimento,email)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING id`,
+      `INSERT INTO fila_atendimentos (
+         nome,tel,tel_documentos,cpf,tipo,triagem,status,queixa,idade,sexo,alergias,cronicas,
+         medicacoes,data_nascimento,email,atendimento_para_terceiro,pagador_nome,pagador_cpf,pagador_email
+       )
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19) RETURNING id`,
       [nomeLimpo||"Paciente",telLimpo||"-",telDocLimpo||telLimpo||"-",cpfLimpo||"",tipoConsulta,triagemTexto,statusInicial,
-       campos.queixa||triagemTexto||"",campos.idade||"",campos.sexo||"",campos.alergias||"",campos.cronicas||"",campos.medicacoes||"",dataNascLimpa||"",emailLimpo]
+       campos.queixa||triagemTexto||"",campos.idade||"",campos.sexo||"",campos.alergias||"",campos.cronicas||"",
+       campos.medicacoes||"",dataNascLimpa||"",emailLimpo,atendimentoTerceiro,pagadorNomeLimpo,pagadorCpfLimpo,pagadorEmailLimpo]
     );
     const novoAtendimentoId = insertResult.rows[0]?.id;
     await salvarAdsAttribution(novoAtendimentoId, adsAttribution, req);
@@ -6916,7 +6954,10 @@ app.post("/api/efi/cartao/cobrar", rlGeral, async (req, res) => {
       telefone,
       nascimento,
       parcelas = 1,
-      atendimentoId
+      atendimentoId,
+      paciente_nome,
+      paciente_cpf,
+      atendimento_para_terceiro
     } = req.body || {};
     const adsAttribution = normalizarAdsAttribution(req.body?.ads || req.body?.attribution || {}, req);
 
@@ -7025,9 +7066,25 @@ app.post("/api/efi/cartao/cobrar", rlGeral, async (req, res) => {
       // Sempre salva o efi_charge_id para o webhook conseguir achar o atendimento depois
       if (atendimentoId) {
         await pool.query(
-          `UPDATE fila_atendimentos SET efi_charge_id = $2
+          `UPDATE fila_atendimentos
+              SET efi_charge_id = $2,
+                  pagador_nome = $3,
+                  pagador_cpf = $4,
+                  pagador_email = $5,
+                  atendimento_para_terceiro = COALESCE($6, atendimento_para_terceiro),
+                  nome = COALESCE($7, nome),
+                  cpf = COALESCE($8, cpf)
             WHERE id = $1 AND (efi_charge_id IS NULL OR efi_charge_id = '')`,
-          [atendimentoId, String(chargeId)]
+          [
+            atendimentoId,
+            String(chargeId),
+            normalizarNomePaciente(nome),
+            cpfLimpo,
+            normalizarEmail(email),
+            atendimento_para_terceiro === true || atendimento_para_terceiro === "true",
+            normalizarNomePaciente(paciente_nome),
+            normalizarCpf(paciente_cpf)
+          ]
         ).catch(e => console.warn("[EFI-CARTAO] Salvar charge_id falhou:", e.message));
         await salvarAdsAttribution(atendimentoId, adsAttribution, req);
       }
