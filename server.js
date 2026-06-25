@@ -807,6 +807,8 @@ async function initDB() {
       ['aprovacao_token','TEXT'],
       ['pagamento_status','TEXT NOT NULL DEFAULT \'pendente\''],
       ['pagbank_order_id','TEXT'],
+      ['pagbank_qr_text','TEXT'],
+      ['pagbank_qr_expira_em','TIMESTAMPTZ'],
       ['pagamento_metodo','TEXT'],
       ['pagamento_confirmado_em','TIMESTAMPTZ'],
       ['efi_charge_id','TEXT'],
@@ -1472,7 +1474,9 @@ app.post("/api/pagbank/order", async (req, res) => {
 
     if (atendimentoIdNum) {
       const atCheck = await pool.query(
-        `SELECT id, pagamento_status FROM fila_atendimentos WHERE id = $1`,
+        `SELECT id, pagamento_status, pagbank_order_id, pagbank_qr_text, pagbank_qr_expira_em
+           FROM fila_atendimentos
+          WHERE id = $1`,
         [atendimentoIdNum]
       );
       if (atCheck.rowCount === 0) {
@@ -1480,6 +1484,21 @@ app.post("/api/pagbank/order", async (req, res) => {
       }
       if (atCheck.rows[0].pagamento_status === "confirmado") {
         return res.status(409).json({ ok: false, error: "Atendimento ja esta pago" });
+      }
+      const existente = atCheck.rows[0];
+      if (
+        existente.pagbank_order_id
+        && existente.pagbank_qr_text
+        && existente.pagbank_qr_expira_em
+        && new Date(existente.pagbank_qr_expira_em).getTime() > Date.now() + 30_000
+      ) {
+        console.log("[PAGBANK] Reutilizando PIX ativo — atendimento #" + atendimentoIdNum + " <- " + existente.pagbank_order_id);
+        return res.json({
+          ok: true,
+          order_id: existente.pagbank_order_id,
+          qr_code_text: existente.pagbank_qr_text,
+          reused: true
+        });
       }
     }
 
@@ -1529,18 +1548,22 @@ app.post("/api/pagbank/order", async (req, res) => {
       const vinc = await pool.query(
         `UPDATE fila_atendimentos
             SET pagbank_order_id = $2,
-                pagador_nome = $3,
-                pagador_cpf = $4,
-                pagador_email = $5,
-                atendimento_para_terceiro = COALESCE($6, atendimento_para_terceiro),
-                nome = COALESCE($7, nome),
-                cpf = COALESCE($8, cpf)
+                pagbank_qr_text = $3,
+                pagbank_qr_expira_em = $4,
+                pagador_nome = $5,
+                pagador_cpf = $6,
+                pagador_email = $7,
+                atendimento_para_terceiro = COALESCE($8, atendimento_para_terceiro),
+                nome = COALESCE($9, nome),
+                cpf = COALESCE($10, cpf)
           WHERE id = $1
             AND pagamento_status = 'pendente'
           RETURNING id`,
         [
           atendimentoIdNum,
           data.id,
+          qrCode.text,
+          expiracao,
           nomeClean || null,
           normalizarCpf(cpf),
           normalizarEmail(email),
@@ -2623,6 +2646,7 @@ app.post("/api/notify", rlTriagem, async (req, res) => {
     const pagadorNomeLimpo = normalizarNomePaciente(pagador_nome);
     const pagadorCpfLimpo = normalizarCpf(pagador_cpf);
     const pagadorEmailLimpo = normalizarEmail(pagador_email);
+    const checkoutSessionId = adsAttribution.checkoutSessionId || null;
 
     if (atendimentoId) {
       const updateResult = await pool.query(
@@ -2679,23 +2703,81 @@ app.post("/api/notify", rlTriagem, async (req, res) => {
       return res.status(400).json({ ok: false, error: "nome_paciente_obrigatorio" });
     }
     const statusInicial = triagemPlaceholder ? 'pagamento_pendente' : 'aguardando';
-    const insertResult = await pool.query(
-      `INSERT INTO fila_atendimentos (
-         nome,tel,tel_documentos,cpf,tipo,triagem,status,queixa,idade,sexo,alergias,cronicas,
-         medicacoes,data_nascimento,email,atendimento_para_terceiro,pagador_nome,pagador_cpf,pagador_email
-       )
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19) RETURNING id`,
-      [nomeLimpo||"Paciente",telLimpo||"-",telDocLimpo||telLimpo||"-",cpfLimpo||"",tipoConsulta,triagemTexto,statusInicial,
-       campos.queixa||triagemTexto||"",campos.idade||"",campos.sexo||"",campos.alergias||"",campos.cronicas||"",
-       campos.medicacoes||"",dataNascLimpa||"",emailLimpo,atendimentoTerceiro,pagadorNomeLimpo,pagadorCpfLimpo,pagadorEmailLimpo]
-    );
+    const insertParams = [
+      nomeLimpo||"Paciente",telLimpo||"-",telDocLimpo||telLimpo||"-",cpfLimpo||"",tipoConsulta,triagemTexto,statusInicial,
+      campos.queixa||triagemTexto||"",campos.idade||"",campos.sexo||"",campos.alergias||"",campos.cronicas||"",
+      campos.medicacoes||"",dataNascLimpa||"",emailLimpo,atendimentoTerceiro,pagadorNomeLimpo,pagadorCpfLimpo,
+      pagadorEmailLimpo,checkoutSessionId
+    ];
+    const insertResult = checkoutSessionId
+      ? await pool.query(
+          `WITH trava AS (
+             SELECT pg_advisory_xact_lock(hashtext($20))
+           ),
+           existente AS (
+             SELECT f.id
+               FROM fila_atendimentos f, trava
+              WHERE f.ads_checkout_session_id = $20
+                AND f.criado_em > NOW() - INTERVAL '12 hours'
+                AND f.status NOT IN ('encerrado','cancelado','expirado','arquivado')
+              ORDER BY f.criado_em DESC
+              LIMIT 1
+           ),
+           inserido AS (
+             INSERT INTO fila_atendimentos (
+               nome,tel,tel_documentos,cpf,tipo,triagem,status,queixa,idade,sexo,alergias,cronicas,
+               medicacoes,data_nascimento,email,atendimento_para_terceiro,pagador_nome,pagador_cpf,
+               pagador_email,ads_checkout_session_id
+             )
+             SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20
+               FROM trava
+              WHERE NOT EXISTS (SELECT 1 FROM existente)
+             RETURNING id
+           )
+           SELECT id, false AS reutilizado FROM inserido
+           UNION ALL
+           SELECT id, true AS reutilizado FROM existente
+           LIMIT 1`,
+          insertParams
+        )
+      : await pool.query(
+          `INSERT INTO fila_atendimentos (
+             nome,tel,tel_documentos,cpf,tipo,triagem,status,queixa,idade,sexo,alergias,cronicas,
+             medicacoes,data_nascimento,email,atendimento_para_terceiro,pagador_nome,pagador_cpf,
+             pagador_email,ads_checkout_session_id
+           )
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+           RETURNING id, false AS reutilizado`,
+          insertParams
+        );
     const novoAtendimentoId = insertResult.rows[0]?.id;
+    const atendimentoReutilizado = insertResult.rows[0]?.reutilizado === true;
+    if (atendimentoReutilizado) {
+      await pool.query(
+        `UPDATE fila_atendimentos
+            SET nome=COALESCE($2,nome),
+                tel=COALESCE($3,tel),
+                tel_documentos=COALESCE($4,tel_documentos),
+                cpf=COALESCE($5,cpf),
+                tipo=$6,
+                data_nascimento=COALESCE($7,data_nascimento),
+                email=COALESCE($8,email),
+                atendimento_para_terceiro=COALESCE($9,atendimento_para_terceiro),
+                pagador_nome=COALESCE($10,pagador_nome),
+                pagador_cpf=COALESCE($11,pagador_cpf),
+                pagador_email=COALESCE($12,pagador_email)
+          WHERE id=$1`,
+        [novoAtendimentoId,nomeLimpo,telLimpo,telDocLimpo,cpfLimpo,tipoConsulta,dataNascLimpa,emailLimpo,
+         atendimentoTerceiro,pagadorNomeLimpo,pagadorCpfLimpo,pagadorEmailLimpo]
+      );
+      console.log(`[NOTIFY-IDEMPOTENTE] sessao ${checkoutSessionId} reutilizou atendimento #${novoAtendimentoId}`);
+    }
     await salvarAdsAttribution(novoAtendimentoId, adsAttribution, req);
     const linkRetorno = `${SITE_URL}/triagem.html?consulta=${novoAtendimentoId}`;
     const agora = new Date().toLocaleString("pt-BR",{timeZone:"America/Fortaleza"});
-    if (!triagemPlaceholder) {
+    if (!triagemPlaceholder && !atendimentoReutilizado) {
       appendToSheet("Atendimentos",[agora,nomeLimpo||"",telLimpo||"",cpfLimpo||"",statusInicial,"",triagemParaPlanilha(triagemTexto, campos.queixa),tipoConsulta||"","",String(novoAtendimentoId)]).catch(e=>console.error("[Sheets]",e));
-    } else {
+    } else if (!atendimentoReutilizado) {
       console.log("[SHEETS] Pre-registro suprimido em Atendimentos — atendimento #" + novoAtendimentoId);
     }
 
@@ -6252,12 +6334,8 @@ app.get("/api/fila", checkMedico, async (req, res) => {
       query = `SELECT id,nome,tel,cpf,tipo,triagem,status,pagamento_status,medico_id,medico_nome,meet_link,criado_em,data_nascimento,idade,sexo,alergias,cronicas,medicacoes,queixa,solicita,horario_agendado
                  FROM fila_atendimentos
                 WHERE tipo NOT LIKE 'renovacao%'
-                  AND status IN ('aguardando','assumido')
+                  AND status IN ('aguardando','assumido','triagem','pagamento_pendente')
                   AND pagamento_status='confirmado'
-                  AND LOWER(TRIM(COALESCE(triagem,''))) NOT LIKE '(aguardando pagamento)%'
-                  AND LOWER(TRIM(COALESCE(triagem,''))) NOT LIKE '(pagamento confirmado%'
-                  AND LOWER(TRIM(COALESCE(triagem,''))) NOT LIKE '(triagem em andamento)%'
-                  AND LOWER(TRIM(COALESCE(triagem,''))) NOT LIKE '(aguardando triagem%'
                 ORDER BY criado_em ASC`;
     } else {
       query = `SELECT id,nome,tel,cpf,tipo,triagem,status,pagamento_status,medico_id,medico_nome,meet_link,criado_em,data_nascimento,idade,sexo,alergias,cronicas,medicacoes,queixa,solicita,horario_agendado
