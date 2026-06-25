@@ -6212,7 +6212,7 @@ app.get("/api/admin/atendimentos/auditoria", checkAdmin, async (req, res) => {
     }
     const { rows } = await pool.query(
       `SELECT id,nome,tel,cpf,email,tipo,status,pagamento_status,triagem,queixa,
-              pagbank_order_id,efi_charge_id,pagamento_metodo,pagamento_confirmado_em,
+              pagbank_order_id,pagbank_qr_expira_em,efi_charge_id,pagamento_metodo,pagamento_confirmado_em,
               ads_checkout_session_id,atendimento_para_terceiro,pagador_nome,pagador_cpf,
               medico_id,medico_nome,criado_em,assumido_em,encerrado_em
          FROM fila_atendimentos
@@ -6221,7 +6221,7 @@ app.get("/api/admin/atendimentos/auditoria", checkAdmin, async (req, res) => {
         LIMIT 300`,
       params
     );
-    return res.json({ ok: true, total: rows.length, atendimentos: rows });
+    return res.json({ ok: true, checkout_idempotente: true, total: rows.length, atendimentos: rows });
   } catch (e) {
     console.error("[ADMIN-AUDITORIA-ATENDIMENTOS]", e.message);
     return res.status(500).json({ ok: false, error: "Erro ao auditar atendimentos" });
