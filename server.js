@@ -6334,8 +6334,12 @@ app.get("/api/fila", checkMedico, async (req, res) => {
       query = `SELECT id,nome,tel,cpf,tipo,triagem,status,pagamento_status,medico_id,medico_nome,meet_link,criado_em,data_nascimento,idade,sexo,alergias,cronicas,medicacoes,queixa,solicita,horario_agendado
                  FROM fila_atendimentos
                 WHERE tipo NOT LIKE 'renovacao%'
-                  AND status IN ('aguardando','assumido','triagem','pagamento_pendente')
+                  AND status IN ('aguardando','assumido')
                   AND pagamento_status='confirmado'
+                  AND LOWER(TRIM(COALESCE(triagem,''))) NOT LIKE '(aguardando pagamento)%'
+                  AND LOWER(TRIM(COALESCE(triagem,''))) NOT LIKE '(pagamento confirmado%'
+                  AND LOWER(TRIM(COALESCE(triagem,''))) NOT LIKE '(triagem em andamento)%'
+                  AND LOWER(TRIM(COALESCE(triagem,''))) NOT LIKE '(aguardando triagem%'
                 ORDER BY criado_em ASC`;
     } else {
       query = `SELECT id,nome,tel,cpf,tipo,triagem,status,pagamento_status,medico_id,medico_nome,meet_link,criado_em,data_nascimento,idade,sexo,alergias,cronicas,medicacoes,queixa,solicita,horario_agendado
