@@ -6091,7 +6091,9 @@ app.get("/api/admin/historico", checkAdmin, async (req, res) => {
     if (data_fim) { params.push(data_fim); where += ` AND criado_em < ($${params.length}::date + interval '1 day')`; }
     if (busca) { params.push(`%${busca}%`); where += ` AND (nome ILIKE $${params.length} OR tel ILIKE $${params.length} OR cpf ILIKE $${params.length})`; }
     const result = await pool.query(
-      `SELECT id,nome,tel,tel_documentos,cpf,email,tipo,triagem,queixa,status,medico_id,medico_nome,prontuario,
+      `SELECT id,nome,tel,tel_documentos,cpf,email,tipo,triagem,queixa,status,pagamento_status,
+              pagbank_order_id,efi_charge_id,pagamento_confirmado_em,ads_checkout_session_id,
+              medico_id,medico_nome,prontuario,
               criado_em,assumido_em,encerrado_em,data_nascimento,idade,sexo,alergias,cronicas,medicacoes,
               solicita,status_atendimento,documentos_emitidos,questionario,anexos_urls,endereco_envio,
               frete_modalidade,frete_valor
@@ -6103,6 +6105,44 @@ app.get("/api/admin/historico", checkAdmin, async (req, res) => {
   } catch(e) {
     console.error("[ADMIN-HISTORICO]", e.message);
     return res.status(500).json({ ok: false, error: "Erro ao carregar histórico" });
+  }
+});
+
+// Diagnóstico administrativo de pagamentos e fila, inclusive registros ainda
+// pendentes/na triagem que não aparecem no histórico clínico.
+app.get("/api/admin/atendimentos/auditoria", checkAdmin, async (req, res) => {
+  try {
+    const busca = String(req.query.busca || "").trim();
+    const horas = Math.min(168, Math.max(1, parseInt(req.query.horas || "48", 10) || 48));
+    const params = [horas];
+    let where = `WHERE criado_em >= NOW() - ($1::text || ' hours')::interval`;
+    if (busca) {
+      params.push(`%${busca}%`);
+      where += ` AND (
+        nome ILIKE $${params.length}
+        OR tel ILIKE $${params.length}
+        OR cpf ILIKE $${params.length}
+        OR COALESCE(pagador_nome,'') ILIKE $${params.length}
+        OR COALESCE(pagador_cpf,'') ILIKE $${params.length}
+        OR COALESCE(pagbank_order_id,'') ILIKE $${params.length}
+        OR COALESCE(efi_charge_id,'') ILIKE $${params.length}
+      )`;
+    }
+    const { rows } = await pool.query(
+      `SELECT id,nome,tel,cpf,email,tipo,status,pagamento_status,triagem,queixa,
+              pagbank_order_id,efi_charge_id,pagamento_metodo,pagamento_confirmado_em,
+              ads_checkout_session_id,atendimento_para_terceiro,pagador_nome,pagador_cpf,
+              medico_id,medico_nome,criado_em,assumido_em,encerrado_em
+         FROM fila_atendimentos
+         ${where}
+        ORDER BY criado_em DESC
+        LIMIT 300`,
+      params
+    );
+    return res.json({ ok: true, total: rows.length, atendimentos: rows });
+  } catch (e) {
+    console.error("[ADMIN-AUDITORIA-ATENDIMENTOS]", e.message);
+    return res.status(500).json({ ok: false, error: "Erro ao auditar atendimentos" });
   }
 });
 
