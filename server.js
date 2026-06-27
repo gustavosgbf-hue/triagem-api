@@ -1130,6 +1130,35 @@ async function compactarTriagensNaPlanilha() {
   }
 }
 
+function calcularIdadePorNascimento(valor, hoje = new Date()) {
+  const texto = String(valor || '').trim();
+  let ano, mes, dia;
+  let match = texto.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (match) {
+    [, ano, mes, dia] = match.map(Number);
+  } else {
+    match = texto.match(/^(\d{2})\/(\d{2})\/(\d{4})/);
+    if (!match) return '';
+    dia = Number(match[1]);
+    mes = Number(match[2]);
+    ano = Number(match[3]);
+  }
+
+  const nascimento = new Date(ano, mes - 1, dia);
+  if (
+    nascimento.getFullYear() !== ano ||
+    nascimento.getMonth() !== mes - 1 ||
+    nascimento.getDate() !== dia
+  ) return '';
+
+  let idade = hoje.getFullYear() - ano;
+  const aniversarioAindaNaoChegou =
+    hoje.getMonth() < mes - 1 ||
+    (hoje.getMonth() === mes - 1 && hoje.getDate() < dia);
+  if (aniversarioAindaNaoChegou) idade -= 1;
+  return idade >= 0 && idade <= 130 ? `${idade} anos` : '';
+}
+
 function parsearTriagem(summary) {
   if (!summary) return {};
   const campos = {};
@@ -1182,11 +1211,8 @@ function parsearTriagem(summary) {
     }
   }
 
-  // Fallbacks por regex no texto livre
-  if (!campos.idade) {
-    const m = summary.match(/(\d{1,3})\s*anos/i);
-    if (m) campos.idade = m[1] + ' anos';
-  }
+  // Idade só é aceita quando vier em campo explícito ("Idade: ...").
+  // Durações como "há 10 anos" não podem ser interpretadas como idade.
   if (!campos.sexo) {
     if (/\bfeminino\b|\bmulher\b|\bfeminina\b/i.test(summary)) campos.sexo = 'Feminino';
     else if (/\bmasculino\b|\bhomem\b|\bmasculina\b/i.test(summary)) campos.sexo = 'Masculino';
@@ -2340,13 +2366,14 @@ app.post("/api/atendimento/atualizar-triagem", async (req, res) => {
     const cpfLimpo = normalizarCpf(cpf);
     const dataNascLimpa = normalizarTexto(data_nascimento);
     const emailLimpo = normalizarEmail(email);
+    const idadeClinica = calcularIdadePorNascimento(dataNascLimpa) || campos.idade || "";
 
     // ── AGENDAMENTO: fluxo original sem interceptação ──────────────────────
     if (agendamentoId) {
       const result = await pool.query(
         `UPDATE fila_atendimentos SET triagem=$2,queixa=$3,idade=$4,sexo=$5,alergias=$6,cronicas=$7,medicacoes=$8,solicita=$9,status='aguardando'
          WHERE id=$1 AND status IN ('triagem','aguardando') RETURNING id,nome,tel,cpf,tipo,triagem,tel_documentos,medico_nome`,
-        [atendimentoId,triagemCompacta,campos.queixa||triagemCompacta,campos.idade||"",campos.sexo||"",campos.alergias||"",campos.cronicas||"",campos.medicacoes||"",campos.solicita||""]
+        [atendimentoId,triagemCompacta,campos.queixa||triagemCompacta,idadeClinica,campos.sexo||"",campos.alergias||"",campos.cronicas||"",campos.medicacoes||"",campos.solicita||""]
       );
       if (result.rowCount === 0) return res.status(404).json({ ok: false, error: "Atendimento nao encontrado ou ja em andamento" });
       const at = await garantirNomePacienteParaFila(result.rows[0]);
@@ -2422,7 +2449,7 @@ app.post("/api/atendimento/atualizar-triagem", async (req, res) => {
               email=COALESCE($15,email)
         WHERE id=$1 AND status IN ('triagem','aguardando','aguardando_aprovacao','pagamento_pendente')
         RETURNING id,nome,tel,cpf,tipo,triagem,tel_documentos`,
-      [atendimentoId, triagemCompacta, campos.queixa||triagemCompacta, campos.idade||"", campos.sexo||"",
+      [atendimentoId, triagemCompacta, campos.queixa||triagemCompacta, idadeClinica, campos.sexo||"",
        campos.alergias||"", campos.cronicas||"", campos.medicacoes||"", campos.solicita||"",
        novoStatus, nomeLimpo, telLimpo, cpfLimpo, dataNascLimpa, emailLimpo]
     );
@@ -2642,6 +2669,7 @@ app.post("/api/notify", rlTriagem, async (req, res) => {
     const cpfLimpo = normalizarCpf(cpf);
     const dataNascLimpa = normalizarTexto(data_nascimento);
     const emailLimpo = normalizarEmail(email);
+    const idadeClinica = calcularIdadePorNascimento(dataNascLimpa) || campos.idade || "";
     const atendimentoTerceiro = atendimento_para_terceiro === true || atendimento_para_terceiro === "true";
     const pagadorNomeLimpo = normalizarNomePaciente(pagador_nome);
     const pagadorCpfLimpo = normalizarCpf(pagador_cpf);
@@ -2676,7 +2704,7 @@ app.post("/api/notify", rlTriagem, async (req, res) => {
           WHERE id = $1
           RETURNING id, nome, tel, cpf, tipo, triagem, status`,
         [atendimentoId, nomeLimpo, telLimpo, telDocLimpo, cpfLimpo, tipoConsulta,
-         triagemTexto, campos.queixa||triagemTexto||"", campos.idade||"", campos.sexo||"",
+         triagemTexto, campos.queixa||triagemTexto||"", idadeClinica, campos.sexo||"",
          campos.alergias||"", campos.cronicas||"", campos.medicacoes||"", dataNascLimpa,
          triagemPlaceholder, emailLimpo, atendimentoTerceiro, pagadorNomeLimpo,
          pagadorCpfLimpo, pagadorEmailLimpo]
@@ -2705,7 +2733,7 @@ app.post("/api/notify", rlTriagem, async (req, res) => {
     const statusInicial = triagemPlaceholder ? 'pagamento_pendente' : 'aguardando';
     const insertParams = [
       nomeLimpo||"Paciente",telLimpo||"-",telDocLimpo||telLimpo||"-",cpfLimpo||"",tipoConsulta,triagemTexto,statusInicial,
-      campos.queixa||triagemTexto||"",campos.idade||"",campos.sexo||"",campos.alergias||"",campos.cronicas||"",
+      campos.queixa||triagemTexto||"",idadeClinica,campos.sexo||"",campos.alergias||"",campos.cronicas||"",
       campos.medicacoes||"",dataNascLimpa||"",emailLimpo,atendimentoTerceiro,pagadorNomeLimpo,pagadorCpfLimpo,
       pagadorEmailLimpo,checkoutSessionId
     ];
