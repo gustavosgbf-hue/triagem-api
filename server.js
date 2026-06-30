@@ -1309,6 +1309,11 @@ async function handleChat(req, res) {
 }
 
 function checkAdmin(req, res, next) {
+  const medico = decodificarMedicoRequest(req);
+  if (String(medico?.email || "").trim().toLowerCase() === "gustavosgbf@gmail.com") {
+    req.adminMedico = medico;
+    return next();
+  }
   const senha = req.headers["x-admin-password"] || req.query.senha;
   const senhaAdmin = process.env.ADMIN_PASSWORD;
   if (!senhaAdmin) return res.status(500).send("ADMIN_PASSWORD nao configurada");
@@ -6253,6 +6258,64 @@ app.get("/api/admin/atendimentos/auditoria", checkAdmin, async (req, res) => {
   } catch (e) {
     console.error("[ADMIN-AUDITORIA-ATENDIMENTOS]", e.message);
     return res.status(500).json({ ok: false, error: "Erro ao auditar atendimentos" });
+  }
+});
+
+app.post("/api/admin/atendimentos/manual", checkAdmin, async (req, res) => {
+  try {
+    const nome = normalizarNomePaciente(req.body?.nome);
+    const tel = normalizarTexto(req.body?.tel).replace(/\D/g, "");
+    const cpf = normalizarCpf(req.body?.cpf);
+    const dataNascimento = normalizarTexto(req.body?.data_nascimento);
+    const email = normalizarEmail(req.body?.email);
+    const tipo = req.body?.tipo === "video" ? "video" : "chat";
+    const motivo = limitarTexto(normalizarTexto(req.body?.motivo), 500) || "Atendimento iniciado manualmente pelo administrador.";
+
+    if (!nome || nome.length < 3) {
+      return res.status(400).json({ ok: false, error: "Informe o nome completo do paciente." });
+    }
+    if (tel.length < 10 || tel.length > 13) {
+      return res.status(400).json({ ok: false, error: "Informe um telefone válido." });
+    }
+    if (cpf && !julieValidarCPF(cpf)) {
+      return res.status(400).json({ ok: false, error: "CPF inválido." });
+    }
+
+    const admin = await pool.query(
+      `SELECT id,nome,nome_exibicao,email
+         FROM medicos
+        WHERE LOWER(email)='gustavosgbf@gmail.com' AND ativo=true
+        LIMIT 1`
+    );
+    if (admin.rowCount === 0) {
+      return res.status(409).json({ ok: false, error: "Médico administrador não encontrado ou inativo." });
+    }
+    const medicoAdmin = admin.rows[0];
+    const idade = calcularIdadePorNascimento(dataNascimento);
+    const result = await pool.query(
+      `INSERT INTO fila_atendimentos
+         (nome,tel,tel_documentos,cpf,email,data_nascimento,tipo,triagem,queixa,
+          idade,status,pagamento_status,pagamento_metodo,medico_id,medico_nome,assumido_em,solicita)
+       VALUES
+         ($1,$2,$2,$3,$4,$5,$6,$7,$7,$8,'assumido','isento_admin','admin_manual',
+          $9,$10,NOW(),'Atendimento manual')
+       RETURNING *`,
+      [
+        nome, tel, cpf || "", email, dataNascimento || "", tipo, motivo, idade,
+        medicoAdmin.id, medicoAdmin.nome_exibicao || medicoAdmin.nome
+      ]
+    );
+    const atendimento = result.rows[0];
+    const SITE_URL = process.env.SITE_URL || "https://consultaja24h.com.br";
+    console.log(`[ADMIN-MANUAL] Atendimento #${atendimento.id} criado por ${medicoAdmin.email}`);
+    return res.json({
+      ok: true,
+      atendimento,
+      linkRetorno: `${SITE_URL}/triagem.html?consulta=${atendimento.id}`
+    });
+  } catch (e) {
+    console.error("[ADMIN-MANUAL]", e.message);
+    return res.status(500).json({ ok: false, error: "Erro ao criar atendimento manual." });
   }
 });
 
