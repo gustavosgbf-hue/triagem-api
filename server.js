@@ -6264,7 +6264,7 @@ app.get("/api/admin/atendimentos/auditoria", checkAdmin, async (req, res) => {
 app.post("/api/admin/atendimentos/manual", checkAdmin, async (req, res) => {
   try {
     const nome = normalizarNomePaciente(req.body?.nome);
-    const tel = normalizarTexto(req.body?.tel).replace(/\D/g, "");
+    const tel = String(normalizarTexto(req.body?.tel) || "").replace(/\D/g, "");
     const cpf = normalizarCpf(req.body?.cpf);
     const dataNascimento = normalizarTexto(req.body?.data_nascimento);
     const email = normalizarEmail(req.body?.email);
