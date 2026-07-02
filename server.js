@@ -1492,6 +1492,71 @@ const PSI_COMISSAO_PCT = parseFloat(process.env.PSI_COMISSAO_PCT || '20');
 
 if (!PAGBANK_TOKEN) console.error("[PAGBANK] Token não configurado");
 
+const LIMITE_ATENDIMENTOS_JANELA_DIAS = 5;
+const LIMITE_ATENDIMENTOS_QUANTIDADE = 2;
+
+async function buscarLimiteAtendimentos(atendimentoId) {
+  const id = parseInt(atendimentoId, 10);
+  if (!id) return null;
+  const { rows } = await pool.query(
+    `WITH atual AS (
+       SELECT regexp_replace(COALESCE(cpf,''), '\\D', '', 'g') AS cpf,
+              regexp_replace(COALESCE(tel,''), '\\D', '', 'g') AS tel
+         FROM fila_atendimentos
+        WHERE id = $1
+     ),
+     recentes AS (
+       SELECT f.id, COALESCE(f.pagamento_confirmado_em, f.criado_em) AS pago_em
+         FROM fila_atendimentos f, atual a
+        WHERE f.id <> $1
+          AND f.pagamento_status = 'confirmado'
+          AND COALESCE(f.pagamento_confirmado_em, f.criado_em)
+              >= NOW() - ($2::text || ' days')::interval
+          AND (
+            (a.cpf <> '' AND regexp_replace(COALESCE(f.cpf,''), '\\D', '', 'g') = a.cpf)
+            OR
+            (a.cpf = '' AND a.tel <> '' AND regexp_replace(COALESCE(f.tel,''), '\\D', '', 'g') = a.tel)
+          )
+     )
+     SELECT COUNT(*)::int AS quantidade,
+            MIN(pago_em) + ($2::text || ' days')::interval AS liberado_em
+       FROM recentes`,
+    [id, LIMITE_ATENDIMENTOS_JANELA_DIAS]
+  );
+  const limite = rows[0] || {};
+  return Number(limite.quantidade || 0) >= LIMITE_ATENDIMENTOS_QUANTIDADE
+    ? {
+        quantidade: Number(limite.quantidade || 0),
+        limite: LIMITE_ATENDIMENTOS_QUANTIDADE,
+        janela_dias: LIMITE_ATENDIMENTOS_JANELA_DIAS,
+        liberado_em: limite.liberado_em || null
+      }
+    : null;
+}
+
+function responderLimiteAtendimentos(res, limite) {
+  return res.status(429).json({
+    ok: false,
+    code: "limite_atendimentos_recentes",
+    error: `Você já realizou ${limite.quantidade} atendimentos nos últimos ${limite.janela_dias} dias. Aguarde o período de liberação para iniciar uma nova consulta.`,
+    quantidade: limite.quantidade,
+    limite: limite.limite,
+    janela_dias: limite.janela_dias,
+    liberado_em: limite.liberado_em
+  });
+}
+
+app.get("/api/pagamento/elegibilidade/:atendimentoId", async (req, res) => {
+  try {
+    const limite = await buscarLimiteAtendimentos(req.params.atendimentoId);
+    if (limite) return responderLimiteAtendimentos(res, limite);
+    return res.json({ ok: true, elegivel: true });
+  } catch (e) {
+    console.error("[PAGAMENTO-ELEGIBILIDADE]", e.message);
+    return res.status(500).json({ ok: false, error: "Não foi possível verificar o pagamento agora" });
+  }
+});
+
 app.post("/api/pagbank/order", async (req, res) => {
   try {
     const {
@@ -1504,6 +1569,8 @@ app.post("/api/pagbank/order", async (req, res) => {
     const atendimentoIdNum = parseInt(atendimentoId, 10) || null;
 
     if (atendimentoIdNum) {
+      const limite = await buscarLimiteAtendimentos(atendimentoIdNum);
+      if (limite) return responderLimiteAtendimentos(res, limite);
       const atCheck = await pool.query(
         `SELECT id, pagamento_status, pagbank_order_id, pagbank_qr_text, pagbank_qr_expira_em
            FROM fila_atendimentos
@@ -7173,6 +7240,7 @@ app.post("/api/efi/cartao/cobrar", rlGeral, async (req, res) => {
       atendimento_para_terceiro
     } = req.body || {};
     const adsAttribution = normalizarAdsAttribution(req.body?.ads || req.body?.attribution || {}, req);
+    const atendimentoIdNum = parseInt(atendimentoId, 10) || null;
 
     // ── Validação ────────────────────────────────────────────────────────────
     if (!payment_token)
@@ -7192,6 +7260,11 @@ app.post("/api/efi/cartao/cobrar", rlGeral, async (req, res) => {
     const telefoneLimpoEfi = String(telefone || "").replace(/\D/g, "");
     if (telefoneLimpoEfi.length < 10 || telefoneLimpoEfi.length > 11)
       return res.status(400).json({ ok: false, error: "Telefone com DDD obrigatório para pagamento no cartão" });
+
+    if (atendimentoIdNum) {
+      const limite = await buscarLimiteAtendimentos(atendimentoIdNum);
+      if (limite) return responderLimiteAtendimentos(res, limite);
+    }
 
     // ── Auth Efí ─────────────────────────────────────────────────────────────
     const efiToken  = await efiGetToken();
