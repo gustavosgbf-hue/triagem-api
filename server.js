@@ -45,6 +45,10 @@ app.use(cors({
 }));
 app.use(express.json({ limit: "1mb" }));
 
+app.get("/api/build-info", (_req, res) => {
+  res.json({ ok: true, version: "dual-specialist-access-v1" });
+});
+
 const RESEND_DEFAULT_FROM = process.env.RESEND_DEFAULT_FROM || "ConsultaJá24h <contato@consultaja24h.com.br>";
 const RESEND_FILA_FROM = process.env.RESEND_FILA_FROM || "ConsultaJá24h Fila <fila@consultaja24h.com.br>";
 
