@@ -5925,6 +5925,7 @@ app.patch("/api/admin/medico/:id/mover-especialista", checkAdmin, async (req, re
     const especialidadeReq = String(req.body?.especialidade || "").trim().toLowerCase();
     if (!especialidadeReq) return res.status(400).json({ ok: false, error: "Especialidade obrigatoria" });
     const valorReq = req.body?.valor_consulta;
+    const manterMedicoAtivo = req.body?.manter_medico_ativo === true;
     const valorPadrao = especialidadeReq.includes("psiqu") ? 350 : especialidadeReq.includes("dermat") ? 220 : 250;
     const valorConsulta = Number.isFinite(Number(valorReq)) && Number(valorReq) > 0 ? Number(valorReq) : valorPadrao;
 
@@ -5993,15 +5994,25 @@ app.patch("/api/admin/medico/:id/mover-especialista", checkAdmin, async (req, re
       );
     }
 
-    const bloqueioTag = `movido_especialista:${especialidadeReq}`;
-    await client.query(
-      `UPDATE medicos
-          SET ativo=false,
-              status=$1,
-              status_online=false
-        WHERE id=$2`,
-      [bloqueioTag, id]
-    );
+    if (manterMedicoAtivo) {
+      await client.query(
+        `UPDATE medicos
+            SET ativo=true,
+                status='aprovado'
+          WHERE id=$1`,
+        [id]
+      );
+    } else {
+      const bloqueioTag = `movido_especialista:${especialidadeReq}`;
+      await client.query(
+        `UPDATE medicos
+            SET ativo=false,
+                status=$1,
+                status_online=false
+          WHERE id=$2`,
+        [bloqueioTag, id]
+      );
+    }
     await client.query("COMMIT");
     return res.json({ ok: true, especialista: espRes.rows[0] });
   } catch (err) {
