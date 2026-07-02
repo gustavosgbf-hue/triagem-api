@@ -841,6 +841,16 @@ async function initDB() {
       ['google_ads_offline_job_id','TEXT'],
       ['google_ads_offline_erro','TEXT'],
       ['google_ads_offline_order_id','TEXT'],
+      ['categoria_atendimento','TEXT NOT NULL DEFAULT \'clinico\''],
+      ['especialidade_solicitada','TEXT'],
+      ['valor_cobrado_centavos','INTEGER NOT NULL DEFAULT 4990'],
+      ['fallback_disponivel_em','TIMESTAMPTZ'],
+      ['fallback_decisao','TEXT'],
+      ['fallback_decidido_em','TIMESTAMPTZ'],
+      ['reembolso_status','TEXT'],
+      ['reembolso_valor_centavos','INTEGER NOT NULL DEFAULT 0'],
+      ['reembolso_processado_em','TIMESTAMPTZ'],
+      ['reembolso_erro','TEXT'],
     ];
     // Coluna para controle de lembrete de agendamento
     await pool.query(`ALTER TABLE agendamentos ADD COLUMN IF NOT EXISTS lembrete_enviado BOOLEAN DEFAULT false`).catch(()=>{});
@@ -1466,6 +1476,69 @@ app.post("/api/doctor", handleChat);
 const PAGBANK_TOKEN = process.env.PAGBANK_TOKEN?.trim();
 const PAGBANK_URL   = "https://api.pagseguro.com";
 const VALOR_CENTAVOS = 4990; // R$ 49,90 — fixo no backend
+const ESPECIALISTA_IMEDIATO_VALOR_CENTAVOS = 9990;
+const ESPECIALIDADES_IMEDIATAS = Object.freeze({
+  pediatria: { termoMedico: "pediatr", nome: "Pediatria" },
+  geriatria: { termoMedico: "geriatr", nome: "Geriatria" },
+  psiquiatria: { termoMedico: "psiquiatr", nome: "Psiquiatria" }
+});
+const ESPECIALISTA_FALLBACK_MINUTOS = Math.max(
+  1,
+  parseInt(process.env.ESPECIALISTA_FALLBACK_MINUTOS || "10", 10) || 10
+);
+
+function normalizarEspecialidadeImediata(valor) {
+  const especialidade = String(valor || "").trim().toLowerCase();
+  return ESPECIALIDADES_IMEDIATAS[especialidade] ? especialidade : null;
+}
+
+function nomeEspecialidadeImediata(especialidade) {
+  return ESPECIALIDADES_IMEDIATAS[especialidade]?.nome || "Especialista";
+}
+
+function medicoAtendeEspecialidade(medico, especialidade) {
+  if (!especialidade) return true;
+  const texto = String(medico?.especialidade || "").trim().toLowerCase();
+  const termo = ESPECIALIDADES_IMEDIATAS[especialidade]?.termoMedico;
+  return !!termo && texto.includes(termo);
+}
+
+function configuracaoAtendimentoImediato(especialidade) {
+  if (ESPECIALIDADES_IMEDIATAS[especialidade]) {
+    const nome = nomeEspecialidadeImediata(especialidade);
+    return {
+      categoria: "especialista_imediato",
+      especialidade,
+      valorCentavos: ESPECIALISTA_IMEDIATO_VALOR_CENTAVOS,
+      nomeCobranca: `Consulta de ${nome} Online — ConsultaJá24h`
+    };
+  }
+  return {
+    categoria: "clinico",
+    especialidade: null,
+    valorCentavos: VALOR_CENTAVOS,
+    nomeCobranca: "Consulta Médica Online — ConsultaJá24h"
+  };
+}
+
+async function buscarConfiguracaoAtendimento(atendimentoId) {
+  const id = parseInt(atendimentoId, 10);
+  if (!id) return configuracaoAtendimentoImediato(null);
+  const { rows } = await pool.query(
+    `SELECT categoria_atendimento, especialidade_solicitada, valor_cobrado_centavos
+       FROM fila_atendimentos
+      WHERE id=$1`,
+    [id]
+  );
+  if (!rows[0]) return null;
+  const especialidade = normalizarEspecialidadeImediata(rows[0].especialidade_solicitada);
+  const padrao = configuracaoAtendimentoImediato(especialidade);
+  return {
+    ...padrao,
+    categoria: rows[0].categoria_atendimento || padrao.categoria,
+    valorCentavos: Number(rows[0].valor_cobrado_centavos) || padrao.valorCentavos
+  };
+}
 
 function formatPagBankError(err) {
   if (!err) return "Erro ao criar cobrança";
@@ -1571,6 +1644,12 @@ app.post("/api/pagbank/order", async (req, res) => {
     if (!nome || !cpf) return res.status(400).json({ ok: false, error: "nome e cpf obrigatorios" });
     if (!PAGBANK_TOKEN) return res.status(503).json({ ok: false, error: "Gateway de pagamento indisponivel" });
     const atendimentoIdNum = parseInt(atendimentoId, 10) || null;
+    const configuracao = await buscarConfiguracaoAtendimento(atendimentoIdNum);
+    if (atendimentoIdNum && !configuracao) {
+      return res.status(404).json({ ok: false, error: "Atendimento nao encontrado para gerar PIX" });
+    }
+    const valorCentavos = configuracao?.valorCentavos || VALOR_CENTAVOS;
+    const nomeCobranca = configuracao?.nomeCobranca || "Consulta Médica Online — ConsultaJá24h";
 
     if (atendimentoIdNum) {
       const limite = await buscarLimiteAtendimentos(atendimentoIdNum);
@@ -1619,8 +1698,8 @@ app.post("/api/pagbank/order", async (req, res) => {
         email:  email || `paciente.${cpf.replace(/\D/g,"")}@consultaja24h.com.br`,
         tax_id: cpf.replace(/\D/g, "")
       },
-      items: [{ name: "Consulta Médica Online — ConsultaJá24h", quantity: 1, unit_amount: VALOR_CENTAVOS }],
-      qr_codes: [{ amount: { value: VALOR_CENTAVOS }, expiration_date: expiracaoISO }],
+      items: [{ name: nomeCobranca, quantity: 1, unit_amount: valorCentavos }],
+      qr_codes: [{ amount: { value: valorCentavos }, expiration_date: expiracaoISO }],
       notification_urls: [
         `${process.env.API_URL || "https://triagem-api.onrender.com"}/api/pagbank/webhook`
       ]
@@ -1652,6 +1731,7 @@ app.post("/api/pagbank/order", async (req, res) => {
             SET pagbank_order_id = $2,
                 pagbank_qr_text = $3,
                 pagbank_qr_expira_em = $4,
+                pagamento_metodo = 'pix',
                 pagador_nome = $5,
                 pagador_cpf = $6,
                 pagador_email = $7,
@@ -1909,18 +1989,36 @@ function montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno, linkAssumir, m
   </div>`;
 }
 
-async function enviarEmailMedicos({ nome, tel, tipo, triagem, linkRetorno, subject, atendimentoId, horarioAgendado, horarioAgendadoRaw }) {
+async function enviarEmailMedicos({
+  nome, tel, tipo, triagem, linkRetorno, subject, atendimentoId,
+  horarioAgendado, horarioAgendadoRaw, especialidadeSolicitada, fallbackClinico
+}) {
   const RESEND_KEY = process.env.RESEND_API_KEY;
   if (!RESEND_KEY) { console.warn("[EMAIL] RESEND_API_KEY nao definida."); return; }
   try {
-    const medicosResult = await pool.query(`SELECT id,nome,email FROM medicos WHERE ativo=true AND status='aprovado' ORDER BY status_online DESC`);
-    const medicos = filtrarMedicosAtivos(medicosResult.rows);
+    const medicosResult = await pool.query(
+      `SELECT id,nome,email,especialidade
+         FROM medicos
+        WHERE ativo=true AND status='aprovado'
+        ORDER BY status_online DESC`
+    );
+    const especialidade = normalizarEspecialidadeImediata(especialidadeSolicitada);
+    const medicosAtivos = filtrarMedicosAtivos(medicosResult.rows);
+    const medicos = medicosAtivos.filter(
+      med => !especialidade || fallbackClinico || medicoAtendeEspecialidade(med, especialidade)
+    );
     // Garante que o admin sempre recebe
     // Admin sempre primeiro
     const adminEmail = "gustavosgbf@gmail.com";
+    const adminCadastrado = medicosAtivos.find(m => m.email === adminEmail);
     const adminIdx = medicos.findIndex(m=>m.email===adminEmail);
     if (adminIdx > 0) medicos.splice(adminIdx, 1);
-    if (adminIdx !== 0) medicos.unshift({ id: 0, nome: "Gustavo", email: adminEmail });
+    const adminDeveReceber = !especialidade
+      || fallbackClinico
+      || medicoAtendeEspecialidade(adminCadastrado, especialidade);
+    if (adminIdx !== 0 && adminDeveReceber) {
+      medicos.unshift(adminCadastrado || { id: 0, nome: "Gustavo", email: adminEmail, especialidade: "" });
+    }
 
     const PAINEL_URL = "https://painel.consultaja24h.com.br";
     const API_URL = process.env.API_URL || "https://triagem-api.onrender.com";
@@ -1981,7 +2079,8 @@ async function reenviarEmailsFilaAtual({ limit = 10 } = {}) {
   const limite = Math.min(20, Math.max(1, parseInt(limit, 10) || 10));
   const SITE_URL = process.env.SITE_URL || "https://consultaja24h.com.br";
   const { rows } = await pool.query(
-    `SELECT id,nome,tel,cpf,tipo,triagem,queixa,tel_documentos
+    `SELECT id,nome,tel,cpf,tipo,triagem,queixa,tel_documentos,
+            especialidade_solicitada,fallback_decisao
        FROM fila_atendimentos
       WHERE status = 'aguardando'
         AND pagamento_status = 'confirmado'
@@ -2004,7 +2103,11 @@ async function reenviarEmailsFilaAtual({ limit = 10 } = {}) {
       atendimentoId: at.id,
       horarioAgendado: null,
       horarioAgendadoRaw: null,
-      subject: `PACIENTE NOVO NA FILA - ${nomeFila}`
+      especialidadeSolicitada: at.especialidade_solicitada,
+      fallbackClinico: at.fallback_decisao === "clinico",
+      subject: at.especialidade_solicitada
+        ? `${nomeEspecialidadeImediata(at.especialidade_solicitada).toUpperCase()} - PACIENTE NOVO NA FILA - ${nomeFila}`
+        : `PACIENTE NOVO NA FILA - ${nomeFila}`
     });
     enviados.push({ id: at.id, nome: nomeFila, tipo: at.tipo });
   }
@@ -2351,7 +2454,8 @@ async function garantirNomePacienteParaFila(at) {
                 data_nascimento=CASE WHEN COALESCE(data_nascimento,'')='' AND COALESCE($3,'')<>'' THEN $3 ELSE data_nascimento END,
                 email=CASE WHEN COALESCE(email,'')='' AND COALESCE($4,'')<>'' THEN $4 ELSE email END
           WHERE id=$1
-          RETURNING id,nome,tel,cpf,tipo,triagem,status,tel_documentos`,
+          RETURNING id,nome,tel,cpf,tipo,triagem,status,tel_documentos,
+                    categoria_atendimento,especialidade_solicitada,fallback_decisao`,
         [at.id, nomeHistorico, historico.rows[0]?.data_nascimento || "", historico.rows[0]?.email || ""]
       );
       console.log(`[PACIENTE-NOME] Atendimento #${at.id} corrigido com nome do historico: ${nomeHistorico}`);
@@ -2399,7 +2503,11 @@ async function notificarMedicos(at) {
     triagem: at.triagem, linkRetorno,
     atendimentoId: at.id,
     horarioAgendado: null, horarioAgendadoRaw: null,
-    subject: "PACIENTE NOVO NA FILA - " + nomeFila
+    especialidadeSolicitada: at.especialidade_solicitada,
+    fallbackClinico: at.fallback_decisao === "clinico",
+    subject: at.especialidade_solicitada
+      ? `${nomeEspecialidadeImediata(at.especialidade_solicitada).toUpperCase()} - PACIENTE NOVO NA FILA - ${nomeFila}`
+      : "PACIENTE NOVO NA FILA - " + nomeFila
   });
 
   console.log("[NOTIFICACAO] Medicos notificados — atendimento #" + at.id);
@@ -2480,7 +2588,10 @@ app.post("/api/atendimento/atualizar-triagem", async (req, res) => {
 
     // ── CONSULTA IMEDIATA: verifica pagamento_status para decidir se libera agora ──
     const check = await pool.query(
-      "SELECT pagamento_status, pagbank_order_id FROM fila_atendimentos WHERE id = $1",
+      `SELECT pagamento_status, pagbank_order_id, categoria_atendimento,
+              especialidade_solicitada
+         FROM fila_atendimentos
+        WHERE id = $1`,
       [atendimentoId]
     );
     if (!check.rows[0]) return res.status(404).json({ ok: false, error: "Atendimento nao encontrado" });
@@ -2522,12 +2633,20 @@ app.post("/api/atendimento/atualizar-triagem", async (req, res) => {
               tel=COALESCE($12,tel),
               cpf=COALESCE($13,cpf),
               data_nascimento=COALESCE($14,data_nascimento),
-              email=COALESCE($15,email)
+              email=COALESCE($15,email),
+              fallback_disponivel_em=CASE
+                WHEN categoria_atendimento='especialista_imediato'
+                  AND fallback_disponivel_em IS NULL
+                THEN NOW() + ($16::text || ' minutes')::interval
+                ELSE fallback_disponivel_em
+              END
         WHERE id=$1 AND status IN ('triagem','aguardando','aguardando_aprovacao','pagamento_pendente')
-        RETURNING id,nome,tel,cpf,tipo,triagem,tel_documentos`,
+        RETURNING id,nome,tel,cpf,tipo,triagem,tel_documentos,categoria_atendimento,
+                  especialidade_solicitada,fallback_decisao`,
       [atendimentoId, triagemCompacta, campos.queixa||triagemCompacta, idadeClinica, campos.sexo||"",
        campos.alergias||"", campos.cronicas||"", campos.medicacoes||"", campos.solicita||"",
-       novoStatus, nomeLimpo, telLimpo, cpfLimpo, dataNascLimpa, emailLimpo]
+       novoStatus, nomeLimpo, telLimpo, cpfLimpo, dataNascLimpa, emailLimpo,
+       ESPECIALISTA_FALLBACK_MINUTOS]
     );
     if (result.rowCount === 0) return res.status(404).json({ ok: false, error: "Atendimento nao encontrado" });
     const at = result.rows[0];
@@ -2731,7 +2850,8 @@ app.post("/api/notify", rlTriagem, async (req, res) => {
   try {
     const {
       atendimentoId, nome, tel, tel_documentos, cpf, triagem, tipo, data_nascimento, email,
-      atendimento_para_terceiro, pagador_nome, pagador_cpf, pagador_email
+      atendimento_para_terceiro, pagador_nome, pagador_cpf, pagador_email,
+      especialidade_solicitada
     } = req.body || {};
     const adsAttribution = normalizarAdsAttribution(req.body?.ads || req.body?.attribution || {}, req);
     const tipoConsulta = tipo === "video" ? "video" : "chat";
@@ -2751,6 +2871,8 @@ app.post("/api/notify", rlTriagem, async (req, res) => {
     const pagadorCpfLimpo = normalizarCpf(pagador_cpf);
     const pagadorEmailLimpo = normalizarEmail(pagador_email);
     const checkoutSessionId = adsAttribution.checkoutSessionId || null;
+    const especialidadeImediata = normalizarEspecialidadeImediata(especialidade_solicitada);
+    const configuracao = configuracaoAtendimentoImediato(especialidadeImediata);
 
     if (atendimentoId) {
       const updateResult = await pool.query(
@@ -2776,14 +2898,27 @@ app.post("/api/notify", rlTriagem, async (req, res) => {
                 atendimento_para_terceiro = COALESCE($17, atendimento_para_terceiro),
                 pagador_nome = COALESCE($18, pagador_nome),
                 pagador_cpf = COALESCE($19, pagador_cpf),
-                pagador_email = COALESCE($20, pagador_email)
+                pagador_email = COALESCE($20, pagador_email),
+                categoria_atendimento = CASE
+                  WHEN pagamento_status='pendente' THEN $21
+                  ELSE categoria_atendimento
+                END,
+                especialidade_solicitada = CASE
+                  WHEN pagamento_status='pendente' THEN $22
+                  ELSE especialidade_solicitada
+                END,
+                valor_cobrado_centavos = CASE
+                  WHEN pagamento_status='pendente' THEN $23
+                  ELSE valor_cobrado_centavos
+                END
           WHERE id = $1
           RETURNING id, nome, tel, cpf, tipo, triagem, status`,
         [atendimentoId, nomeLimpo, telLimpo, telDocLimpo, cpfLimpo, tipoConsulta,
          triagemTexto, campos.queixa||triagemTexto||"", idadeClinica, campos.sexo||"",
          campos.alergias||"", campos.cronicas||"", campos.medicacoes||"", dataNascLimpa,
          triagemPlaceholder, emailLimpo, atendimentoTerceiro, pagadorNomeLimpo,
-         pagadorCpfLimpo, pagadorEmailLimpo]
+         pagadorCpfLimpo, pagadorEmailLimpo, configuracao.categoria,
+         configuracao.especialidade, configuracao.valorCentavos]
       );
 
       if (updateResult.rowCount === 0) {
@@ -2811,7 +2946,8 @@ app.post("/api/notify", rlTriagem, async (req, res) => {
       nomeLimpo||"Paciente",telLimpo||"-",telDocLimpo||telLimpo||"-",cpfLimpo||"",tipoConsulta,triagemTexto,statusInicial,
       campos.queixa||triagemTexto||"",idadeClinica,campos.sexo||"",campos.alergias||"",campos.cronicas||"",
       campos.medicacoes||"",dataNascLimpa||"",emailLimpo,atendimentoTerceiro,pagadorNomeLimpo,pagadorCpfLimpo,
-      pagadorEmailLimpo,checkoutSessionId
+      pagadorEmailLimpo,checkoutSessionId,configuracao.categoria,configuracao.especialidade,
+      configuracao.valorCentavos
     ];
     const insertResult = checkoutSessionId
       ? await pool.query(
@@ -2831,9 +2967,10 @@ app.post("/api/notify", rlTriagem, async (req, res) => {
              INSERT INTO fila_atendimentos (
                nome,tel,tel_documentos,cpf,tipo,triagem,status,queixa,idade,sexo,alergias,cronicas,
                medicacoes,data_nascimento,email,atendimento_para_terceiro,pagador_nome,pagador_cpf,
-               pagador_email,ads_checkout_session_id
+               pagador_email,ads_checkout_session_id,categoria_atendimento,especialidade_solicitada,
+               valor_cobrado_centavos
              )
-             SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20
+             SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23
                FROM trava
               WHERE NOT EXISTS (SELECT 1 FROM existente)
              RETURNING id
@@ -2848,9 +2985,10 @@ app.post("/api/notify", rlTriagem, async (req, res) => {
           `INSERT INTO fila_atendimentos (
              nome,tel,tel_documentos,cpf,tipo,triagem,status,queixa,idade,sexo,alergias,cronicas,
              medicacoes,data_nascimento,email,atendimento_para_terceiro,pagador_nome,pagador_cpf,
-             pagador_email,ads_checkout_session_id
+             pagador_email,ads_checkout_session_id,categoria_atendimento,especialidade_solicitada,
+             valor_cobrado_centavos
            )
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
            RETURNING id, false AS reutilizado`,
           insertParams
         );
@@ -2869,10 +3007,14 @@ app.post("/api/notify", rlTriagem, async (req, res) => {
                 atendimento_para_terceiro=COALESCE($9,atendimento_para_terceiro),
                 pagador_nome=COALESCE($10,pagador_nome),
                 pagador_cpf=COALESCE($11,pagador_cpf),
-                pagador_email=COALESCE($12,pagador_email)
+                pagador_email=COALESCE($12,pagador_email),
+                categoria_atendimento=$13,
+                especialidade_solicitada=$14,
+                valor_cobrado_centavos=$15
           WHERE id=$1`,
         [novoAtendimentoId,nomeLimpo,telLimpo,telDocLimpo,cpfLimpo,tipoConsulta,dataNascLimpa,emailLimpo,
-         atendimentoTerceiro,pagadorNomeLimpo,pagadorCpfLimpo,pagadorEmailLimpo]
+         atendimentoTerceiro,pagadorNomeLimpo,pagadorCpfLimpo,pagadorEmailLimpo,
+         configuracao.categoria,configuracao.especialidade,configuracao.valorCentavos]
       );
       console.log(`[NOTIFY-IDEMPOTENTE] sessao ${checkoutSessionId} reutilizou atendimento #${novoAtendimentoId}`);
     }
@@ -2984,7 +3126,11 @@ app.get("/api/atendimento/status/:id", async (req, res) => {
     const result = await pool.query(
       `SELECT id, status, tipo, medico_nome, meet_link, criado_em, assumido_em, encerrado_em,
               nome, tel, cpf, data_nascimento, idade, sexo, alergias, cronicas, medicacoes, queixa, email,
-              pagamento_status, pagbank_order_id, efi_charge_id
+              pagamento_status, pagbank_order_id, efi_charge_id, categoria_atendimento,
+              especialidade_solicitada, valor_cobrado_centavos, fallback_disponivel_em,
+              fallback_decisao, fallback_decidido_em, reembolso_status,
+              reembolso_valor_centavos, reembolso_processado_em,
+              (fallback_disponivel_em IS NOT NULL AND NOW() >= fallback_disponivel_em) AS fallback_disponivel
          FROM fila_atendimentos WHERE id = $1`,
       [req.params.id]
     );
@@ -3027,6 +3173,176 @@ app.get("/api/atendimento/status/:id", async (req, res) => {
   } catch (e) { return res.status(500).json({ ok: false, error: "Erro ao buscar status" }); }
 });
 
+function localizarCobrancaPagBankParaEstorno(order) {
+  const candidatos = [
+    ...(Array.isArray(order?.charges) ? order.charges : []),
+    ...(Array.isArray(order?.qr_codes)
+      ? order.qr_codes.flatMap(qr => Array.isArray(qr?.payments) ? qr.payments : [])
+      : [])
+  ];
+  return candidatos.find(item => {
+    const status = String(item?.status || "").toUpperCase();
+    return item?.id && ["PAID", "COMPLETED"].includes(status);
+  }) || null;
+}
+
+async function reembolsarAtendimento(atendimento, valorCentavos) {
+  if (!Number.isInteger(valorCentavos) || valorCentavos <= 0) {
+    throw new Error("Valor de reembolso invalido");
+  }
+
+  if (atendimento.pagamento_metodo === "cartao" || atendimento.efi_charge_id) {
+    if (!atendimento.efi_charge_id) throw new Error("Cobranca Efi nao localizada");
+    const token = await efiGetToken();
+    const resposta = await axios.post(
+      `${EFI_BASE_URL}/v1/charge/card/${atendimento.efi_charge_id}/refund`,
+      { amount: valorCentavos },
+      {
+        httpsAgent: getEfiAgent(),
+        headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }
+      }
+    );
+    return { gateway: "efi", resposta: resposta.data };
+  }
+
+  if (!atendimento.pagbank_order_id || !PAGBANK_TOKEN) {
+    throw new Error("Cobranca PagBank nao localizada");
+  }
+  const orderRes = await fetch(`${PAGBANK_URL}/orders/${atendimento.pagbank_order_id}`, {
+    headers: { Authorization: `Bearer ${PAGBANK_TOKEN}`, accept: "application/json" }
+  });
+  const order = await orderRes.json();
+  if (!orderRes.ok) throw new Error(formatPagBankError(order?.error_messages || order));
+  const cobranca = localizarCobrancaPagBankParaEstorno(order);
+  if (!cobranca) throw new Error("Pagamento PagBank pago nao localizado para estorno");
+  const linkCancelamento = (cobranca.links || []).find(link => link?.rel === "CHARGE.CANCEL")?.href;
+  const url = linkCancelamento || `${PAGBANK_URL}/charges/${cobranca.id}/cancel`;
+  const refundRes = await fetch(url, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${PAGBANK_TOKEN}`,
+      "Content-Type": "application/json",
+      accept: "application/json"
+    },
+    body: JSON.stringify({ amount: { value: valorCentavos } })
+  });
+  const refund = await refundRes.json();
+  if (!refundRes.ok) throw new Error(formatPagBankError(refund?.error_messages || refund));
+  return { gateway: "pagbank", resposta: refund };
+}
+
+app.post("/api/atendimento/:id/fallback-especialista", rlGeral, async (req, res) => {
+  const atendimentoId = parseInt(req.params.id, 10);
+  const decisao = String(req.body?.decisao || "").trim().toLowerCase();
+  if (!atendimentoId || !["clinico", "reembolso"].includes(decisao)) {
+    return res.status(400).json({ ok: false, error: "Decisao invalida" });
+  }
+
+  try {
+    const reserva = await pool.query(
+      `UPDATE fila_atendimentos
+          SET reembolso_status='processando',
+              reembolso_processado_em=NOW(),
+              reembolso_erro=NULL
+        WHERE id=$1
+          AND categoria_atendimento='especialista_imediato'
+          AND especialidade_solicitada = ANY($2::text[])
+          AND status='aguardando'
+          AND pagamento_status='confirmado'
+          AND fallback_disponivel_em IS NOT NULL
+          AND NOW() >= fallback_disponivel_em
+          AND fallback_decisao IS NULL
+          AND (
+            COALESCE(reembolso_status,'') NOT IN ('processando','concluido','parcial_concluido')
+            OR (
+              reembolso_status='processando'
+              AND reembolso_processado_em < NOW() - INTERVAL '5 minutes'
+            )
+          )
+        RETURNING id,nome,tel,cpf,tipo,triagem,pagamento_metodo,pagbank_order_id,
+                  efi_charge_id,valor_cobrado_centavos,especialidade_solicitada`,
+      [atendimentoId, Object.keys(ESPECIALIDADES_IMEDIATAS)]
+    );
+    if (!reserva.rows[0]) {
+      const atual = await pool.query(
+        `SELECT status,fallback_disponivel_em,fallback_decisao,reembolso_status
+           FROM fila_atendimentos WHERE id=$1`,
+        [atendimentoId]
+      );
+      if (!atual.rows[0]) return res.status(404).json({ ok: false, error: "Atendimento nao encontrado" });
+      return res.status(409).json({
+        ok: false,
+        error: "Opcao ainda indisponivel ou decisao ja registrada",
+        atendimento: atual.rows[0]
+      });
+    }
+
+    const at = reserva.rows[0];
+    const total = Number(at.valor_cobrado_centavos) || ESPECIALISTA_IMEDIATO_VALOR_CENTAVOS;
+    const valorReembolso = decisao === "clinico" ? Math.max(0, total - VALOR_CENTAVOS) : total;
+    const refund = await reembolsarAtendimento(at, valorReembolso);
+
+    if (decisao === "clinico") {
+      const atualizado = await pool.query(
+        `UPDATE fila_atendimentos
+            SET fallback_decisao='clinico',
+                fallback_decidido_em=NOW(),
+                reembolso_status='parcial_concluido',
+                reembolso_valor_centavos=$2,
+                reembolso_processado_em=NOW(),
+                reembolso_erro=NULL
+          WHERE id=$1
+          RETURNING id,nome,tel,cpf,tipo,triagem,categoria_atendimento,
+                    especialidade_solicitada,fallback_decisao`,
+        [atendimentoId, valorReembolso]
+      );
+      await notificarMedicos(atualizado.rows[0]);
+      console.log(`[FALLBACK-ESPECIALISTA] #${atendimentoId} liberado para clinico; R$ ${(valorReembolso / 100).toFixed(2)} devolvidos via ${refund.gateway}`);
+      return res.json({
+        ok: true,
+        decisao,
+        reembolso_centavos: valorReembolso,
+        mensagem: "Atendimento liberado para clinico e diferenca devolvida"
+      });
+    }
+
+    await pool.query(
+      `UPDATE fila_atendimentos
+          SET fallback_decisao='reembolso',
+              fallback_decidido_em=NOW(),
+              reembolso_status='concluido',
+              reembolso_valor_centavos=$2,
+              reembolso_processado_em=NOW(),
+              reembolso_erro=NULL,
+              pagamento_status='reembolsado',
+              status='cancelado',
+              encerrado_em=NOW()
+        WHERE id=$1`,
+      [atendimentoId, valorReembolso]
+    );
+    console.log(`[FALLBACK-ESPECIALISTA] #${atendimentoId} cancelado; R$ ${(valorReembolso / 100).toFixed(2)} devolvidos via ${refund.gateway}`);
+    return res.json({
+      ok: true,
+      decisao,
+      reembolso_centavos: valorReembolso,
+      mensagem: "Reembolso integral solicitado"
+    });
+  } catch (e) {
+    await pool.query(
+      `UPDATE fila_atendimentos
+          SET reembolso_status='erro',
+              reembolso_erro=$2
+        WHERE id=$1 AND reembolso_status='processando'`,
+      [atendimentoId, String(e.message || "Falha no reembolso").slice(0, 500)]
+    ).catch(() => {});
+    console.error("[FALLBACK-ESPECIALISTA]", atendimentoId, e.message);
+    return res.status(502).json({
+      ok: false,
+      error: "Nao foi possivel concluir o reembolso agora. Tente novamente."
+    });
+  }
+});
+
 // [UX] Calcula posição do atendimento na fila de aguardando (1 = próximo) e total aguardando.
 // Usado pela tela de espera do paciente para mostrar "Você é o Nº X da fila".
 async function _filaPos(at) {
@@ -3040,16 +3356,18 @@ async function _filaPos(at) {
         WHERE status = 'aguardando'
           AND pagamento_status = 'confirmado'
           AND tipo = $1
+          AND COALESCE(especialidade_solicitada,'') = COALESCE($3,'')
           AND criado_em <= $2`,
-      [at.tipo, at.criado_em]
+      [at.tipo, at.criado_em, at.especialidade_solicitada || null]
     );
     const t = await pool.query(
       `SELECT COUNT(*)::int AS total
          FROM fila_atendimentos
         WHERE status = 'aguardando'
           AND pagamento_status = 'confirmado'
-          AND tipo = $1`,
-      [at.tipo]
+          AND tipo = $1
+          AND COALESCE(especialidade_solicitada,'') = COALESCE($2,'')`,
+      [at.tipo, at.especialidade_solicitada || null]
     );
     return { posicao: q.rows[0]?.pos || 0, total: t.rows[0]?.total || 0 };
   } catch (e) { return { posicao: 0, total: 0 }; }
@@ -3087,6 +3405,23 @@ app.get("/api/atendimento/assumir-email", async (req, res) => {
     catch(e) { return res.send(`<html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#060d0b;color:#fff"><h2 style="color:#ff8080">⏰ Link expirado</h2><p>Este link de assumir atendimento expirou (válido por 2h).</p><a href="${PAINEL_URL}" style="color:#b4e05a">Ir para o painel</a></body></html>`); }
     if (payload.tipo !== "assumir") return res.status(400).send("<h2>Token inválido.</h2>");
     const { medicoId, medicoNome, atendimentoId } = payload;
+    const reserva = await pool.query(
+      `SELECT categoria_atendimento,especialidade_solicitada,fallback_decisao
+         FROM fila_atendimentos
+        WHERE id=$1`,
+      [atendimentoId]
+    );
+    if (reserva.rows[0]?.categoria_atendimento === "especialista_imediato"
+        && reserva.rows[0]?.fallback_decisao !== "clinico"
+        && Number(medicoId) !== 0) {
+      const med = await pool.query(
+        `SELECT especialidade FROM medicos WHERE id=$1 AND ativo=true AND status='aprovado'`,
+        [medicoId]
+      );
+      if (!medicoAtendeEspecialidade(med.rows[0], reserva.rows[0].especialidade_solicitada)) {
+        return res.status(403).send(`<html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#060d0b;color:#fff"><h2 style="color:#ffbd2e">Atendimento reservado</h2><p>Este atendimento ainda está reservado ao especialista escolhido pelo paciente.</p><a href="${PAINEL_URL}" style="color:#b4e05a">Ir para o painel</a></body></html>`);
+      }
+    }
     // Tenta assumir com trava — só um médico consegue
     const result = await pool.query(
       `UPDATE fila_atendimentos SET status='assumido', medico_id=$1, medico_nome=$2, assumido_em=NOW()
@@ -6002,9 +6337,10 @@ app.patch("/api/admin/medico/:id/mover-especialista", checkAdmin, async (req, re
       await client.query(
         `UPDATE medicos
             SET ativo=true,
-                status='aprovado'
+                status='aprovado',
+                especialidade=$2
           WHERE id=$1`,
-        [id]
+        [id, especialidadeReq]
       );
     } else {
       const bloqueioTag = `movido_especialista:${especialidadeReq}`;
@@ -6052,7 +6388,7 @@ app.post("/api/admin/medico/criar", checkAdmin, async (req, res) => {
 
 app.get("/api/admin/medicos", checkAdmin, async (req, res) => {
   try {
-    const result = await pool.query("SELECT id,nome,email,crm,status_online,ativo,created_at FROM medicos ORDER BY id DESC");
+    const result = await pool.query("SELECT id,nome,email,crm,especialidade,status_online,ativo,created_at FROM medicos ORDER BY id DESC");
     return res.json({ ok: true, medicos: result.rows });
   } catch (err) { return res.status(500).json({ ok: false, error: err.message }); }
 });
@@ -6501,10 +6837,16 @@ app.post("/api/medico/login", rlLogin, async (req, res) => {
 app.get("/api/fila", checkMedico, async (req, res) => {
   try {
     const isAdmin = req.medico.email === "gustavosgbf@gmail.com";
+    const medicoDb = await pool.query(
+      `SELECT especialidade FROM medicos WHERE id=$1 LIMIT 1`,
+      [req.medico.id]
+    );
+    const especialidadeMedico = String(medicoDb.rows[0]?.especialidade || "").toLowerCase();
     let query, params;
     if (isAdmin) {
       await reconciliarRenovacoesPendentes().catch(e => console.warn("[RENOVACAO-RECONCILIAR]", e.message));
-      query = `SELECT id,nome,tel,cpf,tipo,triagem,status,pagamento_status,medico_id,medico_nome,meet_link,criado_em,data_nascimento,idade,sexo,alergias,cronicas,medicacoes,queixa,solicita,horario_agendado
+      query = `SELECT id,nome,tel,cpf,tipo,triagem,status,pagamento_status,medico_id,medico_nome,meet_link,criado_em,data_nascimento,idade,sexo,alergias,cronicas,medicacoes,queixa,solicita,horario_agendado,
+                      categoria_atendimento,especialidade_solicitada,valor_cobrado_centavos,fallback_decisao
                  FROM fila_atendimentos
                 WHERE tipo NOT LIKE 'renovacao%'
                   AND status IN ('aguardando','assumido')
@@ -6515,7 +6857,8 @@ app.get("/api/fila", checkMedico, async (req, res) => {
                   AND LOWER(TRIM(COALESCE(triagem,''))) NOT LIKE '(aguardando triagem%'
                 ORDER BY criado_em ASC`;
     } else {
-      query = `SELECT id,nome,tel,cpf,tipo,triagem,status,pagamento_status,medico_id,medico_nome,meet_link,criado_em,data_nascimento,idade,sexo,alergias,cronicas,medicacoes,queixa,solicita,horario_agendado
+      query = `SELECT id,nome,tel,cpf,tipo,triagem,status,pagamento_status,medico_id,medico_nome,meet_link,criado_em,data_nascimento,idade,sexo,alergias,cronicas,medicacoes,queixa,solicita,horario_agendado,
+                      categoria_atendimento,especialidade_solicitada,valor_cobrado_centavos,fallback_decisao
                  FROM fila_atendimentos
                 WHERE status IN ('aguardando','assumido')
                   AND pagamento_status='confirmado'
@@ -6525,7 +6868,23 @@ app.get("/api/fila", checkMedico, async (req, res) => {
                   AND LOWER(TRIM(COALESCE(triagem,''))) NOT LIKE '(triagem em andamento)%'
                   AND LOWER(TRIM(COALESCE(triagem,''))) NOT LIKE '(aguardando triagem%'
                   AND (horario_agendado IS NULL OR horario_agendado <= NOW() + INTERVAL '15 minutes')
+                  AND (
+                    COALESCE(categoria_atendimento,'clinico') <> 'especialista_imediato'
+                    OR fallback_decisao='clinico'
+                    OR (
+                      especialidade_solicitada = ANY($2::text[])
+                      AND $1 LIKE '%' || (
+                        CASE especialidade_solicitada
+                          WHEN 'pediatria' THEN 'pediatr'
+                          WHEN 'geriatria' THEN 'geriatr'
+                          WHEN 'psiquiatria' THEN 'psiquiatr'
+                          ELSE '__sem_especialidade__'
+                        END
+                      ) || '%'
+                    )
+                  )
                 ORDER BY criado_em ASC`;
+      params = [especialidadeMedico, Object.keys(ESPECIALIDADES_IMEDIATAS)];
     }
     const result = await pool.query(query, params || []);
     const fila = [];
@@ -6613,13 +6972,41 @@ app.get("/api/historico", checkMedico, async (req, res) => {
   }
 });
 
-app.post("/api/atendimento/assumir", async (req, res) => {
+app.post("/api/atendimento/assumir", checkMedico, async (req, res) => {
   try {
-    const { filaId, medicoId, medicoNome } = req.body || {};
-    if (!filaId||!medicoId||!medicoNome) return res.status(400).json({ ok: false, error: "Dados obrigatorios faltando" });
+    const { filaId } = req.body || {};
+    if (!filaId) return res.status(400).json({ ok: false, error: "Dados obrigatorios faltando" });
+    const medicoResult = await pool.query(
+      `SELECT id,nome,nome_exibicao,email,especialidade
+         FROM medicos
+        WHERE id=$1 AND ativo=true AND status='aprovado'
+        LIMIT 1`,
+      [req.medico.id]
+    );
+    if (!medicoResult.rows[0]) return res.status(403).json({ ok: false, error: "Medico nao autorizado" });
+    const medico = medicoResult.rows[0];
+    const atendimentoResult = await pool.query(
+      `SELECT id,categoria_atendimento,especialidade_solicitada,fallback_decisao
+         FROM fila_atendimentos
+        WHERE id=$1`,
+      [filaId]
+    );
+    const atendimento = atendimentoResult.rows[0];
+    if (!atendimento) return res.status(404).json({ ok: false, error: "Atendimento nao encontrado" });
+    const isAdmin = medico.email === "gustavosgbf@gmail.com";
+    const reservadoEspecialista = atendimento.categoria_atendimento === "especialista_imediato"
+      && atendimento.fallback_decisao !== "clinico";
+    if (
+      reservadoEspecialista
+      && !isAdmin
+      && !medicoAtendeEspecialidade(medico, atendimento.especialidade_solicitada)
+    ) {
+      return res.status(403).json({ ok: false, error: "Atendimento reservado ao especialista selecionado" });
+    }
+    const medicoNome = medico.nome_exibicao || medico.nome;
     const result = await pool.query(
       `UPDATE fila_atendimentos SET status='assumido',medico_id=$1,medico_nome=$2,assumido_em=NOW() WHERE id=$3 AND status='aguardando' RETURNING *`,
-      [medicoId,medicoNome,filaId]
+      [medico.id,medicoNome,filaId]
     );
     if (result.rowCount===0) return res.status(409).json({ ok: false, error: "Paciente ja foi assumido" });
     const at2 = result.rows[0];
@@ -7256,6 +7643,12 @@ app.post("/api/efi/cartao/cobrar", rlGeral, async (req, res) => {
     } = req.body || {};
     const adsAttribution = normalizarAdsAttribution(req.body?.ads || req.body?.attribution || {}, req);
     const atendimentoIdNum = parseInt(atendimentoId, 10) || null;
+    const configuracao = await buscarConfiguracaoAtendimento(atendimentoIdNum);
+    if (atendimentoIdNum && !configuracao) {
+      return res.status(404).json({ ok: false, error: "Atendimento nao encontrado para cobrar" });
+    }
+    const valorCentavos = configuracao?.valorCentavos || EFI_VALOR_CENTAVOS;
+    const nomeCobranca = configuracao?.nomeCobranca || "Consulta Médica Online — ConsultaJá24h";
 
     // ── Validação ────────────────────────────────────────────────────────────
     if (!payment_token)
@@ -7291,8 +7684,8 @@ app.post("/api/efi/cartao/cobrar", rlGeral, async (req, res) => {
     // Retorna charge_id que será usado no passo 2
     const chargePayload = {
       items: [{
-        name:   "Consulta Médica Online — ConsultaJá24h",
-        value:  EFI_VALOR_CENTAVOS,
+        name:   nomeCobranca,
+        value:  valorCentavos,
         amount: 1
       }],
       metadata: {
@@ -7369,6 +7762,7 @@ app.post("/api/efi/cartao/cobrar", rlGeral, async (req, res) => {
         await pool.query(
           `UPDATE fila_atendimentos
               SET efi_charge_id = $2,
+                  pagamento_metodo = 'cartao',
                   pagador_nome = $3,
                   pagador_cpf = $4,
                   pagador_email = $5,
