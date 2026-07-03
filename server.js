@@ -726,6 +726,18 @@ async function initDB() {
     await pool.query(`ALTER TABLE mensagens ADD COLUMN IF NOT EXISTS arquivo_url TEXT`);
     await pool.query(`ALTER TABLE mensagens ADD COLUMN IF NOT EXISTS arquivo_tipo TEXT`);
     await pool.query(`ALTER TABLE mensagens ADD COLUMN IF NOT EXISTS arquivo_nome TEXT`); // [UX] nome real do arquivo
+    await pool.query(`CREATE TABLE IF NOT EXISTS paciente_bloqueios (
+        id SERIAL PRIMARY KEY,
+        paciente_nome TEXT,
+        cpf TEXT,
+        tel TEXT,
+        motivo TEXT,
+        bloqueado_ate TIMESTAMPTZ NOT NULL,
+        criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_paciente_bloqueios_cpf ON paciente_bloqueios(cpf)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_paciente_bloqueios_tel ON paciente_bloqueios(tel)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_paciente_bloqueios_ate ON paciente_bloqueios(bloqueado_ate)`);
     await pool.query(`CREATE TABLE IF NOT EXISTS agendamentos (
         id SERIAL PRIMARY KEY,
         nome TEXT NOT NULL,
@@ -1572,9 +1584,53 @@ if (!PAGBANK_TOKEN) console.error("[PAGBANK] Token não configurado");
 const LIMITE_ATENDIMENTOS_JANELA_DIAS = 5;
 const LIMITE_ATENDIMENTOS_QUANTIDADE = 2;
 
+async function buscarBloqueioManualAtendimento(atendimentoId) {
+  const id = parseInt(atendimentoId, 10);
+  if (!id) return null;
+  const { rows } = await pool.query(
+    `WITH atual AS (
+       SELECT regexp_replace(COALESCE(cpf,''), '\\D', '', 'g') AS cpf,
+              regexp_replace(COALESCE(tel,''), '\\D', '', 'g') AS tel
+         FROM fila_atendimentos
+        WHERE id = $1
+     )
+     SELECT b.bloqueado_ate, b.motivo
+       FROM paciente_bloqueios b, atual a
+      WHERE b.bloqueado_ate > NOW()
+        AND (
+          (
+            regexp_replace(COALESCE(b.cpf,''), '\\D', '', 'g') <> ''
+            AND a.cpf <> ''
+            AND regexp_replace(COALESCE(b.cpf,''), '\\D', '', 'g') = a.cpf
+          )
+          OR
+          (
+            regexp_replace(COALESCE(b.cpf,''), '\\D', '', 'g') = ''
+            AND a.tel <> ''
+            AND regexp_replace(COALESCE(b.tel,''), '\\D', '', 'g') = a.tel
+          )
+        )
+      ORDER BY b.bloqueado_ate DESC
+      LIMIT 1`,
+    [id]
+  );
+  return rows[0] || null;
+}
+
 async function buscarLimiteAtendimentos(atendimentoId) {
   const id = parseInt(atendimentoId, 10);
   if (!id) return null;
+  const bloqueioManual = await buscarBloqueioManualAtendimento(id);
+  if (bloqueioManual) {
+    return {
+      manual: true,
+      quantidade: 0,
+      limite: 0,
+      janela_dias: null,
+      liberado_em: bloqueioManual.bloqueado_ate,
+      motivo: bloqueioManual.motivo || ""
+    };
+  }
   const { rows } = await pool.query(
     `WITH atual AS (
        SELECT regexp_replace(COALESCE(cpf,''), '\\D', '', 'g') AS cpf,
@@ -1612,6 +1668,17 @@ async function buscarLimiteAtendimentos(atendimentoId) {
 }
 
 function responderLimiteAtendimentos(res, limite) {
+  if (limite.manual) {
+    const dataLiberacao = limite.liberado_em
+      ? new Date(limite.liberado_em).toLocaleDateString("pt-BR", { timeZone: "America/Fortaleza" })
+      : "";
+    return res.status(429).json({
+      ok: false,
+      code: "cadastro_temporariamente_bloqueado",
+      error: `Este cadastro está temporariamente indisponível para novos atendimentos${dataLiberacao ? ` até ${dataLiberacao}` : ""}.`,
+      liberado_em: limite.liberado_em
+    });
+  }
   return res.status(429).json({
     ok: false,
     code: "limite_atendimentos_recentes",
@@ -1622,6 +1689,52 @@ function responderLimiteAtendimentos(res, limite) {
     liberado_em: limite.liberado_em
   });
 }
+
+app.post("/api/admin/pacientes/bloquear", checkAdmin, async (req, res) => {
+  try {
+    const nome = String(req.body?.nome || "").trim();
+    const dias = Math.min(90, Math.max(1, parseInt(req.body?.dias || "1", 10) || 1));
+    const motivo = String(req.body?.motivo || "Bloqueio administrativo temporário").trim().slice(0, 300);
+    if (!nome) return res.status(400).json({ ok: false, error: "nome obrigatório" });
+
+    const { rows } = await pool.query(
+      `SELECT nome,
+              regexp_replace(COALESCE(cpf,''), '\\D', '', 'g') AS cpf,
+              regexp_replace(COALESCE(tel,''), '\\D', '', 'g') AS tel
+         FROM fila_atendimentos
+        WHERE LOWER(BTRIM(nome)) = LOWER(BTRIM($1))
+        ORDER BY COALESCE(pagamento_confirmado_em, criado_em) DESC, id DESC
+        LIMIT 1`,
+      [nome]
+    );
+    const paciente = rows[0];
+    if (!paciente) return res.status(404).json({ ok: false, error: "Paciente não encontrado" });
+    if (!paciente.cpf && !paciente.tel) {
+      return res.status(409).json({ ok: false, error: "Paciente sem CPF ou telefone para aplicar o bloqueio" });
+    }
+
+    const cpfBloqueio = paciente.cpf || "";
+    const telBloqueio = cpfBloqueio ? "" : paciente.tel;
+    const inserido = await pool.query(
+      `INSERT INTO paciente_bloqueios
+         (paciente_nome, cpf, tel, motivo, bloqueado_ate)
+       VALUES ($1,$2,$3,$4,NOW() + ($5::text || ' days')::interval)
+       RETURNING id, paciente_nome, bloqueado_ate`,
+      [paciente.nome, cpfBloqueio, telBloqueio, motivo, dias]
+    );
+    console.log(`[PACIENTE-BLOQUEIO] ${paciente.nome} bloqueado por ${dias} dia(s) — id ${inserido.rows[0].id}`);
+    return res.json({
+      ok: true,
+      id: inserido.rows[0].id,
+      paciente_nome: inserido.rows[0].paciente_nome,
+      bloqueado_ate: inserido.rows[0].bloqueado_ate,
+      identificacao: cpfBloqueio ? "cpf" : "telefone"
+    });
+  } catch (e) {
+    console.error("[PACIENTE-BLOQUEIO]", e.message);
+    return res.status(500).json({ ok: false, error: "Não foi possível aplicar o bloqueio" });
+  }
+});
 
 app.get("/api/pagamento/elegibilidade/:atendimentoId", async (req, res) => {
   try {
