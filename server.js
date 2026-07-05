@@ -3025,14 +3025,14 @@ app.post("/api/notify", rlTriagem, async (req, res) => {
         await pool.query(
           `UPDATE fila_atendimentos
               SET nome=CASE
-                    WHEN $2 IS NOT NULL AND LOWER($2) <> 'paciente' THEN $2
+                    WHEN $2::text IS NOT NULL AND LOWER($2::text) <> 'paciente' THEN $2::text
                     ELSE nome
                   END,
-                  tel=COALESCE($3,tel),
-                  tel_documentos=COALESCE($4,tel_documentos),
-                  cpf=COALESCE($5,cpf),
-                  data_nascimento=COALESCE($6,data_nascimento),
-                  email=COALESCE($7,email)
+                  tel=COALESCE($3::text,tel),
+                  tel_documentos=COALESCE($4::text,tel_documentos),
+                  cpf=COALESCE($5::text,cpf),
+                  data_nascimento=COALESCE($6::text,data_nascimento),
+                  email=COALESCE($7::text,email)
             WHERE id=$1`,
           [atendimentoPago.id, nomeLimpo, telLimpo, telDocLimpo, cpfLimpo, dataNascLimpa, emailLimpo]
         );
