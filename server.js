@@ -1703,11 +1703,11 @@ async function buscarAtendimentoPagoAtivoPorIdentidade({ cpf, tel, especialidade
       WHERE pagamento_status='confirmado'
         AND status IN ('triagem','aguardando','assumido')
         AND COALESCE(pagamento_confirmado_em,criado_em) >= NOW() - INTERVAL '12 hours'
-        AND COALESCE(especialidade_solicitada,'') = $3
+        AND COALESCE(especialidade_solicitada,'') = $3::text
         AND (
-          ($1 <> '' AND regexp_replace(COALESCE(cpf,''), '\\D', '', 'g') = $1)
+          ($1::text <> '' AND regexp_replace(COALESCE(cpf,''), '\\D', '', 'g') = $1::text)
           OR
-          ($1 = '' AND $2 <> '' AND regexp_replace(COALESCE(tel,''), '\\D', '', 'g') = $2)
+          ($1::text = '' AND $2::text <> '' AND regexp_replace(COALESCE(tel,''), '\\D', '', 'g') = $2::text)
         )
       ORDER BY COALESCE(pagamento_confirmado_em,criado_em) DESC,id DESC
       LIMIT 1`,
