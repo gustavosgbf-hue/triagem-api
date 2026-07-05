@@ -1690,6 +1690,32 @@ function responderLimiteAtendimentos(res, limite) {
   });
 }
 
+async function buscarAtendimentoPagoAtivoPorIdentidade({ cpf, tel, especialidade }) {
+  const cpfLimpo = String(cpf || "").replace(/\D/g, "");
+  const telLimpo = String(tel || "").replace(/\D/g, "");
+  if (!cpfLimpo && !telLimpo) return null;
+  const especialidadeLimpa = normalizarEspecialidadeImediata(especialidade) || "";
+  const { rows } = await pool.query(
+    `SELECT id,nome,tel,cpf,email,tipo,status,pagamento_status,
+            pagbank_order_id,efi_charge_id,pagamento_metodo,
+            categoria_atendimento,especialidade_solicitada,valor_cobrado_centavos
+       FROM fila_atendimentos
+      WHERE pagamento_status='confirmado'
+        AND status IN ('triagem','aguardando','assumido')
+        AND COALESCE(pagamento_confirmado_em,criado_em) >= NOW() - INTERVAL '12 hours'
+        AND COALESCE(especialidade_solicitada,'') = $3
+        AND (
+          ($1 <> '' AND regexp_replace(COALESCE(cpf,''), '\\D', '', 'g') = $1)
+          OR
+          ($1 = '' AND $2 <> '' AND regexp_replace(COALESCE(tel,''), '\\D', '', 'g') = $2)
+        )
+      ORDER BY COALESCE(pagamento_confirmado_em,criado_em) DESC,id DESC
+      LIMIT 1`,
+    [cpfLimpo, telLimpo, especialidadeLimpa]
+  );
+  return rows[0] || null;
+}
+
 app.post("/api/admin/pacientes/bloquear", checkAdmin, async (req, res) => {
   try {
     const nome = String(req.body?.nome || "").trim();
@@ -2986,6 +3012,46 @@ app.post("/api/notify", rlTriagem, async (req, res) => {
     const checkoutSessionId = adsAttribution.checkoutSessionId || null;
     const especialidadeImediata = normalizarEspecialidadeImediata(especialidade_solicitada);
     const configuracao = configuracaoAtendimentoImediato(especialidadeImediata);
+
+    // Se o navegador perdeu a sessão após o pagamento, retoma o atendimento
+    // confirmado pela identidade clínica em vez de abrir outra cobrança.
+    if (triagemPlaceholder) {
+      const atendimentoPago = await buscarAtendimentoPagoAtivoPorIdentidade({
+        cpf: cpfLimpo,
+        tel: telLimpo,
+        especialidade: especialidadeImediata
+      });
+      if (atendimentoPago) {
+        await pool.query(
+          `UPDATE fila_atendimentos
+              SET nome=CASE
+                    WHEN $2 IS NOT NULL AND LOWER($2) <> 'paciente' THEN $2
+                    ELSE nome
+                  END,
+                  tel=COALESCE($3,tel),
+                  tel_documentos=COALESCE($4,tel_documentos),
+                  cpf=COALESCE($5,cpf),
+                  data_nascimento=COALESCE($6,data_nascimento),
+                  email=COALESCE($7,email)
+            WHERE id=$1`,
+          [atendimentoPago.id, nomeLimpo, telLimpo, telDocLimpo, cpfLimpo, dataNascLimpa, emailLimpo]
+        );
+        await salvarAdsAttribution(atendimentoPago.id, adsAttribution, req);
+        console.log(
+          `[NOTIFY-RETOMA-PAGO] atendimento #${atendimentoPago.id} retomado`
+          + (atendimentoId ? ` no lugar do pré-registro #${atendimentoId}` : "")
+        );
+        return res.json({
+          ok: true,
+          atendimentoId: atendimentoPago.id,
+          linkRetorno: `${SITE_URL}/triagem.html?consulta=${atendimentoPago.id}`,
+          pagamentoConfirmado: true,
+          atendimentoRetomado: true,
+          status: atendimentoPago.status,
+          tipo: atendimentoPago.tipo || tipoConsulta
+        });
+      }
+    }
 
     if (atendimentoId) {
       const updateResult = await pool.query(
