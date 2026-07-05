@@ -3217,7 +3217,14 @@ app.post("/api/notify", rlTriagem, async (req, res) => {
     return res.json({ ok: true, atendimentoId: novoAtendimentoId, linkRetorno });
   } catch (e) {
     console.error("Notify error:", e);
-    if (!res.headersSent) return res.status(500).json({ ok: false });
+    if (!res.headersSent) {
+      const adminDebug = process.env.ADMIN_PASSWORD
+        && req.headers["x-admin-password"] === process.env.ADMIN_PASSWORD;
+      return res.status(500).json({
+        ok: false,
+        ...(adminDebug ? { debug: e.message } : {})
+      });
+    }
   }
 });
 
