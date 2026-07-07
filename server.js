@@ -3432,6 +3432,7 @@ async function reembolsarAtendimento(atendimento, valorCentavos) {
 
 app.post("/api/admin/atendimento/:id/reembolsar", checkAdmin, async (req, res) => {
   const atendimentoId = parseInt(req.params.id, 10);
+  const marcarManual = req.body?.manual === true;
   if (!atendimentoId) return res.status(400).json({ ok: false, error: "Atendimento invalido" });
 
   try {
@@ -3472,6 +3473,29 @@ app.post("/api/admin/atendimento/:id/reembolsar", checkAdmin, async (req, res) =
 
     const at = reserva.rows[0];
     const valorReembolso = Number(at.valor_cobrado_centavos) || VALOR_CENTAVOS;
+    if (marcarManual) {
+      await pool.query(
+        `UPDATE fila_atendimentos
+            SET reembolso_status='manual_pendente',
+                reembolso_valor_centavos=$2,
+                reembolso_processado_em=NOW(),
+                reembolso_erro=NULL,
+                pagamento_status='reembolso_pendente',
+                status='cancelado',
+                encerrado_em=NOW()
+          WHERE id=$1`,
+        [atendimentoId, valorReembolso]
+      );
+      console.log(`[ADMIN-REEMBOLSO] #${atendimentoId} cancelado; reembolso manual pendente de R$ ${(valorReembolso / 100).toFixed(2)}`);
+      return res.json({
+        ok: true,
+        atendimento_id: atendimentoId,
+        manual: true,
+        reembolso_centavos: valorReembolso,
+        mensagem: "Atendimento cancelado e aviso de reembolso exibido"
+      });
+    }
+
     const refund = await reembolsarAtendimento(at, valorReembolso);
 
     await pool.query(
