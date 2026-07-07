@@ -3493,7 +3493,8 @@ app.post("/api/admin/atendimento/:id/reembolsar", checkAdmin, async (req, res) =
     console.error("[ADMIN-REEMBOLSO]", atendimentoId, e.message);
     return res.status(502).json({
       ok: false,
-      error: "Nao foi possivel concluir o reembolso agora. Tente novamente."
+      error: "Nao foi possivel concluir o reembolso agora. Tente novamente.",
+      detalhe: String(e.message || "Falha no reembolso").slice(0, 500)
     });
   }
 });
