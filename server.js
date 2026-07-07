@@ -3394,27 +3394,40 @@ async function reembolsarAtendimento(atendimento, valorCentavos) {
   if (!atendimento.pagbank_order_id || !PAGBANK_TOKEN) {
     throw new Error("Cobranca PagBank nao localizada");
   }
-  const orderRes = await fetch(`${PAGBANK_URL}/orders/${atendimento.pagbank_order_id}`, {
-    headers: { Authorization: `Bearer ${PAGBANK_TOKEN}`, accept: "application/json" }
-  });
-  const order = await orderRes.json();
-  if (!orderRes.ok) throw new Error(formatPagBankError(order?.error_messages || order));
+  let order;
+  try {
+    const orderRes = await axios.get(`${PAGBANK_URL}/orders/${atendimento.pagbank_order_id}`, {
+      timeout: 12000,
+      headers: { Authorization: `Bearer ${PAGBANK_TOKEN}`, accept: "application/json" }
+    });
+    order = orderRes.data;
+  } catch (e) {
+    const payload = e.response?.data;
+    throw new Error(payload ? formatPagBankError(payload?.error_messages || payload) : `Falha ao consultar pedido PagBank: ${e.message}`);
+  }
+
   const cobranca = localizarCobrancaPagBankParaEstorno(order);
   if (!cobranca) throw new Error("Pagamento PagBank pago nao localizado para estorno");
   const linkCancelamento = (cobranca.links || []).find(link => link?.rel === "CHARGE.CANCEL")?.href;
   const url = linkCancelamento || `${PAGBANK_URL}/charges/${cobranca.id}/cancel`;
-  const refundRes = await fetch(url, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${PAGBANK_TOKEN}`,
-      "Content-Type": "application/json",
-      accept: "application/json"
-    },
-    body: JSON.stringify({ amount: { value: valorCentavos } })
-  });
-  const refund = await refundRes.json();
-  if (!refundRes.ok) throw new Error(formatPagBankError(refund?.error_messages || refund));
-  return { gateway: "pagbank", resposta: refund };
+  try {
+    const refundRes = await axios.post(
+      url,
+      { amount: { value: valorCentavos } },
+      {
+        timeout: 12000,
+        headers: {
+          Authorization: `Bearer ${PAGBANK_TOKEN}`,
+          "Content-Type": "application/json",
+          accept: "application/json"
+        }
+      }
+    );
+    return { gateway: "pagbank", resposta: refundRes.data };
+  } catch (e) {
+    const payload = e.response?.data;
+    throw new Error(payload ? formatPagBankError(payload?.error_messages || payload) : `Falha ao cancelar cobranca PagBank: ${e.message}`);
+  }
 }
 
 app.post("/api/admin/atendimento/:id/reembolsar", checkAdmin, async (req, res) => {
