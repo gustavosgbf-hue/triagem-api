@@ -3417,6 +3417,87 @@ async function reembolsarAtendimento(atendimento, valorCentavos) {
   return { gateway: "pagbank", resposta: refund };
 }
 
+app.post("/api/admin/atendimento/:id/reembolsar", checkAdmin, async (req, res) => {
+  const atendimentoId = parseInt(req.params.id, 10);
+  if (!atendimentoId) return res.status(400).json({ ok: false, error: "Atendimento invalido" });
+
+  try {
+    const reserva = await pool.query(
+      `UPDATE fila_atendimentos
+          SET reembolso_status='processando',
+              reembolso_processado_em=NOW(),
+              reembolso_erro=NULL
+        WHERE id=$1
+          AND pagamento_status='confirmado'
+          AND status IN ('triagem','aguardando','assumido','aguardando_aprovacao')
+          AND encerrado_em IS NULL
+          AND (
+            COALESCE(reembolso_status,'') NOT IN ('processando','concluido','parcial_concluido')
+            OR (
+              reembolso_status='processando'
+              AND reembolso_processado_em < NOW() - INTERVAL '5 minutes'
+            )
+          )
+        RETURNING id,nome,tel,cpf,tipo,triagem,pagamento_metodo,pagbank_order_id,
+                  efi_charge_id,valor_cobrado_centavos,status`,
+      [atendimentoId]
+    );
+
+    if (!reserva.rows[0]) {
+      const atual = await pool.query(
+        `SELECT id,status,pagamento_status,encerrado_em,reembolso_status
+           FROM fila_atendimentos WHERE id=$1`,
+        [atendimentoId]
+      );
+      if (!atual.rows[0]) return res.status(404).json({ ok: false, error: "Atendimento nao encontrado" });
+      return res.status(409).json({
+        ok: false,
+        error: "Atendimento nao esta elegivel para estorno automatico",
+        atendimento: atual.rows[0]
+      });
+    }
+
+    const at = reserva.rows[0];
+    const valorReembolso = Number(at.valor_cobrado_centavos) || VALOR_CENTAVOS;
+    const refund = await reembolsarAtendimento(at, valorReembolso);
+
+    await pool.query(
+      `UPDATE fila_atendimentos
+          SET reembolso_status='concluido',
+              reembolso_valor_centavos=$2,
+              reembolso_processado_em=NOW(),
+              reembolso_erro=NULL,
+              pagamento_status='reembolsado',
+              status='cancelado',
+              encerrado_em=NOW()
+        WHERE id=$1`,
+      [atendimentoId, valorReembolso]
+    );
+
+    console.log(`[ADMIN-REEMBOLSO] #${atendimentoId} cancelado; R$ ${(valorReembolso / 100).toFixed(2)} devolvidos via ${refund.gateway}`);
+    return res.json({
+      ok: true,
+      atendimento_id: atendimentoId,
+      gateway: refund.gateway,
+      reembolso_centavos: valorReembolso,
+      mensagem: "Atendimento cancelado e reembolso solicitado"
+    });
+  } catch (e) {
+    await pool.query(
+      `UPDATE fila_atendimentos
+          SET reembolso_status='erro',
+              reembolso_erro=$2
+        WHERE id=$1 AND reembolso_status='processando'`,
+      [atendimentoId, String(e.message || "Falha no reembolso").slice(0, 500)]
+    ).catch(() => {});
+    console.error("[ADMIN-REEMBOLSO]", atendimentoId, e.message);
+    return res.status(502).json({
+      ok: false,
+      error: "Nao foi possivel concluir o reembolso agora. Tente novamente."
+    });
+  }
+});
+
 app.post("/api/atendimento/:id/fallback-especialista", rlGeral, async (req, res) => {
   const atendimentoId = parseInt(req.params.id, 10);
   const decisao = String(req.body?.decisao || "").trim().toLowerCase();
