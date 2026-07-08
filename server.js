@@ -2305,6 +2305,32 @@ app.post("/api/admin/atendimento/:id/notificar-medicos", checkAdmin, async (req,
   }
 });
 
+app.patch("/api/admin/atendimento/:id/queixa", checkAdmin, async (req, res) => {
+  try {
+    const atendimentoId = Number(req.params.id);
+    const queixa = limitarTexto(normalizarTexto(req.body?.queixa), 500);
+    if (!Number.isInteger(atendimentoId) || atendimentoId <= 0 || !queixa) {
+      return res.status(400).json({ ok: false, error: "Atendimento ou queixa inválida." });
+    }
+    const { rows } = await pool.query(
+      `UPDATE fila_atendimentos
+          SET queixa=$2,
+              triagem=$2
+        WHERE id=$1
+        RETURNING id,nome,queixa,triagem,status`,
+      [atendimentoId, queixa]
+    );
+    if (!rows[0]) {
+      return res.status(404).json({ ok: false, error: "Atendimento não encontrado." });
+    }
+    console.log(`[ADMIN-QUEIXA] Atendimento #${atendimentoId} atualizado`);
+    return res.json({ ok: true, atendimento: rows[0] });
+  } catch (e) {
+    console.error("[ADMIN-QUEIXA]", e.message);
+    return res.status(500).json({ ok: false, error: "Erro ao atualizar queixa." });
+  }
+});
+
 app.post("/api/admin/atendimento/:id/liberar-se-inativo", checkAdmin, async (req, res) => {
   try {
     const atendimentoId = Number(req.params.id);
