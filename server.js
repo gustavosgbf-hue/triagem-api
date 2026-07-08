@@ -2309,6 +2309,7 @@ app.post("/api/admin/atendimento/:id/liberar-se-inativo", checkAdmin, async (req
   try {
     const atendimentoId = Number(req.params.id);
     const medicoIdEsperado = Number(req.body?.medicoId);
+    const notificar = req.body?.notificar !== false;
     if (!Number.isInteger(atendimentoId) || atendimentoId <= 0 || !Number.isInteger(medicoIdEsperado)) {
       return res.status(400).json({ ok: false, error: "Atendimento ou médico inválido." });
     }
@@ -2355,7 +2356,7 @@ app.post("/api/admin/atendimento/:id/liberar-se-inativo", checkAdmin, async (req
     if (!liberado.rows[0]) {
       return res.json({ ok: true, liberado: false, motivo: "atendimento_ja_alterado" });
     }
-    await notificarMedicos(liberado.rows[0]);
+    if (notificar) await notificarMedicos(liberado.rows[0]);
     console.log(`[ADMIN-LIBERAR] Atendimento #${atendimentoId} liberado por inatividade do médico #${medicoIdEsperado}`);
     return res.json({ ok: true, liberado: true, atendimentoId });
   } catch (e) {
