@@ -7363,7 +7363,7 @@ app.get("/api/fila", checkMedico, async (req, res) => {
                  FROM fila_atendimentos
                 WHERE tipo NOT LIKE 'renovacao%'
                   AND status IN ('aguardando','assumido')
-                  AND pagamento_status='confirmado'
+                  AND pagamento_status IN ('confirmado','isento_admin')
                   AND LOWER(TRIM(COALESCE(triagem,''))) NOT LIKE '(aguardando pagamento)%'
                   AND LOWER(TRIM(COALESCE(triagem,''))) NOT LIKE '(pagamento confirmado%'
                   AND LOWER(TRIM(COALESCE(triagem,''))) NOT LIKE '(triagem em andamento)%'
@@ -7374,7 +7374,7 @@ app.get("/api/fila", checkMedico, async (req, res) => {
                       categoria_atendimento,especialidade_solicitada,valor_cobrado_centavos,fallback_decisao
                  FROM fila_atendimentos
                 WHERE status IN ('aguardando','assumido')
-                  AND pagamento_status='confirmado'
+                  AND pagamento_status IN ('confirmado','isento_admin')
                   AND tipo NOT LIKE 'renovacao%'
                   AND LOWER(TRIM(COALESCE(triagem,''))) NOT LIKE '(aguardando pagamento)%'
                   AND LOWER(TRIM(COALESCE(triagem,''))) NOT LIKE '(pagamento confirmado%'
