@@ -7042,6 +7042,112 @@ app.post("/api/admin/atendimentos/manual", checkAdmin, async (req, res) => {
   }
 });
 
+app.post("/api/admin/atendimentos/:id/transferir", checkAdmin, async (req, res) => {
+  try {
+    const atendimentoId = Number(req.params.id);
+    const medicoBusca = normalizarTexto(req.body?.medico);
+    const notificar = req.body?.notificar !== false;
+    if (!Number.isInteger(atendimentoId) || atendimentoId <= 0 || !medicoBusca) {
+      return res.status(400).json({ ok: false, error: "Informe atendimento e médico." });
+    }
+
+    const termo = `%${medicoBusca.trim()}%`;
+    const medicos = await pool.query(
+      `SELECT id,nome,nome_exibicao,email,crm
+         FROM medicos
+        WHERE ativo=true
+          AND status='aprovado'
+          AND (nome ILIKE $1 OR COALESCE(nome_exibicao,'') ILIKE $1 OR email ILIKE $1)
+        ORDER BY
+          CASE WHEN LOWER(email)=LOWER($2) THEN 0 ELSE 1 END,
+          nome
+        LIMIT 2`,
+      [termo, medicoBusca.trim()]
+    );
+    if (medicos.rowCount === 0) {
+      return res.status(404).json({ ok: false, error: "Médico não encontrado." });
+    }
+    if (medicos.rowCount > 1) {
+      return res.status(409).json({
+        ok: false,
+        error: "Busca ambígua. Informe o e-mail exato.",
+        medicos: medicos.rows.map(m => ({ id: m.id, nome: m.nome_exibicao || m.nome, email: m.email }))
+      });
+    }
+
+    const medico = medicos.rows[0];
+    const medicoNome = medico.nome_exibicao || medico.nome;
+    const atualizado = await pool.query(
+      `UPDATE fila_atendimentos
+          SET medico_id=$1,
+              medico_nome=$2,
+              status=CASE WHEN status IN ('encerrado','expirado','arquivado') THEN status ELSE 'assumido' END,
+              assumido_em=COALESCE(assumido_em,NOW())
+        WHERE id=$3
+        RETURNING id,nome,tel,cpf,tipo,triagem,queixa,status,medico_id,medico_nome,assumido_em,encerrado_em`,
+      [medico.id, medicoNome, atendimentoId]
+    );
+    if (atualizado.rowCount === 0) {
+      return res.status(404).json({ ok: false, error: "Atendimento não encontrado." });
+    }
+    const atendimento = atualizado.rows[0];
+    const agora = new Date().toLocaleString("pt-BR", { timeZone: "America/Fortaleza" });
+    await appendToSheet("Atendimentos", [
+      agora, atendimento.nome || "", atendimento.tel || "", atendimento.cpf || "",
+      "Assumido", medicoNome, triagemParaPlanilha(atendimento.triagem, atendimento.queixa),
+      atendimento.tipo || "", "", String(atendimento.id)
+    ]).catch(e => console.error("[Sheets transferência]", e.message));
+
+    let emailEnviado = false;
+    if (notificar && process.env.RESEND_API_KEY && medico.email) {
+      const painelUrl = "https://painel.consultaja24h.com.br";
+      const modalidade = atendimento.tipo === "video" ? "vídeo" : "chat";
+      const html = `<div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;color:#17211d">
+        <p>Olá, ${normalizarNomePaciente(medicoNome)}.</p>
+        <h2 style="font-size:20px;margin:18px 0 8px">Atendimento atribuído a você</h2>
+        <p style="line-height:1.55;color:#425049">Um atendimento de cortesia foi transferido diretamente para o seu painel.</p>
+        <div style="padding:16px;border:1px solid #dfe8e3;border-radius:8px;background:#f8fbf9">
+          <p style="margin:0 0 8px"><strong>Paciente:</strong> ${normalizarNomePaciente(atendimento.nome) || "Nome não informado"}</p>
+          <p style="margin:0"><strong>Modalidade:</strong> ${modalidade}</p>
+        </div>
+        <div style="margin-top:22px">
+          <a href="${painelUrl}" style="display:inline-block;padding:13px 24px;border-radius:8px;background:#168653;color:#fff;font-weight:700;text-decoration:none">Abrir atendimento</a>
+        </div>
+        <p style="margin-top:18px;font-size:12px;color:#718078">Equipe ConsultaJá24h</p>
+      </div>`;
+      const envio = await enviarResendComFallback({
+        apiKey: process.env.RESEND_API_KEY,
+        from: RESEND_FILA_FROM,
+        fallbackFrom: RESEND_DEFAULT_FROM,
+        to: [medico.email],
+        subject: `ATENDIMENTO ATRIBUÍDO - ${normalizarNomePaciente(atendimento.nome) || `#${atendimento.id}`}`,
+        html,
+        text: `${atendimento.nome || "Paciente"} foi atribuído a você para atendimento por ${modalidade}.\n\nPainel: ${painelUrl}`,
+        replyTo: "consultaja24@gmail.com",
+        headers: {
+          "X-Priority": "1",
+          "Priority": "urgent",
+          "Importance": "high",
+          "X-Entity-Ref-ID": `transferencia-${atendimento.id}-${medico.id}-${Date.now()}`
+        },
+        tag: "atendimento-transferido"
+      });
+      emailEnviado = Boolean(envio?.res?.ok);
+    }
+
+    console.log(`[ADMIN-TRANSFERIR] Atendimento #${atendimento.id} -> ${medico.email}`);
+    return res.json({
+      ok: true,
+      atendimento,
+      medico: { id: medico.id, nome: medicoNome, email: medico.email },
+      emailEnviado
+    });
+  } catch (e) {
+    console.error("[ADMIN-TRANSFERIR]", e.message);
+    return res.status(500).json({ ok: false, error: "Erro ao transferir atendimento." });
+  }
+});
+
 // Rate limiting simples para esqueci-senha
 const esqueciRateLimit = new Map();
 
