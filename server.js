@@ -2305,6 +2305,65 @@ app.post("/api/admin/atendimento/:id/notificar-medicos", checkAdmin, async (req,
   }
 });
 
+app.post("/api/admin/atendimento/:id/liberar-se-inativo", checkAdmin, async (req, res) => {
+  try {
+    const atendimentoId = Number(req.params.id);
+    const medicoIdEsperado = Number(req.body?.medicoId);
+    if (!Number.isInteger(atendimentoId) || atendimentoId <= 0 || !Number.isInteger(medicoIdEsperado)) {
+      return res.status(400).json({ ok: false, error: "Atendimento ou médico inválido." });
+    }
+    const atual = await pool.query(
+      `SELECT id,nome,status,medico_id,medico_nome,assumido_em
+         FROM fila_atendimentos
+        WHERE id=$1
+        LIMIT 1`,
+      [atendimentoId]
+    );
+    if (!atual.rows[0]) {
+      return res.status(404).json({ ok: false, error: "Atendimento não encontrado." });
+    }
+    const at = atual.rows[0];
+    if (String(at.medico_id || "") !== String(medicoIdEsperado) || at.status !== "assumido") {
+      return res.json({ ok: true, liberado: false, motivo: "atendimento_ja_alterado", atendimento: at });
+    }
+    const atividade = await pool.query(
+      `SELECT 1
+         FROM mensagens
+        WHERE atendimento_id=$1
+          AND autor='medico'
+          AND autor_id=$2
+          AND criado_em >= COALESCE($3,NOW() - INTERVAL '30 minutes')
+        LIMIT 1`,
+      [atendimentoId, medicoIdEsperado, at.assumido_em]
+    );
+    if (atividade.rowCount > 0) {
+      return res.json({ ok: true, liberado: false, motivo: "medico_iniciou_atendimento", atendimento: at });
+    }
+
+    const liberado = await pool.query(
+      `UPDATE fila_atendimentos
+          SET status='aguardando',
+              medico_id=NULL,
+              medico_nome=NULL,
+              assumido_em=NULL
+        WHERE id=$1
+          AND status='assumido'
+          AND medico_id=$2
+        RETURNING *`,
+      [atendimentoId, medicoIdEsperado]
+    );
+    if (!liberado.rows[0]) {
+      return res.json({ ok: true, liberado: false, motivo: "atendimento_ja_alterado" });
+    }
+    await notificarMedicos(liberado.rows[0]);
+    console.log(`[ADMIN-LIBERAR] Atendimento #${atendimentoId} liberado por inatividade do médico #${medicoIdEsperado}`);
+    return res.json({ ok: true, liberado: true, atendimentoId });
+  } catch (e) {
+    console.error("[ADMIN-LIBERAR]", e.message);
+    return res.status(500).json({ ok: false, error: "Erro ao liberar atendimento." });
+  }
+});
+
 // ── E-MAIL: novo cadastro de médico (só para o admin) ──────────────────────────
 async function enviarEmailNovoCadastroMedico({ nome, email, crm, uf, especialidade, telefone }) {
   const RESEND_KEY = process.env.RESEND_API_KEY;
