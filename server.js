@@ -2263,6 +2263,48 @@ app.post("/api/admin/fila/reenviar-emails", checkAdmin, async (req, res) => {
   }
 });
 
+app.post("/api/admin/atendimento/:id/notificar-medicos", checkAdmin, async (req, res) => {
+  try {
+    const atendimentoId = Number(req.params.id);
+    if (!Number.isInteger(atendimentoId) || atendimentoId <= 0) {
+      return res.status(400).json({ ok: false, error: "Atendimento inválido." });
+    }
+    const { rows } = await pool.query(
+      `SELECT id,nome,tel,tipo,triagem,queixa,especialidade_solicitada,fallback_decisao
+         FROM fila_atendimentos
+        WHERE id=$1
+        LIMIT 1`,
+      [atendimentoId]
+    );
+    if (!rows[0]) {
+      return res.status(404).json({ ok: false, error: "Atendimento não encontrado." });
+    }
+    const at = rows[0];
+    const nomeFila = normalizarNomePaciente(at.nome) || "Nome não informado";
+    const SITE_URL = process.env.SITE_URL || "https://consultaja24h.com.br";
+    await enviarEmailMedicos({
+      nome: nomeFila,
+      tel: at.tel,
+      tipo: at.tipo,
+      triagem: at.triagem || at.queixa,
+      linkRetorno: `${SITE_URL}/triagem.html?consulta=${at.id}`,
+      atendimentoId: at.id,
+      horarioAgendado: null,
+      horarioAgendadoRaw: null,
+      especialidadeSolicitada: at.especialidade_solicitada,
+      fallbackClinico: at.fallback_decisao === "clinico",
+      subject: at.especialidade_solicitada
+        ? `${nomeEspecialidadeImediata(at.especialidade_solicitada).toUpperCase()} - PACIENTE NOVO NA FILA - ${nomeFila}`
+        : `PACIENTE NOVO NA FILA - ${nomeFila}`
+    });
+    console.log(`[ADMIN-NOTIFICAR] Atendimento #${at.id} reenviado aos médicos`);
+    return res.json({ ok: true, atendimentoId: at.id, nome: nomeFila });
+  } catch (e) {
+    console.error("[ADMIN-NOTIFICAR]", e.message);
+    return res.status(500).json({ ok: false, error: "Erro ao notificar médicos." });
+  }
+});
+
 // ── E-MAIL: novo cadastro de médico (só para o admin) ──────────────────────────
 async function enviarEmailNovoCadastroMedico({ nome, email, crm, uf, especialidade, telefone }) {
   const RESEND_KEY = process.env.RESEND_API_KEY;
