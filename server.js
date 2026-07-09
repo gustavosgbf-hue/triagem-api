@@ -9884,7 +9884,7 @@ async function pagBankOrderEstaPaga(orderId) {
   if (!response.ok) {
     throw new Error(formatPagBankError(data.error_messages || data.message || data.error || data));
   }
-  return Array.isArray(data.charges) && data.charges.some(c => c.status === "PAID");
+  return pagbankOrderPago(data);
 }
 
 async function confirmarRenovacaoPorId(id, origem = "manual") {
@@ -10015,7 +10015,7 @@ app.post("/api/renovacao/pagbank/order", rlGeral, async (req, res) => {
     const q = await pool.query(`SELECT id,tipo,frete_valor FROM fila_atendimentos WHERE id=$1 AND tipo LIKE 'renovacao_%'`, [atendimentoId]);
     if (!q.rowCount) return res.status(404).json({ ok: false, error: "Renovação não encontrada" });
     const valorCentavos = renovacaoValorCentavos(q.rows[0]);
-    const expiracaoISO = new Date(Date.now() + 30 * 60 * 1000).toISOString().replace("Z", "-03:00");
+    const expiracaoISO = new Date(Date.now() + 30 * 60 * 1000).toISOString();
     const orderBody = {
       reference_id: `RENOV-${atendimentoId}-${Date.now()}`,
       customer: { name: nome, email: emailSeguroPagBank(email, cpf, "renovacao"), tax_id: String(cpf).replace(/\D/g, "") },
