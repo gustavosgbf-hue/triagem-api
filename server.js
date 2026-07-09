@@ -2079,6 +2079,53 @@ app.get("/api/pagbank/order/:id", async (req, res) => {
   }
 });
 
+app.get("/api/admin/pagbank/order/:id", checkAdmin, async (req, res) => {
+  try {
+    if (!PAGBANK_TOKEN) {
+      return res.status(503).json({ ok: false, error: "Gateway indisponível." });
+    }
+    const response = await fetch(`${PAGBANK_URL}/orders/${req.params.id}`, {
+      headers: { Authorization: `Bearer ${PAGBANK_TOKEN}`, accept: "application/json" }
+    });
+    const data = await response.json().catch(() => ({}));
+    const resumirValor = valor => valor && typeof valor === "object"
+      ? { value: valor.value, currency: valor.currency }
+      : valor;
+    return res.status(response.ok ? 200 : response.status).json({
+      ok: response.ok,
+      httpStatus: response.status,
+      id: data.id || req.params.id,
+      reference_id: data.reference_id,
+      created_at: data.created_at,
+      status: data.status,
+      pago: pagbankOrderPago(data),
+      qr_codes: (Array.isArray(data.qr_codes) ? data.qr_codes : []).map(qr => ({
+        id: qr.id,
+        status: qr.status,
+        amount: resumirValor(qr.amount),
+        expiration_date: qr.expiration_date,
+        payments: (Array.isArray(qr.payments) ? qr.payments : []).map(p => ({
+          id: p.id,
+          status: p.status,
+          amount: resumirValor(p.amount),
+          paid_at: p.paid_at
+        }))
+      })),
+      charges: (Array.isArray(data.charges) ? data.charges : []).map(c => ({
+        id: c.id,
+        status: c.status,
+        amount: resumirValor(c.amount),
+        paid_at: c.paid_at,
+        payment_method: c.payment_method?.type
+      })),
+      error: data.error_messages || data.message || data.error
+    });
+  } catch (e) {
+    console.error("[ADMIN-PAGBANK-ORDER]", e.message);
+    return res.status(500).json({ ok: false, error: "Erro ao consultar ordem PagBank." });
+  }
+});
+
 // Helper para montar HTML do email
 function montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno, linkAssumir, medicoNome, horarioAgendado, isLembrete }) {
   const tipoLabel = tipo === "video" ? "Video" : "Chat";
