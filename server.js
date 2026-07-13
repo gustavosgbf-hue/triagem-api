@@ -7469,7 +7469,8 @@ app.get("/api/admin/atendimentos/auditoria", checkAdmin, async (req, res) => {
       `SELECT id,nome,tel,cpf,email,tipo,status,pagamento_status,triagem,queixa,
               pagbank_order_id,pagbank_qr_expira_em,efi_charge_id,pagamento_metodo,pagamento_confirmado_em,
               ads_checkout_session_id,atendimento_para_terceiro,pagador_nome,pagador_cpf,
-              medico_id,medico_nome,criado_em,assumido_em,encerrado_em
+              medico_id,medico_nome,prioridade_medico_id,prioridade_ate,
+              prioridade_geral_notificada_em,criado_em,assumido_em,encerrado_em
          FROM fila_atendimentos
          ${where}
         ORDER BY criado_em DESC
