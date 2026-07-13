@@ -51,6 +51,9 @@ app.get("/api/build-info", (_req, res) => {
 
 const RESEND_DEFAULT_FROM = process.env.RESEND_DEFAULT_FROM || "ConsultaJá24h <contato@consultaja24h.com.br>";
 const RESEND_FILA_FROM = process.env.RESEND_FILA_FROM || "ConsultaJá24h Fila <fila@consultaja24h.com.br>";
+const ADMIN_MEDICO_EMAIL = "gustavosgbf@gmail.com";
+const MARIANA_PRIORIDADE_EMAIL = "marianamartinsc1@gmail.com";
+const PRIORIDADE_FILA_MINUTOS = 5;
 
 async function enviarResendComFallback({ apiKey, from, fallbackFrom = RESEND_DEFAULT_FROM, to, subject, html, text, headers, replyTo, tag }) {
   const payload = { from, to, subject, html };
@@ -868,6 +871,9 @@ async function initDB() {
       ['reembolso_valor_centavos','INTEGER NOT NULL DEFAULT 0'],
       ['reembolso_processado_em','TIMESTAMPTZ'],
       ['reembolso_erro','TEXT'],
+      ['prioridade_medico_id','INTEGER'],
+      ['prioridade_ate','TIMESTAMPTZ'],
+      ['prioridade_geral_notificada_em','TIMESTAMPTZ'],
     ];
     // Coluna para controle de lembrete de agendamento
     await pool.query(`ALTER TABLE agendamentos ADD COLUMN IF NOT EXISTS lembrete_enviado BOOLEAN DEFAULT false`).catch(()=>{});
@@ -877,6 +883,22 @@ async function initDB() {
     for (const [col, tipo] of cols) {
       await pool.query(`ALTER TABLE fila_atendimentos ADD COLUMN IF NOT EXISTS ${col} ${tipo}`);
     }
+    await pool.query(`CREATE TABLE IF NOT EXISTS escala_prioridade_medico (
+      id SERIAL PRIMARY KEY,
+      medico_id INTEGER NOT NULL REFERENCES medicos(id) ON DELETE CASCADE,
+      dia_semana SMALLINT NOT NULL CHECK (dia_semana BETWEEN 0 AND 6),
+      hora_inicio TIME NOT NULL,
+      hora_fim TIME NOT NULL,
+      ativo BOOLEAN NOT NULL DEFAULT true,
+      criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      atualizado_em TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      CHECK (hora_fim > hora_inicio)
+    )`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_escala_prioridade_medico_dia
+      ON escala_prioridade_medico(medico_id,dia_semana,hora_inicio,hora_fim)`).catch(()=>{});
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_fila_prioridade_ate
+      ON fila_atendimentos(prioridade_ate)
+      WHERE status='aguardando' AND prioridade_geral_notificada_em IS NULL`).catch(()=>{});
     await pool.query(
       `UPDATE fila_atendimentos
           SET triagem = BTRIM(SPLIT_PART(triagem, 'DADOS ORGANIZADOS PELA TRIAGEM', 2))
@@ -2215,7 +2237,8 @@ function montarHtmlEmail({ nome, tel, tipo, triagem, linkRetorno, linkAssumir, m
 
 async function enviarEmailMedicos({
   nome, tel, tipo, triagem, linkRetorno, subject, atendimentoId,
-  horarioAgendado, horarioAgendadoRaw, especialidadeSolicitada, fallbackClinico
+  horarioAgendado, horarioAgendadoRaw, especialidadeSolicitada, fallbackClinico,
+  destinatariosPermitidos
 }) {
   const RESEND_KEY = process.env.RESEND_API_KEY;
   if (!RESEND_KEY) { console.warn("[EMAIL] RESEND_API_KEY nao definida."); return; }
@@ -2228,18 +2251,24 @@ async function enviarEmailMedicos({
     );
     const especialidade = normalizarEspecialidadeImediata(especialidadeSolicitada);
     const medicosAtivos = filtrarMedicosAtivos(medicosResult.rows);
-    const medicos = medicosAtivos.filter(
+    let medicos = medicosAtivos.filter(
       med => !especialidade || fallbackClinico || medicoAtendeEspecialidade(med, especialidade)
     );
+    if (Array.isArray(destinatariosPermitidos) && destinatariosPermitidos.length) {
+      const permitidos = new Set(destinatariosPermitidos.map(email => String(email || "").trim().toLowerCase()));
+      medicos = medicos.filter(med => permitidos.has(String(med.email || "").trim().toLowerCase()));
+    }
     // Garante que o admin sempre recebe
     // Admin sempre primeiro
-    const adminEmail = "gustavosgbf@gmail.com";
+    const adminEmail = ADMIN_MEDICO_EMAIL;
     const adminCadastrado = medicosAtivos.find(m => m.email === adminEmail);
     const adminIdx = medicos.findIndex(m=>m.email===adminEmail);
     if (adminIdx > 0) medicos.splice(adminIdx, 1);
-    const adminDeveReceber = !especialidade
+    const adminPermitido = !Array.isArray(destinatariosPermitidos)
+      || destinatariosPermitidos.map(email => String(email || "").trim().toLowerCase()).includes(adminEmail);
+    const adminDeveReceber = adminPermitido && (!especialidade
       || fallbackClinico
-      || medicoAtendeEspecialidade(adminCadastrado, especialidade);
+      || medicoAtendeEspecialidade(adminCadastrado, especialidade));
     if (adminIdx !== 0 && adminDeveReceber) {
       medicos.unshift(adminCadastrado || { id: 0, nome: "Gustavo", email: adminEmail, especialidade: "" });
     }
@@ -2837,6 +2866,29 @@ function normalizarEmail(email) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e) ? e : null;
 }
 
+function atendimentoAceitaPrioridadeSemanal(at) {
+  return ["chat", "video"].includes(String(at?.tipo || "").toLowerCase())
+    && String(at?.categoria_atendimento || "clinico") !== "especialista_imediato"
+    && !at?.especialidade_solicitada;
+}
+
+async function obterMarianaEmTurnoAgora() {
+  const { rows } = await pool.query(
+    `SELECT m.id,m.nome,m.nome_exibicao,m.email
+       FROM medicos m
+       JOIN escala_prioridade_medico e ON e.medico_id=m.id AND e.ativo=true
+      WHERE LOWER(TRIM(m.email))=$1
+        AND m.ativo=true AND m.status='aprovado'
+        AND e.dia_semana=EXTRACT(DOW FROM (NOW() AT TIME ZONE 'America/Fortaleza'))::int
+        AND (NOW() AT TIME ZONE 'America/Fortaleza')::time >= e.hora_inicio
+        AND (NOW() AT TIME ZONE 'America/Fortaleza')::time < e.hora_fim
+      ORDER BY e.hora_inicio
+      LIMIT 1`,
+    [MARIANA_PRIORIDADE_EMAIL]
+  );
+  return rows[0] || null;
+}
+
 // Notificacao centralizada: unica fonte de verdade para envio de email aos medicos
 async function notificarMedicos(at) {
   at = await garantirNomePacienteParaFila(at);
@@ -2850,6 +2902,23 @@ async function notificarMedicos(at) {
     "Aguardando", "", triagemParaPlanilha(at.triagem, at.queixa), at.tipo||"", "", String(at.id)
   ]).catch(() => {});
 
+  const marianaPrioritaria = atendimentoAceitaPrioridadeSemanal(at)
+    ? await obterMarianaEmTurnoAgora()
+    : null;
+  if (marianaPrioritaria) {
+    const prioridade = await pool.query(
+      `UPDATE fila_atendimentos
+          SET prioridade_medico_id=$1,
+              prioridade_ate=NOW() + ($2 * INTERVAL '1 minute'),
+              prioridade_geral_notificada_em=NULL
+        WHERE id=$3
+        RETURNING prioridade_ate`,
+      [marianaPrioritaria.id, PRIORIDADE_FILA_MINUTOS, at.id]
+    );
+    at.prioridade_medico_id = marianaPrioritaria.id;
+    at.prioridade_ate = prioridade.rows[0]?.prioridade_ate;
+  }
+
   await enviarEmailMedicos({
     nome: nomeFila, tel: at.tel, tipo: at.tipo,
     triagem: at.triagem, linkRetorno,
@@ -2857,13 +2926,54 @@ async function notificarMedicos(at) {
     horarioAgendado: null, horarioAgendadoRaw: null,
     especialidadeSolicitada: at.especialidade_solicitada,
     fallbackClinico: at.fallback_decisao === "clinico",
+    destinatariosPermitidos: marianaPrioritaria
+      ? [ADMIN_MEDICO_EMAIL, MARIANA_PRIORIDADE_EMAIL]
+      : null,
     subject: at.especialidade_solicitada
       ? `${nomeEspecialidadeImediata(at.especialidade_solicitada).toUpperCase()} - PACIENTE NOVO NA FILA - ${nomeFila}`
       : "PACIENTE NOVO NA FILA - " + nomeFila
   });
 
-  console.log("[NOTIFICACAO] Medicos notificados — atendimento #" + at.id);
+  console.log(`[NOTIFICACAO] Atendimento #${at.id} notificado${marianaPrioritaria ? " primeiro para Mariana e admin" : " para a equipe"}.`);
 }
+
+async function liberarPrioridadesVencidas() {
+  const { rows } = await pool.query(
+    `UPDATE fila_atendimentos
+        SET prioridade_geral_notificada_em=NOW()
+      WHERE id IN (
+        SELECT id FROM fila_atendimentos
+         WHERE status='aguardando'
+           AND pagamento_status IN ('confirmado','isento_admin')
+           AND prioridade_medico_id IS NOT NULL
+           AND prioridade_ate <= NOW()
+           AND prioridade_geral_notificada_em IS NULL
+         ORDER BY prioridade_ate
+         FOR UPDATE SKIP LOCKED
+         LIMIT 20
+      )
+      RETURNING id,nome,tel,tipo,triagem,especialidade_solicitada,fallback_decisao`,
+  );
+  for (const at of rows) {
+    const nomeFila = normalizarNomePaciente(at.nome) || "Nome não informado";
+    await enviarEmailMedicos({
+      nome: nomeFila,
+      tel: at.tel,
+      tipo: at.tipo,
+      triagem: at.triagem,
+      linkRetorno: `${process.env.SITE_URL || "https://consultaja24h.com.br"}/triagem.html?consulta=${at.id}`,
+      atendimentoId: at.id,
+      subject: `FILA LIBERADA - PACIENTE AGUARDANDO - ${nomeFila}`,
+      especialidadeSolicitada: at.especialidade_solicitada,
+      fallbackClinico: at.fallback_decisao === "clinico"
+    });
+    console.log(`[PRIORIDADE] Atendimento #${at.id} liberado para toda a equipe.`);
+  }
+}
+
+setInterval(() => {
+  liberarPrioridadesVencidas().catch(e => console.error("[PRIORIDADE] Erro ao liberar fila:", e.message));
+}, 30 * 1000);
 
 // ── Helper: libera atendimento para médicos (timer + endpoint de aprovação) ───
 async function liberarAtendimentoParaMedicos(atendimentoId) {
@@ -3924,19 +4034,28 @@ app.get("/api/atendimento/assumir-email", async (req, res) => {
     if (payload.tipo !== "assumir") return res.status(400).send("<h2>Token inválido.</h2>");
     const { medicoId, medicoNome, atendimentoId } = payload;
     const reserva = await pool.query(
-      `SELECT categoria_atendimento,especialidade_solicitada,fallback_decisao
+      `SELECT categoria_atendimento,especialidade_solicitada,fallback_decisao,
+              prioridade_medico_id,prioridade_ate
          FROM fila_atendimentos
         WHERE id=$1`,
       [atendimentoId]
     );
+    const medicoReserva = Number(medicoId) === 0 ? null : (await pool.query(
+      `SELECT email,especialidade FROM medicos WHERE id=$1 AND ativo=true AND status='aprovado'`,
+      [medicoId]
+    )).rows[0];
+    const prioridadeAtiva = reserva.rows[0]?.prioridade_medico_id
+      && reserva.rows[0]?.prioridade_ate
+      && new Date(reserva.rows[0].prioridade_ate).getTime() > Date.now();
+    if (prioridadeAtiva
+        && Number(medicoId) !== Number(reserva.rows[0].prioridade_medico_id)
+        && String(medicoReserva?.email || "").trim().toLowerCase() !== ADMIN_MEDICO_EMAIL) {
+      return res.status(403).send(`<html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#060d0b;color:#fff"><h2 style="color:#ffbd2e">Prioridade em andamento</h2><p>Este atendimento está reservado por alguns minutos ao profissional escalado.</p><a href="${PAINEL_URL}" style="color:#b4e05a">Ir para o painel</a></body></html>`);
+    }
     if (reserva.rows[0]?.categoria_atendimento === "especialista_imediato"
         && reserva.rows[0]?.fallback_decisao !== "clinico"
         && Number(medicoId) !== 0) {
-      const med = await pool.query(
-        `SELECT especialidade FROM medicos WHERE id=$1 AND ativo=true AND status='aprovado'`,
-        [medicoId]
-      );
-      if (!medicoAtendeEspecialidade(med.rows[0], reserva.rows[0].especialidade_solicitada)) {
+      if (!medicoAtendeEspecialidade(medicoReserva, reserva.rows[0].especialidade_solicitada)) {
         return res.status(403).send(`<html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#060d0b;color:#fff"><h2 style="color:#ffbd2e">Atendimento reservado</h2><p>Este atendimento ainda está reservado ao especialista escolhido pelo paciente.</p><a href="${PAINEL_URL}" style="color:#b4e05a">Ir para o painel</a></body></html>`);
       }
     }
@@ -7584,7 +7703,8 @@ app.post("/api/medico/login", rlLogin, async (req, res) => {
 
 app.get("/api/fila", checkMedico, async (req, res) => {
   try {
-    const isAdmin = req.medico.email === "gustavosgbf@gmail.com";
+    const emailMedico = String(req.medico.email || "").trim().toLowerCase();
+    const isAdmin = emailMedico === ADMIN_MEDICO_EMAIL;
     const medicoDb = await pool.query(
       `SELECT especialidade FROM medicos WHERE id=$1 LIMIT 1`,
       [req.medico.id]
@@ -7594,7 +7714,8 @@ app.get("/api/fila", checkMedico, async (req, res) => {
     if (isAdmin) {
       await reconciliarRenovacoesPendentes().catch(e => console.warn("[RENOVACAO-RECONCILIAR]", e.message));
       query = `SELECT id,nome,tel,cpf,tipo,triagem,status,pagamento_status,medico_id,medico_nome,meet_link,criado_em,data_nascimento,idade,sexo,alergias,cronicas,medicacoes,queixa,solicita,horario_agendado,
-                      categoria_atendimento,especialidade_solicitada,valor_cobrado_centavos,fallback_decisao
+                      categoria_atendimento,especialidade_solicitada,valor_cobrado_centavos,fallback_decisao,
+                      prioridade_medico_id,prioridade_ate
                  FROM fila_atendimentos
                 WHERE tipo NOT LIKE 'renovacao%'
                   AND status IN ('aguardando','assumido')
@@ -7606,7 +7727,8 @@ app.get("/api/fila", checkMedico, async (req, res) => {
                 ORDER BY criado_em ASC`;
     } else {
       query = `SELECT id,nome,tel,cpf,tipo,triagem,status,pagamento_status,medico_id,medico_nome,meet_link,criado_em,data_nascimento,idade,sexo,alergias,cronicas,medicacoes,queixa,solicita,horario_agendado,
-                      categoria_atendimento,especialidade_solicitada,valor_cobrado_centavos,fallback_decisao
+                      categoria_atendimento,especialidade_solicitada,valor_cobrado_centavos,fallback_decisao,
+                      prioridade_medico_id,prioridade_ate
                  FROM fila_atendimentos
                 WHERE status IN ('aguardando','assumido')
                   AND pagamento_status IN ('confirmado','isento_admin')
@@ -7616,6 +7738,14 @@ app.get("/api/fila", checkMedico, async (req, res) => {
                   AND LOWER(TRIM(COALESCE(triagem,''))) NOT LIKE '(triagem em andamento)%'
                   AND LOWER(TRIM(COALESCE(triagem,''))) NOT LIKE '(aguardando triagem%'
                   AND (horario_agendado IS NULL OR horario_agendado <= NOW() + INTERVAL '15 minutes')
+                  AND (
+                    prioridade_medico_id IS NULL
+                    OR prioridade_medico_id=$3
+                    OR (
+                      status='aguardando'
+                      AND (prioridade_ate <= NOW() OR prioridade_geral_notificada_em IS NOT NULL)
+                    )
+                  )
                   AND (
                     COALESCE(categoria_atendimento,'clinico') <> 'especialista_imediato'
                     OR fallback_decisao='clinico'
@@ -7632,7 +7762,7 @@ app.get("/api/fila", checkMedico, async (req, res) => {
                     )
                   )
                 ORDER BY criado_em ASC`;
-      params = [especialidadeMedico, Object.keys(ESPECIALIDADES_IMEDIATAS)];
+      params = [especialidadeMedico, Object.keys(ESPECIALIDADES_IMEDIATAS), Number(req.medico.id)];
     }
     const result = await pool.query(query, params || []);
     const fila = [];
@@ -7650,6 +7780,72 @@ app.get("/api/fila", checkMedico, async (req, res) => {
     }
     return res.json({ ok: true, fila });
   } catch (err) { return res.status(500).json({ ok: false, error: "Erro ao carregar fila" }); }
+});
+
+function podeGerenciarEscalaPrioritaria(req) {
+  const email = String(req.medico?.email || "").trim().toLowerCase();
+  return email === ADMIN_MEDICO_EMAIL || email === MARIANA_PRIORIDADE_EMAIL;
+}
+
+async function obterMedicoMariana() {
+  const { rows } = await pool.query(
+    `SELECT id,nome,nome_exibicao,email FROM medicos
+      WHERE LOWER(TRIM(email))=$1 AND ativo=true AND status='aprovado' LIMIT 1`,
+    [MARIANA_PRIORIDADE_EMAIL]
+  );
+  return rows[0] || null;
+}
+
+app.get("/api/escala-prioridade", checkMedico, async (req, res) => {
+  try {
+    if (!podeGerenciarEscalaPrioritaria(req)) return res.status(403).json({ ok:false, error:"Acesso restrito" });
+    const mariana = await obterMedicoMariana();
+    if (!mariana) return res.status(404).json({ ok:false, error:"Cadastro da Mariana não encontrado" });
+    const { rows } = await pool.query(
+      `SELECT id,dia_semana,TO_CHAR(hora_inicio,'HH24:MI') AS hora_inicio,
+              TO_CHAR(hora_fim,'HH24:MI') AS hora_fim
+         FROM escala_prioridade_medico
+        WHERE medico_id=$1 AND ativo=true
+        ORDER BY dia_semana,hora_inicio`,
+      [mariana.id]
+    );
+    return res.json({ ok:true, medico:{ id:mariana.id, nome:mariana.nome_exibicao||mariana.nome }, turnos:rows, prioridade_minutos:PRIORIDADE_FILA_MINUTOS });
+  } catch (e) {
+    console.error("[ESCALA] GET:", e.message);
+    return res.status(500).json({ ok:false, error:"Erro ao carregar turnos" });
+  }
+});
+
+app.put("/api/escala-prioridade", checkMedico, async (req, res) => {
+  const client = await pool.connect();
+  try {
+    if (!podeGerenciarEscalaPrioritaria(req)) return res.status(403).json({ ok:false, error:"Acesso restrito" });
+    const turnos = Array.isArray(req.body?.turnos) ? req.body.turnos : [];
+    if (turnos.length > 35) return res.status(400).json({ ok:false, error:"Limite de turnos excedido" });
+    const horaValida = /^([01]\d|2[0-3]):[0-5]\d$/;
+    const normalizados = turnos.map(t => ({ dia:Number(t.dia_semana), inicio:String(t.hora_inicio||""), fim:String(t.hora_fim||"") }));
+    if (normalizados.some(t => !Number.isInteger(t.dia) || t.dia<0 || t.dia>6 || !horaValida.test(t.inicio) || !horaValida.test(t.fim) || t.fim<=t.inicio)) {
+      return res.status(400).json({ ok:false, error:"Revise os dias e horários informados" });
+    }
+    const mariana = await obterMedicoMariana();
+    if (!mariana) return res.status(404).json({ ok:false, error:"Cadastro da Mariana não encontrado" });
+    await client.query("BEGIN");
+    await client.query(`DELETE FROM escala_prioridade_medico WHERE medico_id=$1`, [mariana.id]);
+    for (const turno of normalizados) {
+      await client.query(
+        `INSERT INTO escala_prioridade_medico(medico_id,dia_semana,hora_inicio,hora_fim) VALUES($1,$2,$3,$4)`,
+        [mariana.id,turno.dia,turno.inicio,turno.fim]
+      );
+    }
+    await client.query("COMMIT");
+    return res.json({ ok:true, total:normalizados.length });
+  } catch (e) {
+    await client.query("ROLLBACK").catch(()=>{});
+    console.error("[ESCALA] PUT:", e.message);
+    return res.status(500).json({ ok:false, error:"Erro ao salvar turnos" });
+  } finally {
+    client.release();
+  }
 });
 
 app.get("/api/renovacoes/fila", checkMedico, async (req, res) => {
@@ -7734,7 +7930,8 @@ app.post("/api/atendimento/assumir", checkMedico, async (req, res) => {
     if (!medicoResult.rows[0]) return res.status(403).json({ ok: false, error: "Medico nao autorizado" });
     const medico = medicoResult.rows[0];
     const atendimentoResult = await pool.query(
-      `SELECT id,categoria_atendimento,especialidade_solicitada,fallback_decisao
+      `SELECT id,categoria_atendimento,especialidade_solicitada,fallback_decisao,
+              prioridade_medico_id,prioridade_ate
          FROM fila_atendimentos
         WHERE id=$1`,
       [filaId]
@@ -7742,6 +7939,12 @@ app.post("/api/atendimento/assumir", checkMedico, async (req, res) => {
     const atendimento = atendimentoResult.rows[0];
     if (!atendimento) return res.status(404).json({ ok: false, error: "Atendimento nao encontrado" });
     const isAdmin = medico.email === "gustavosgbf@gmail.com";
+    const prioridadeAtiva = atendimento.prioridade_medico_id
+      && atendimento.prioridade_ate
+      && new Date(atendimento.prioridade_ate).getTime() > Date.now();
+    if (prioridadeAtiva && !isAdmin && Number(medico.id) !== Number(atendimento.prioridade_medico_id)) {
+      return res.status(403).json({ ok:false, error:"Atendimento reservado temporariamente ao profissional escalado" });
+    }
     const reservadoEspecialista = atendimento.categoria_atendimento === "especialista_imediato"
       && atendimento.fallback_decisao !== "clinico";
     if (
