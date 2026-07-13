@@ -731,12 +731,17 @@ async function initDB() {
         paciente_nome TEXT,
         cpf TEXT,
         tel TEXT,
+        email TEXT,
         motivo TEXT,
+        permanente BOOLEAN NOT NULL DEFAULT false,
         bloqueado_ate TIMESTAMPTZ NOT NULL,
         criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )`);
+    await pool.query(`ALTER TABLE paciente_bloqueios ADD COLUMN IF NOT EXISTS email TEXT`);
+    await pool.query(`ALTER TABLE paciente_bloqueios ADD COLUMN IF NOT EXISTS permanente BOOLEAN NOT NULL DEFAULT false`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_paciente_bloqueios_cpf ON paciente_bloqueios(cpf)`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_paciente_bloqueios_tel ON paciente_bloqueios(tel)`);
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_paciente_bloqueios_email ON paciente_bloqueios(LOWER(email))`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_paciente_bloqueios_ate ON paciente_bloqueios(bloqueado_ate)`);
     await pool.query(`CREATE TABLE IF NOT EXISTS agendamentos (
         id SERIAL PRIMARY KEY,
@@ -1590,11 +1595,12 @@ async function buscarBloqueioManualAtendimento(atendimentoId) {
   const { rows } = await pool.query(
     `WITH atual AS (
        SELECT regexp_replace(COALESCE(cpf,''), '\\D', '', 'g') AS cpf,
-              regexp_replace(COALESCE(tel,''), '\\D', '', 'g') AS tel
+              regexp_replace(COALESCE(tel,''), '\\D', '', 'g') AS tel,
+              LOWER(BTRIM(COALESCE(email,''))) AS email
          FROM fila_atendimentos
         WHERE id = $1
      )
-     SELECT b.bloqueado_ate, b.motivo
+     SELECT b.bloqueado_ate, b.motivo, b.permanente
        FROM paciente_bloqueios b, atual a
       WHERE b.bloqueado_ate > NOW()
         AND (
@@ -1605,9 +1611,13 @@ async function buscarBloqueioManualAtendimento(atendimentoId) {
           )
           OR
           (
-            regexp_replace(COALESCE(b.cpf,''), '\\D', '', 'g') = ''
-            AND a.tel <> ''
+            a.tel <> ''
             AND regexp_replace(COALESCE(b.tel,''), '\\D', '', 'g') = a.tel
+          )
+          OR
+          (
+            a.email <> ''
+            AND LOWER(BTRIM(COALESCE(b.email,''))) = a.email
           )
         )
       ORDER BY b.bloqueado_ate DESC
@@ -1628,7 +1638,8 @@ async function buscarLimiteAtendimentos(atendimentoId) {
       limite: 0,
       janela_dias: null,
       liberado_em: bloqueioManual.bloqueado_ate,
-      motivo: bloqueioManual.motivo || ""
+      motivo: bloqueioManual.motivo || "",
+      permanente: Boolean(bloqueioManual.permanente)
     };
   }
   const { rows } = await pool.query(
@@ -1669,6 +1680,13 @@ async function buscarLimiteAtendimentos(atendimentoId) {
 
 function responderLimiteAtendimentos(res, limite) {
   if (limite.manual) {
+    if (limite.permanente) {
+      return res.status(403).json({
+        ok: false,
+        code: "cadastro_bloqueado",
+        error: "Este cadastro não está autorizado a realizar novos atendimentos."
+      });
+    }
     const dataLiberacao = limite.liberado_em
       ? new Date(limite.liberado_em).toLocaleDateString("pt-BR", { timeZone: "America/Fortaleza" })
       : "";
@@ -1719,42 +1737,52 @@ async function buscarAtendimentoPagoAtivoPorIdentidade({ cpf, tel, especialidade
 app.post("/api/admin/pacientes/bloquear", checkAdmin, async (req, res) => {
   try {
     const nome = String(req.body?.nome || "").trim();
+    const cpfInformado = String(req.body?.cpf || "").replace(/\D/g, "");
+    const telInformado = String(req.body?.tel || "").replace(/\D/g, "");
+    const emailInformado = String(req.body?.email || "").trim().toLowerCase();
+    const permanente = req.body?.permanente === true;
     const dias = Math.min(90, Math.max(1, parseInt(req.body?.dias || "1", 10) || 1));
     const motivo = String(req.body?.motivo || "Bloqueio administrativo temporário").trim().slice(0, 300);
-    if (!nome) return res.status(400).json({ ok: false, error: "nome obrigatório" });
+    if (!nome && !cpfInformado && !telInformado && !emailInformado) {
+      return res.status(400).json({ ok: false, error: "Informe nome, CPF, telefone ou e-mail" });
+    }
 
-    const { rows } = await pool.query(
+    const { rows } = nome ? await pool.query(
       `SELECT nome,
               regexp_replace(COALESCE(cpf,''), '\\D', '', 'g') AS cpf,
-              regexp_replace(COALESCE(tel,''), '\\D', '', 'g') AS tel
+              regexp_replace(COALESCE(tel,''), '\\D', '', 'g') AS tel,
+              LOWER(BTRIM(COALESCE(email,''))) AS email
          FROM fila_atendimentos
         WHERE LOWER(BTRIM(nome)) = LOWER(BTRIM($1))
         ORDER BY COALESCE(pagamento_confirmado_em, criado_em) DESC, id DESC
         LIMIT 1`,
       [nome]
-    );
-    const paciente = rows[0];
-    if (!paciente) return res.status(404).json({ ok: false, error: "Paciente não encontrado" });
-    if (!paciente.cpf && !paciente.tel) {
-      return res.status(409).json({ ok: false, error: "Paciente sem CPF ou telefone para aplicar o bloqueio" });
+    ) : { rows: [] };
+    const paciente = rows[0] || {};
+    const cpfBloqueio = cpfInformado || paciente.cpf || "";
+    const telBloqueio = telInformado || paciente.tel || "";
+    const emailBloqueio = emailInformado || paciente.email || "";
+    if (!cpfBloqueio && !telBloqueio && !emailBloqueio) {
+      return res.status(404).json({ ok: false, error: "Paciente ou identificadores não encontrados" });
     }
 
-    const cpfBloqueio = paciente.cpf || "";
-    const telBloqueio = cpfBloqueio ? "" : paciente.tel;
     const inserido = await pool.query(
       `INSERT INTO paciente_bloqueios
-         (paciente_nome, cpf, tel, motivo, bloqueado_ate)
-       VALUES ($1,$2,$3,$4,NOW() + ($5::text || ' days')::interval)
-       RETURNING id, paciente_nome, bloqueado_ate`,
-      [paciente.nome, cpfBloqueio, telBloqueio, motivo, dias]
+         (paciente_nome, cpf, tel, email, motivo, permanente, bloqueado_ate)
+       VALUES ($1,$2,$3,$4,$5,$6,
+         CASE WHEN $6 THEN TIMESTAMPTZ '2099-12-31 23:59:59+00'
+              ELSE NOW() + ($7::text || ' days')::interval END)
+       RETURNING id, paciente_nome, bloqueado_ate, permanente`,
+      [paciente.nome || nome || "Cadastro bloqueado", cpfBloqueio, telBloqueio, emailBloqueio, motivo, permanente, dias]
     );
-    console.log(`[PACIENTE-BLOQUEIO] ${paciente.nome} bloqueado por ${dias} dia(s) — id ${inserido.rows[0].id}`);
+    console.log(`[PACIENTE-BLOQUEIO] ${paciente.nome || nome || emailBloqueio} ${permanente ? "bloqueado permanentemente" : `bloqueado por ${dias} dia(s)`} — id ${inserido.rows[0].id}`);
     return res.json({
       ok: true,
       id: inserido.rows[0].id,
       paciente_nome: inserido.rows[0].paciente_nome,
       bloqueado_ate: inserido.rows[0].bloqueado_ate,
-      identificacao: cpfBloqueio ? "cpf" : "telefone"
+      permanente: inserido.rows[0].permanente,
+      identificacao: [cpfBloqueio && "cpf", telBloqueio && "telefone", emailBloqueio && "email"].filter(Boolean)
     });
   } catch (e) {
     console.error("[PACIENTE-BLOQUEIO]", e.message);
