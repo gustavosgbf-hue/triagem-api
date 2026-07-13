@@ -1005,6 +1005,16 @@ async function initDB() {
     await pool.query(`ALTER TABLE especialistas ADD COLUMN IF NOT EXISTS bio TEXT`).catch(()=>{});
     await pool.query(`ALTER TABLE especialistas ADD COLUMN IF NOT EXISTS disponibilidade JSONB`).catch(()=>{});
     await pool.query(`ALTER TABLE especialistas ADD COLUMN IF NOT EXISTS rqe TEXT`).catch(()=>{});
+    await pool.query(`ALTER TABLE especialistas ADD COLUMN IF NOT EXISTS cpf_medico TEXT`).catch(()=>{});
+    await pool.query(`ALTER TABLE especialistas ADD COLUMN IF NOT EXISTS data_nascimento_medico TEXT`).catch(()=>{});
+    await pool.query(`
+      UPDATE especialistas e
+         SET cpf_medico = COALESCE(NULLIF(e.cpf_medico,''), m.cpf_medico),
+             data_nascimento_medico = COALESCE(NULLIF(e.data_nascimento_medico,''), m.data_nascimento_medico)
+        FROM medicos m
+       WHERE LOWER(e.email) = LOWER(m.email)
+         AND (COALESCE(e.cpf_medico,'') = '' OR COALESCE(e.data_nascimento_medico,'') = '')
+    `).catch(()=>{});
     await pool.query(`
       ALTER TABLE especialistas
       ALTER COLUMN disponibilidade TYPE JSONB
@@ -6076,19 +6086,21 @@ app.get('/api/especialistas/agendamento/:id/status', rlGeral, async (req, res) =
 // ── ESPECIALISTAS: admin — cadastrar especialista ─────────────────────────────
 app.post('/api/admin/especialista/criar', checkAdmin, async (req, res) => {
   try {
-    const { nome, nome_exibicao, especialidade, crm, rqe, uf, valor_consulta, email, bio, foto_url } = req.body || {};
+    const { nome, nome_exibicao, especialidade, crm, rqe, uf, valor_consulta, email, bio, foto_url, cpf_medico, data_nascimento_medico } = req.body || {};
     if (!nome || !especialidade || !crm || !uf) {
       return res.status(400).json({ ok: false, error: 'nome, especialidade, crm e uf são obrigatórios' });
     }
     const valorNum = valor_consulta ? parseFloat(String(valor_consulta).replace(',','.')) : 0;
     const emailNorm = email ? email.trim().toLowerCase() : null;
     const rqeNorm = rqe ? rqe.trim() : null;
+    const cpfNorm = String(cpf_medico || '').replace(/\D/g, '') || null;
+    const nascimentoNorm = normalizarDataNascimentoMedico(data_nascimento_medico) || null;
     const { rows } = await pool.query(
-      `INSERT INTO especialistas (nome, nome_exibicao, especialidade, crm, rqe, uf, valor_consulta, email, bio, foto_url)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id, nome_exibicao, especialidade`,
+      `INSERT INTO especialistas (nome, nome_exibicao, especialidade, crm, rqe, uf, valor_consulta, email, bio, foto_url, cpf_medico, data_nascimento_medico)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id, nome_exibicao, especialidade`,
       [nome.trim(), (nome_exibicao||nome).trim(), especialidade.trim().toLowerCase(),
        crm.trim().toUpperCase(), rqeNorm, uf.trim().toUpperCase(),
-       valorNum, emailNorm, bio||'', foto_url||'']
+       valorNum, emailNorm, bio||'', foto_url||'', cpfNorm, nascimentoNorm]
     );
     console.log('[ESP-ADMIN] Especialista criado #'+rows[0].id+' — '+rows[0].especialidade);
     return res.json({ ok: true, especialista: rows[0] });
@@ -6100,7 +6112,7 @@ app.get('/api/admin/especialistas', checkAdmin, async (req, res) => {
   try {
 const { rows } = await pool.query(
       `SELECT id, nome, nome_exibicao, email, especialidade, crm, rqe, uf, valor_consulta,
-              foto_url, bio, disponibilidade, ativo, visivel, created_at
+              foto_url, bio, disponibilidade, cpf_medico, data_nascimento_medico, ativo, visivel, created_at
           FROM especialistas ORDER BY especialidade, id`
     );
     return res.json({ ok: true, especialistas: rows });
@@ -6778,7 +6790,7 @@ app.patch("/api/admin/medico/:id/mover-especialista", checkAdmin, async (req, re
 
     await client.query("BEGIN");
     const medRes = await client.query(
-      `SELECT id,nome,nome_exibicao,email,senha_hash,crm,uf,telefone,especialidade
+      `SELECT id,nome,nome_exibicao,email,senha_hash,crm,uf,telefone,especialidade,cpf_medico,data_nascimento_medico
          FROM medicos WHERE id=$1 FOR UPDATE`,
       [id]
     );
@@ -6805,9 +6817,11 @@ app.patch("/api/admin/medico/:id/mover-especialista", checkAdmin, async (req, re
                 valor_consulta=$6,
                 email=$7,
                 senha_hash=COALESCE(senha_hash,$8),
+                cpf_medico=COALESCE($9,cpf_medico),
+                data_nascimento_medico=COALESCE($10,data_nascimento_medico),
                 ativo=true,
                 visivel=false
-          WHERE id=$9
+          WHERE id=$11
           RETURNING id,nome_exibicao,email,especialidade,ativo,visivel`,
         [
           med.nome,
@@ -6818,14 +6832,16 @@ app.patch("/api/admin/medico/:id/mover-especialista", checkAdmin, async (req, re
           valorConsulta,
           emailNorm,
           med.senha_hash || null,
+          med.cpf_medico || null,
+          med.data_nascimento_medico || null,
           espRes.rows[0].id,
         ]
       );
     } else {
       espRes = await client.query(
         `INSERT INTO especialistas
-          (nome,nome_exibicao,especialidade,crm,uf,valor_consulta,email,senha_hash,precisa_trocar_senha,ativo,visivel,bio)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,false,true,false,$9)
+          (nome,nome_exibicao,especialidade,crm,uf,valor_consulta,email,senha_hash,precisa_trocar_senha,ativo,visivel,bio,cpf_medico,data_nascimento_medico)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,false,true,false,$9,$10,$11)
          RETURNING id,nome_exibicao,email,especialidade,ativo,visivel`,
         [
           med.nome,
@@ -6837,6 +6853,8 @@ app.patch("/api/admin/medico/:id/mover-especialista", checkAdmin, async (req, re
           emailNorm,
           med.senha_hash || null,
           "",
+          med.cpf_medico || null,
+          med.data_nascimento_medico || null,
         ]
       );
     }
@@ -6896,7 +6914,7 @@ app.post("/api/admin/medico/criar", checkAdmin, async (req, res) => {
 
 app.get("/api/admin/medicos", checkAdmin, async (req, res) => {
   try {
-    const result = await pool.query("SELECT id,nome,email,crm,especialidade,status_online,ativo,created_at FROM medicos ORDER BY id DESC");
+    const result = await pool.query("SELECT id,nome,email,crm,uf,especialidade,cpf_medico,data_nascimento_medico,memed_external_id,status_online,ativo,created_at FROM medicos ORDER BY id DESC");
     return res.json({ ok: true, medicos: result.rows });
   } catch (err) { return res.status(500).json({ ok: false, error: err.message }); }
 });
@@ -6911,11 +6929,127 @@ app.patch("/api/admin/medico/:id", checkAdmin, async (req, res) => {
   } catch (err) { return res.status(500).json({ ok: false, error: err.message }); }
 });
 
+app.put("/api/admin/medico/:id/dados-regulatorios", checkAdmin, async (req, res) => {
+  try {
+    const cpf = String(req.body?.cpf_medico || "").replace(/\D/g, "");
+    const dataNascimento = normalizarDataNascimentoMedico(req.body?.data_nascimento_medico);
+    if (cpf.length !== 11) {
+      return res.status(400).json({ ok: false, error: "CPF do médico deve conter 11 dígitos" });
+    }
+    if (!dataNascimento) {
+      return res.status(400).json({ ok: false, error: "Data de nascimento inválida. Use AAAA-MM-DD ou DD/MM/AAAA" });
+    }
+
+    const result = await pool.query(
+      `UPDATE medicos
+          SET cpf_medico=$1, data_nascimento_medico=$2
+        WHERE id=$3
+        RETURNING id,nome,email,crm,uf,cpf_medico,data_nascimento_medico,memed_external_id`,
+      [cpf, dataNascimento, req.params.id]
+    );
+    if (result.rowCount === 0) {
+      return res.status(404).json({ ok: false, error: "Médico não encontrado" });
+    }
+
+    const med = result.rows[0];
+    let memed = { ok: false, pendente: true, motivo: "Prescritor ainda não cadastrado na Memed" };
+    if (med.memed_external_id) {
+      const sync = await atualizarPrescritorMemed(med, med.memed_external_id);
+      memed = sync.ok
+        ? { ok: true, pendente: false }
+        : {
+            ok: false,
+            pendente: true,
+            status: sync.status,
+            error: sync.data?.errors?.[0]?.detail || sync.data?.error || "Memed recusou a atualização"
+          };
+    }
+    return res.json({ ok: true, medico: med, memed });
+  } catch (err) {
+    console.error("[MEMED] Erro ao atualizar dados regulatórios:", err.message);
+    return res.status(500).json({ ok: false, error: "Erro ao atualizar dados regulatórios" });
+  }
+});
+
+app.put("/api/admin/especialista/:id/dados-regulatorios", checkAdmin, async (req, res) => {
+  try {
+    const cpf = String(req.body?.cpf_medico || "").replace(/\D/g, "");
+    const dataNascimento = normalizarDataNascimentoMedico(req.body?.data_nascimento_medico);
+    if (cpf.length !== 11 || !dataNascimento) {
+      return res.status(400).json({ ok: false, error: "Informe CPF com 11 dígitos e data de nascimento válida" });
+    }
+    const result = await pool.query(
+      `UPDATE especialistas
+          SET cpf_medico=$1, data_nascimento_medico=$2
+        WHERE id=$3
+        RETURNING id,nome,nome_exibicao,email,crm,uf,cpf_medico,data_nascimento_medico`,
+      [cpf, dataNascimento, req.params.id]
+    );
+    if (!result.rowCount) return res.status(404).json({ ok: false, error: "Especialista não encontrado" });
+    const especialista = result.rows[0];
+    const sync = await atualizarPrescritorMemed(especialista, `esp-${especialista.id}`);
+    return res.json({
+      ok: true,
+      especialista,
+      memed: sync.ok
+        ? { ok: true, pendente: false }
+        : { ok: false, pendente: true, status: sync.status, error: sync.data?.errors?.[0]?.detail || sync.data?.error || "Memed recusou a atualização" }
+    });
+  } catch (err) {
+    console.error("[MEMED] Erro regulatório especialista:", err.message);
+    return res.status(500).json({ ok: false, error: "Erro ao atualizar dados regulatórios" });
+  }
+});
+
 
 // ── MEMED: obter/criar token do médico ────────────────────────────────────────
 const MEMED_API_URL = process.env.MEMED_API_URL || "https://api.memed.com.br/v1";
 const MEMED_API_KEY = process.env.MEMED_API_KEY || "";
 const MEMED_SECRET_KEY = process.env.MEMED_SECRET_KEY || "";
+
+function normalizarDataNascimentoMedico(valor) {
+  const texto = String(valor || "").trim();
+  if (!texto) return "";
+  const br = texto.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+  const iso = br ? `${br[3]}-${br[2]}-${br[1]}` : texto;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(iso)) return "";
+  const [ano, mes, dia] = iso.split("-").map(Number);
+  const data = new Date(Date.UTC(ano, mes - 1, dia));
+  if (
+    data.getUTCFullYear() !== ano ||
+    data.getUTCMonth() !== mes - 1 ||
+    data.getUTCDate() !== dia ||
+    data > new Date()
+  ) return "";
+  return iso;
+}
+
+async function atualizarPrescritorMemed(med, externalId) {
+  const cpf = String(med.cpf_medico || "").replace(/\D/g, "");
+  const dataNascimento = normalizarDataNascimentoMedico(med.data_nascimento_medico);
+  const partesNome = String(med.nome || "Médico").trim().split(/\s+/);
+  const uf = String(med.uf || "").trim().toUpperCase();
+  const attributes = {
+    nome: partesNome[0],
+    sobrenome: partesNome.slice(1).join(" ") || "ConsultaJa",
+    board: {
+      board_code: "CRM",
+      board_number: String(med.crm || "").replace(/\D/g, ""),
+      board_state: uf
+    }
+  };
+  if (cpf) attributes.cpf = cpf;
+  if (dataNascimento) attributes.data_nascimento = dataNascimento;
+
+  const patchUrl = `${MEMED_API_URL}/sinapse-prescricao/usuarios/${externalId}?api-key=${MEMED_API_KEY}&secret-key=${MEMED_SECRET_KEY}`;
+  const patchRes = await fetch(patchUrl, {
+    method: "PATCH",
+    headers: { "Accept": "application/vnd.api+json", "Content-Type": "application/json" },
+    body: JSON.stringify({ data: { type: "usuarios", attributes } })
+  });
+  const patchData = await patchRes.json().catch(() => ({}));
+  return { ok: patchRes.ok, status: patchRes.status, data: patchData };
+}
 
 // ── Middleware combinado: aceita token de médico OU especialista ──────────────
 function checkMedicoOuEspecialista(req, res, next) {
@@ -6946,7 +7080,7 @@ app.get("/api/memed/token", checkMedicoOuEspecialista, async (req, res) => {
     // Branch especialista — redireciona para lógica própria
     if (req._isEspecialista) {
       const { rows: espRows } = await pool.query(
-        `SELECT id, nome, nome_exibicao, crm, uf, email FROM especialistas WHERE id = $1`,
+        `SELECT id, nome, nome_exibicao, crm, uf, email, cpf_medico, data_nascimento_medico FROM especialistas WHERE id = $1`,
         [req.medicoId]
       );
       if (espRows.length === 0) return res.status(404).json({ ok: false, error: 'Especialista não encontrado' });
@@ -6964,7 +7098,18 @@ app.get("/api/memed/token", checkMedicoOuEspecialista, async (req, res) => {
       if (getRes.ok) {
         const getData = await getRes.json();
         const token = getData?.data?.attributes?.token;
-        if (token) return res.json({ ok: true, token });
+        if (token) {
+          const cpfLocal = String(esp.cpf_medico || '').replace(/\D/g, '');
+          const cpfMemed = String(getData?.data?.attributes?.cpf || '').replace(/\D/g, '');
+          const dataLocal = normalizarDataNascimentoMedico(esp.data_nascimento_medico);
+          const dataMemed = normalizarDataNascimentoMedico(getData?.data?.attributes?.data_nascimento);
+          if ((cpfLocal && cpfLocal !== cpfMemed) || (dataLocal && dataLocal !== dataMemed)) {
+            const sync = await atualizarPrescritorMemed(esp, externalId);
+            if (!sync.ok) console.error(`[MEMED] PATCH regulatório especialista id=${esp.id}:`, JSON.stringify(sync.data).substring(0, 300));
+            return res.json({ ok: true, token: sync.data?.data?.attributes?.token || token });
+          }
+          return res.json({ ok: true, token });
+        }
       }
       const postUrl = `${MEMED_API_URL}/sinapse-prescricao/usuarios?api-key=${MEMED_API_KEY}&secret-key=${MEMED_SECRET_KEY}`;
       const postRes = await fetch(postUrl, {
@@ -6974,6 +7119,8 @@ app.get("/api/memed/token", checkMedicoOuEspecialista, async (req, res) => {
           nome: nomeLocal, sobrenome: sobrenomeLocal,
           email: esp.email || `esp${esp.id}@consultaja24h.com.br`,
           external_id: externalId,
+          cpf: String(esp.cpf_medico || '').replace(/\D/g, '') || undefined,
+          data_nascimento: normalizarDataNascimentoMedico(esp.data_nascimento_medico) || undefined,
           board: { board_code: 'CRM', board_number: (esp.crm || '').replace(/\D/g, ''), board_state: uf },
         }}}),
       });
@@ -7021,42 +7168,29 @@ app.get("/api/memed/token", checkMedicoOuEspecialista, async (req, res) => {
           await pool.query(`UPDATE medicos SET memed_external_id=$1 WHERE id=$2`, [externalId, medicoId]);
         }
 
-        // Verifica consistência de UF e sobrenome (case-insensitive + trim)
+        // Mantém os dados cadastrais exigidos pela Memed/CFM sincronizados.
         const ufMemed       = (getData?.data?.attributes?.board?.board_state || "").trim().toUpperCase();
         const sobrenomeMemed = (getData?.data?.attributes?.sobrenome || "").trim().toLowerCase();
+        const cpfLocal = String(med.cpf_medico || "").replace(/\D/g, "");
+        const cpfMemed = String(getData?.data?.attributes?.cpf || "").replace(/\D/g, "");
+        const dataLocal = normalizarDataNascimentoMedico(med.data_nascimento_medico);
+        const dataMemed = normalizarDataNascimentoMedico(getData?.data?.attributes?.data_nascimento);
         const ufOk          = ufMemed === ufLocal;
         const sobrenomeOk   = sobrenomeMemed === sobrenomeLocal.toLowerCase();
+        const cpfOk         = !cpfLocal || cpfMemed === cpfLocal;
+        const dataOk        = !dataLocal || dataMemed === dataLocal;
 
-        if (!ufOk || !sobrenomeOk) {
-          console.warn(`[MEMED] Inconsistência médico id=${med.id}: UF banco=${ufLocal} Memed=${ufMemed} | sobrenome banco="${sobrenomeLocal}" Memed="${getData?.data?.attributes?.sobrenome}"`);
+        if (!ufOk || !sobrenomeOk || !cpfOk || !dataOk) {
+          console.warn(`[MEMED] Inconsistência médico id=${med.id}: UF=${ufOk} sobrenome=${sobrenomeOk} CPF=${cpfOk} nascimento=${dataOk}`);
           // Tenta corrigir via PATCH — sem recriar usuário
           try {
-            const patchUrl = `${MEMED_API_URL}/sinapse-prescricao/usuarios/${externalId}?api-key=${MEMED_API_KEY}&secret-key=${MEMED_SECRET_KEY}`;
-            const patchRes = await fetch(patchUrl, {
-              method: "PATCH",
-              headers: { "Accept": "application/vnd.api+json", "Content-Type": "application/json" },
-              body: JSON.stringify({
-                data: {
-                  type: "usuarios",
-                  attributes: {
-                    nome: nomeLocal,
-                    sobrenome: sobrenomeLocal,
-                    board: {
-                      board_code: "CRM",
-                      board_number: (med.crm || "").replace(/\D/g, ""),
-                      board_state: ufLocal
-                    }
-                  }
-                }
-              })
-            });
-            const patchData = await patchRes.json();
-            if (patchRes.ok) {
-              console.log(`[MEMED] Cadastro corrigido médico id=${med.id} (UF→${ufLocal}, sobrenome→"${sobrenomeLocal}")`);
-              const tokenCorrigido = patchData?.data?.attributes?.token || token;
+            const sync = await atualizarPrescritorMemed(med, externalId);
+            if (sync.ok) {
+              console.log(`[MEMED] Cadastro regulatório sincronizado médico id=${med.id}`);
+              const tokenCorrigido = sync.data?.data?.attributes?.token || token;
               return res.json({ ok: true, token: tokenCorrigido, externalId });
             } else {
-              console.error(`[MEMED] PATCH falhou médico id=${med.id}:`, JSON.stringify(patchData).substring(0, 300));
+              console.error(`[MEMED] PATCH falhou médico id=${med.id}:`, JSON.stringify(sync.data).substring(0, 300));
               // Não quebra — retorna token atual mesmo com dados ainda desatualizados
               return res.json({ ok: true, token, externalId });
             }
