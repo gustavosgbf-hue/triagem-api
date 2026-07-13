@@ -2889,6 +2889,44 @@ async function obterMarianaEmTurnoAgora() {
   return rows[0] || null;
 }
 
+async function notificarEquipeAposAssuncaoPrioritaria(atendimentoId) {
+  const { rows } = await pool.query(
+    `SELECT id,nome,tel,tipo,triagem,queixa,especialidade_solicitada,fallback_decisao
+       FROM fila_atendimentos
+      WHERE id=$1 AND status='assumido'
+      LIMIT 1`,
+    [atendimentoId]
+  );
+  const at = rows[0];
+  if (!at) return;
+
+  const medicosResult = await pool.query(
+    `SELECT id,nome,email FROM medicos WHERE ativo=true AND status='aprovado'`
+  );
+  const destinatarios = filtrarMedicosAtivos(medicosResult.rows)
+    .map(med => String(med.email || "").trim().toLowerCase())
+    .filter(email => email && email !== ADMIN_MEDICO_EMAIL && email !== MARIANA_PRIORIDADE_EMAIL);
+  if (!destinatarios.length) return;
+
+  const nomeFila = normalizarNomePaciente(at.nome) || "Nome não informado";
+  const SITE_URL = process.env.SITE_URL || "https://consultaja24h.com.br";
+  await enviarEmailMedicos({
+    nome: nomeFila,
+    tel: at.tel,
+    tipo: at.tipo,
+    triagem: at.triagem || at.queixa,
+    linkRetorno: `${SITE_URL}/triagem.html?consulta=${at.id}`,
+    atendimentoId: at.id,
+    horarioAgendado: null,
+    horarioAgendadoRaw: null,
+    especialidadeSolicitada: at.especialidade_solicitada,
+    fallbackClinico: at.fallback_decisao === "clinico",
+    destinatariosPermitidos: destinatarios,
+    subject: `PACIENTE NOVO NA FILA - ${nomeFila}`
+  });
+  console.log(`[PRIORIDADE] Fluxo do atendimento #${at.id} comunicado à equipe após assunção.`);
+}
+
 // Notificacao centralizada: unica fonte de verdade para envio de email aos medicos
 async function notificarMedicos(at) {
   at = await garantirNomePacienteParaFila(at);
@@ -4079,6 +4117,11 @@ app.get("/api/atendimento/assumir-email", async (req, res) => {
     }
     const paciente = result.rows[0];
     console.log(`[ASSUMIR-EMAIL] ${medicoNome} assumiu atendimento #${atendimentoId} (${paciente.nome}) via e-mail`);
+    if (String(medicoReserva?.email || "").trim().toLowerCase() === MARIANA_PRIORIDADE_EMAIL
+        && Number(reserva.rows[0]?.prioridade_medico_id) === Number(medicoId)) {
+      notificarEquipeAposAssuncaoPrioritaria(atendimentoId)
+        .catch(e => console.error("[PRIORIDADE] Erro ao comunicar assunção à equipe:", e.message));
+    }
     // Redireciona para o painel com o atendimento já marcado
     return res.redirect(`${PAINEL_URL}?assumiu=${atendimentoId}`);
   } catch(e) {
@@ -7961,6 +8004,12 @@ app.post("/api/atendimento/assumir", checkMedico, async (req, res) => {
     );
     if (result.rowCount===0) return res.status(409).json({ ok: false, error: "Paciente ja foi assumido" });
     const at2 = result.rows[0];
+
+    if (String(medico.email || "").trim().toLowerCase() === MARIANA_PRIORIDADE_EMAIL
+        && Number(atendimento.prioridade_medico_id) === Number(medico.id)) {
+      notificarEquipeAposAssuncaoPrioritaria(filaId)
+        .catch(e => console.error("[PRIORIDADE] Erro ao comunicar assunção à equipe:", e.message));
+    }
 
     // Da baixa no agendamento para sair do badge de agendamentos
     if (at2.agendamento_id) {
