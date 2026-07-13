@@ -7784,6 +7784,7 @@ app.get("/api/fila", checkMedico, async (req, res) => {
                   AND (
                     prioridade_medico_id IS NULL
                     OR prioridade_medico_id=$3
+                    OR status='assumido'
                     OR (
                       status='aguardando'
                       AND (prioridade_ate <= NOW() OR prioridade_geral_notificada_em IS NOT NULL)
@@ -7812,7 +7813,17 @@ app.get("/api/fila", checkMedico, async (req, res) => {
     for (const row of result.rows) {
       try {
         if (row.status === "aguardando") fila.push(await garantirNomePacienteParaFila(row));
-        else fila.push({ ...row, nome: normalizarNomePaciente(row.nome) || "Nome não informado" });
+        else {
+          const atendimentoVisivel = { ...row, nome: normalizarNomePaciente(row.nome) || "Nome não informado" };
+          if (!isAdmin
+              && row.status === "assumido"
+              && row.prioridade_medico_id
+              && Number(row.prioridade_medico_id) !== Number(req.medico.id)) {
+            atendimentoVisivel.medico_id = null;
+            atendimentoVisivel.medico_nome = null;
+          }
+          fila.push(atendimentoVisivel);
+        }
       } catch (e) {
         if (e.code === "NOME_PACIENTE_OBRIGATORIO") {
           console.warn(`[FILA] Atendimento #${row.id} sem nome real removido da fila ate paciente confirmar dados.`);
