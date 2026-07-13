@@ -7871,6 +7871,32 @@ app.get("/api/escala-prioridade", checkMedico, async (req, res) => {
   }
 });
 
+app.get("/api/admin/escala-prioridade/auditoria", checkAdmin, async (req, res) => {
+  try {
+    const mariana = await obterMedicoMariana();
+    if (!mariana) return res.status(404).json({ ok:false, error:"Cadastro da Mariana não encontrado" });
+    const { rows } = await pool.query(
+      `SELECT id,dia_semana,TO_CHAR(hora_inicio,'HH24:MI') AS hora_inicio,
+              TO_CHAR(hora_fim,'HH24:MI') AS hora_fim,ativo
+         FROM escala_prioridade_medico
+        WHERE medico_id=$1
+        ORDER BY dia_semana,hora_inicio`,
+      [mariana.id]
+    );
+    const turnoAtual = await obterMarianaEmTurnoAgora();
+    return res.json({
+      ok:true,
+      medico:{ id:mariana.id, nome:mariana.nome_exibicao || mariana.nome, email:mariana.email },
+      turnos:rows,
+      em_turno_agora:!!turnoAtual,
+      horario_fortaleza:new Date().toLocaleString("pt-BR", { timeZone:"America/Fortaleza" })
+    });
+  } catch (e) {
+    console.error("[ESCALA-AUDITORIA]", e.message);
+    return res.status(500).json({ ok:false, error:"Erro ao auditar turnos" });
+  }
+});
+
 app.put("/api/escala-prioridade", checkMedico, async (req, res) => {
   const client = await pool.connect();
   try {
