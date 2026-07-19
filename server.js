@@ -1103,6 +1103,20 @@ async function initDB() {
       status        TEXT NOT NULL DEFAULT 'iniciou_agendamento',
       criado_em     TIMESTAMP DEFAULT NOW()
     )`).catch(()=>{});
+    await pool.query(`CREATE TABLE IF NOT EXISTS eventos_funil (
+      id              BIGSERIAL PRIMARY KEY,
+      modulo          TEXT NOT NULL,
+      evento          TEXT NOT NULL,
+      pagina          TEXT,
+      profissional_id INTEGER,
+      session_id      TEXT,
+      metadata        JSONB NOT NULL DEFAULT '{}'::jsonb,
+      criado_em       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )`).catch(()=>{});
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_eventos_funil_modulo_data
+      ON eventos_funil(modulo, criado_em DESC)`).catch(()=>{});
+    await pool.query(`CREATE INDEX IF NOT EXISTS idx_eventos_funil_evento_data
+      ON eventos_funil(evento, criado_em DESC)`).catch(()=>{});
     console.log("[DB] Tabelas, colunas e índices verificados com sucesso");
   } catch (e) {
     console.error("[DB] Erro no initDB:", e.message);
@@ -5494,9 +5508,18 @@ async function enviarEmailConfirmacaoPacientePsi({ id, paciente_nome, paciente_e
 // ── PSICOLOGIA: e-mail convite para guest criar senha ────────────────────────
 // Disparado pós-pagamento quando paciente agendou sem autenticação.
 // Envia link JWT de 24h para o paciente definir sua senha e acessar o painel.
-async function enviarEmailConviteContaGuest({ nome, email, psicologo, horario }) {
+async function enviarEmailConviteContaGuest({
+  nome,
+  email,
+  psicologo,
+  profissional,
+  horario,
+  contexto = 'Psicologia Online',
+  tipoAtendimento = 'sessão'
+}) {
   const RESEND_KEY = process.env.RESEND_API_KEY;
   if (!RESEND_KEY || !email) return;
+  const nomeProfissional = profissional || psicologo || 'profissional';
 
   // Só envia se for conta guest (senha_hash = '__GUEST__')
   try {
@@ -5524,15 +5547,15 @@ async function enviarEmailConviteContaGuest({ nome, email, psicologo, horario })
     <div style="max-width:520px;margin:0 auto;background:#fff;border:1px solid rgba(22,18,14,.1);border-radius:16px;overflow:hidden">
       <div style="padding:20px 28px;background:linear-gradient(135deg,#e8eef7,#d0ddef)">
         <span style="font-size:1.1rem;font-weight:600;color:#26508e">ConsultaJá24h</span>
-        <span style="font-size:.8rem;color:rgba(22,18,14,.5);margin-left:8px">Psicologia Online</span>
+        <span style="font-size:.8rem;color:rgba(22,18,14,.5);margin-left:8px">${contexto}</span>
       </div>
       <div style="padding:28px">
         <p style="color:#16120e;font-size:.95rem;margin-bottom:12px">Olá, <strong>${nome}</strong>!</p>
         <p style="color:#443e38;font-size:.9rem;line-height:1.65;margin-bottom:16px">
-          Sua sessão com <strong>${psicologo}</strong> em <strong>${horarioFmt}</strong> está confirmada. 🎉
+          Sua ${tipoAtendimento} com <strong>${nomeProfissional}</strong> em <strong>${horarioFmt}</strong> está confirmada.
         </p>
         <p style="color:#443e38;font-size:.88rem;line-height:1.65;margin-bottom:20px">
-          Crie uma senha para acompanhar todas as suas sessões, ver o link de acesso e gerenciar agendamentos:
+          Crie uma senha para acompanhar seu atendimento, ver o link de acesso e gerenciar seus agendamentos:
         </p>
         <a href="${linkCriarSenha}" style="display:inline-block;padding:12px 28px;border-radius:12px;background:#26508e;color:#fff;font-weight:600;font-size:.9rem;text-decoration:none;margin-bottom:16px">
           Criar minha senha →
@@ -5551,7 +5574,7 @@ async function enviarEmailConviteContaGuest({ nome, email, psicologo, horario })
       body: JSON.stringify({
         from: 'ConsultaJá24h <contato@consultaja24h.com.br>',
         to: [email],
-        subject: `✅ Sessão confirmada com ${psicologo} — crie sua senha`,
+        subject: `Atendimento confirmado com ${nomeProfissional} — crie sua senha`,
         html
       })
     });
@@ -5924,6 +5947,124 @@ app.post('/api/lead/registrar', rlGeral, async (req, res) => {
   }
 });
 
+const FUNIL_MODULOS = new Set(['especialistas', 'psicologia']);
+const FUNIL_EVENTOS = new Set([
+  'page_view',
+  'profile_opened',
+  'slot_selected',
+  'availability_contact',
+  'booking_created',
+  'payment_started',
+  'payment_failed',
+  'payment_confirmed'
+]);
+
+function limitarTextoFunil(valor, limite) {
+  return String(valor == null ? '' : valor).trim().slice(0, limite);
+}
+
+app.post('/api/funil/evento', rlGeral, async (req, res) => {
+  try {
+    const modulo = limitarTextoFunil(req.body?.modulo, 32).toLowerCase();
+    const evento = limitarTextoFunil(req.body?.evento, 48).toLowerCase();
+    if (!FUNIL_MODULOS.has(modulo) || !FUNIL_EVENTOS.has(evento)) {
+      return res.status(400).json({ ok: false, error: 'Evento inválido' });
+    }
+
+    const pagina = limitarTextoFunil(req.body?.pagina, 160);
+    const sessionId = limitarTextoFunil(req.body?.session_id, 80);
+    const profissionalId = Number.parseInt(req.body?.profissional_id, 10) || null;
+    const metadataEntrada = req.body?.metadata;
+    const metadata = metadataEntrada && typeof metadataEntrada === 'object' && !Array.isArray(metadataEntrada)
+      ? Object.fromEntries(
+          Object.entries(metadataEntrada)
+            .slice(0, 12)
+            .map(([chave, valor]) => [limitarTextoFunil(chave, 40), limitarTextoFunil(valor, 180)])
+            .filter(([chave]) => chave)
+        )
+      : {};
+
+    await pool.query(
+      `INSERT INTO eventos_funil (modulo, evento, pagina, profissional_id, session_id, metadata)
+       VALUES ($1,$2,$3,$4,$5,$6::jsonb)`,
+      [modulo, evento, pagina, profissionalId, sessionId, JSON.stringify(metadata)]
+    );
+    return res.status(204).end();
+  } catch (e) {
+    console.warn('[FUNIL] Falha ao registrar evento:', e.message);
+    return res.status(204).end();
+  }
+});
+
+app.get('/api/admin/funil', checkAdmin, async (req, res) => {
+  try {
+    const moduloInformado = limitarTextoFunil(req.query.modulo, 32).toLowerCase();
+    const modulo = FUNIL_MODULOS.has(moduloInformado) ? moduloInformado : null;
+    const dias = Math.min(180, Math.max(1, Number.parseInt(req.query.dias || '30', 10) || 30));
+    const params = [dias];
+    let filtroModulo = '';
+    if (modulo) {
+      params.push(modulo);
+      filtroModulo = `AND modulo = $2`;
+    }
+    const { rows: totais } = await pool.query(
+      `SELECT modulo, evento, COUNT(*)::int AS total,
+              COUNT(DISTINCT NULLIF(session_id,''))::int AS sessoes
+         FROM eventos_funil
+        WHERE criado_em >= NOW() - ($1 || ' days')::interval ${filtroModulo}
+        GROUP BY modulo, evento
+        ORDER BY modulo, evento`,
+      params
+    );
+    const { rows: diarios } = await pool.query(
+      `SELECT DATE(criado_em AT TIME ZONE 'America/Fortaleza') AS data,
+              modulo, evento, COUNT(*)::int AS total
+         FROM eventos_funil
+        WHERE criado_em >= NOW() - ($1 || ' days')::interval ${filtroModulo}
+        GROUP BY data, modulo, evento
+        ORDER BY data DESC, modulo, evento`,
+      params
+    );
+    return res.json({ ok: true, dias, modulo: modulo || 'todos', totais, diarios });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+async function obterOuCriarPacienteGuest({ nome, email, tel, cpf }) {
+  const emailNorm = String(email || '').trim().toLowerCase();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailNorm)) {
+    throw new Error('E-mail inválido');
+  }
+  const nomeNorm = String(nome || '').trim();
+  const telNorm = String(tel || '').trim();
+  const cpfNorm = String(cpf || '').replace(/\D/g, '');
+  const existente = await pool.query(
+    `SELECT id FROM pacientes WHERE email = $1 LIMIT 1`,
+    [emailNorm]
+  );
+  if (existente.rowCount > 0) {
+    const pacienteId = existente.rows[0].id;
+    await pool.query(
+      `UPDATE pacientes
+          SET nome = CASE WHEN COALESCE(TRIM(nome),'') = '' THEN $1 ELSE nome END,
+              tel  = CASE WHEN COALESCE(TRIM(tel),'') = '' THEN $2 ELSE tel END,
+              cpf  = CASE WHEN COALESCE(TRIM(cpf),'') = '' THEN $3 ELSE cpf END
+        WHERE id = $4`,
+      [nomeNorm, telNorm, cpfNorm, pacienteId]
+    );
+    return pacienteId;
+  }
+  const { rows } = await pool.query(
+    `INSERT INTO pacientes (nome, email, senha_hash, cpf, tel)
+     VALUES ($1,$2,'__GUEST__',$3,$4)
+     ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email
+     RETURNING id`,
+    [nomeNorm, emailNorm, cpfNorm, telNorm]
+  );
+  return rows[0].id;
+}
+
 // ── ESPECIALISTAS: horários ocupados ─────────────────────────────────────────
 // ATENÇÃO: rota específica ANTES de /:especialidade para evitar captura pelo wildcard
 app.get('/api/especialistas/horarios-ocupados/:especialistaId', rlGeral, async (req, res) => {
@@ -5943,24 +6084,6 @@ app.get('/api/especialistas/horarios-ocupados/:especialistaId', rlGeral, async (
   } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
 });
 
-function gerarDisponibilidadeFallbackEspecialista({
-  inicioHora = 16,
-  fimHora = 20,
-  dias = 7,
-} = {}) {
-  const slots = [];
-  const agora = new Date();
-  for (let d = 0; d < dias; d++) {
-    for (let h = inicioHora; h <= fimHora; h++) {
-      const slot = new Date(agora);
-      slot.setDate(slot.getDate() + d);
-      slot.setHours(h, 0, 0, 0);
-      if (slot > agora) slots.push(slot.toISOString());
-    }
-  }
-  return slots;
-}
-
 function normalizarDisponibilidadeEspecialista(disponibilidadeBruta) {
   const arr = Array.isArray(disponibilidadeBruta) ? disponibilidadeBruta : [];
   const agoraTs = Date.now();
@@ -5969,8 +6092,7 @@ function normalizarDisponibilidadeEspecialista(disponibilidadeBruta) {
     .filter((d) => !isNaN(d.getTime()) && d.getTime() > agoraTs)
     .sort((a, b) => a.getTime() - b.getTime())
     .map((d) => d.toISOString());
-  if (futuros.length > 0) return futuros;
-  return gerarDisponibilidadeFallbackEspecialista({ inicioHora: 16, fimHora: 20, dias: 7 });
+  return futuros;
 }
 
 // ── ESPECIALISTAS: listar por especialidade ───────────────────────────────────
@@ -6053,6 +6175,14 @@ async function notificarAgendamentoEspecialistaConfirmado(agendamentoId) {
       horario: horarioFmt,
       modalidade: ag.modalidade || 'video',
       status: 'confirmado'
+    }),
+    enviarEmailConviteContaGuest({
+      nome: ag.paciente_nome,
+      email: ag.paciente_email,
+      profissional: ag.especialista_nome,
+      horario: ag.horario_agendado,
+      contexto: 'Consulta com especialista',
+      tipoAtendimento: 'consulta'
     })
   ]);
 }
@@ -6074,8 +6204,13 @@ app.post('/api/especialistas/agendamento/criar', rlGeral, async (req, res) => {
         if (dec.tipo === 'paciente') pacienteId = dec.id;
       } catch(_) {}
     }
+    const emailNorm = String(paciente_email).trim().toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailNorm)) {
+      return res.status(400).json({ ok: false, error: 'E-mail inválido' });
+    }
     const espRes = await pool.query(
-      `SELECT id, nome_exibicao, especialidade, valor_consulta, ativo FROM especialistas WHERE id = $1 LIMIT 1`,
+      `SELECT id, nome_exibicao, especialidade, valor_consulta, ativo, disponibilidade
+         FROM especialistas WHERE id = $1 LIMIT 1`,
       [especialistaId]
     );
     if (espRes.rowCount === 0) {
@@ -6088,6 +6223,11 @@ app.post('/api/especialistas/agendamento/criar', rlGeral, async (req, res) => {
     const modalidadeFinal = String(modalidade || 'video').toLowerCase() === 'chat' ? 'chat' : 'video';
     const slotStart = new Date(horario_agendado);
     if (isNaN(slotStart.getTime())) return res.status(400).json({ ok: false, error: 'Horário inválido' });
+    const disponibilidade = normalizarDisponibilidadeEspecialista(esp.disponibilidade);
+    const slotAutorizado = disponibilidade.some(slot => new Date(slot).getTime() === slotStart.getTime());
+    if (!slotAutorizado) {
+      return res.status(409).json({ ok: false, error: 'Este horário não está mais disponível. Escolha outro.' });
+    }
     const slotEnd = new Date(slotStart.getTime() + 60 * 60 * 1000);
     const conflito = await pool.query(
       `SELECT id FROM agendamentos_especialistas
@@ -6099,13 +6239,26 @@ app.post('/api/especialistas/agendamento/criar', rlGeral, async (req, res) => {
       [especialistaId, slotStart.toISOString(), slotEnd.toISOString()]
     );
     if (conflito.rowCount > 0) return res.status(409).json({ ok: false, error: 'Horário indisponível. Escolha outro.' });
+    if (!pacienteId) {
+      try {
+        pacienteId = await obterOuCriarPacienteGuest({
+          nome: paciente_nome,
+          email: emailNorm,
+          tel: paciente_tel,
+          cpf: paciente_cpf
+        });
+      } catch (e) {
+        console.error('[ESP-AGEND] Falha ao vincular paciente guest:', e.message);
+        return res.status(500).json({ ok: false, error: 'Não foi possível preparar o acesso do paciente' });
+      }
+    }
     const result = await pool.query(
       `INSERT INTO agendamentos_especialistas
         (especialista_id, especialista_nome, especialidade, paciente_nome, paciente_email,
          paciente_tel, paciente_cpf, horario_agendado, valor_cobrado, paciente_id, modalidade)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
        RETURNING id, valor_cobrado`,
-      [especialistaId, esp.nome_exibicao, esp.especialidade, paciente_nome, paciente_email,
+      [especialistaId, esp.nome_exibicao, esp.especialidade, paciente_nome, emailNorm,
        paciente_tel||'', paciente_cpf||'', slotStart.toISOString(), esp.valor_consulta, pacienteId, modalidadeFinal]
     );
     const ag = result.rows[0];
