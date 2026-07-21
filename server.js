@@ -3030,6 +3030,16 @@ async function liberarPrioridadesVencidas() {
       )
       RETURNING id,nome,tel,tipo,triagem,especialidade_solicitada,fallback_decisao`,
   );
+  if (!rows.length) return;
+
+  const medicosResult = await pool.query(
+    `SELECT id,nome,email FROM medicos WHERE ativo=true AND status='aprovado'`
+  );
+  const destinatariosEquipe = filtrarMedicosAtivos(medicosResult.rows)
+    .map(med => String(med.email || "").trim().toLowerCase())
+    .filter(email => email && !emailPertenceGrupoPrioridadeInicial(email));
+  if (!destinatariosEquipe.length) return;
+
   for (const at of rows) {
     const nomeFila = normalizarNomePaciente(at.nome) || "Nome não informado";
     await enviarEmailMedicos({
@@ -3041,7 +3051,8 @@ async function liberarPrioridadesVencidas() {
       atendimentoId: at.id,
       subject: `FILA LIBERADA - PACIENTE AGUARDANDO - ${nomeFila}`,
       especialidadeSolicitada: at.especialidade_solicitada,
-      fallbackClinico: at.fallback_decisao === "clinico"
+      fallbackClinico: at.fallback_decisao === "clinico",
+      destinatariosPermitidos: destinatariosEquipe
     });
     console.log(`[PRIORIDADE] Atendimento #${at.id} liberado para toda a equipe.`);
   }
