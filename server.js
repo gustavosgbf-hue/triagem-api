@@ -46,7 +46,7 @@ app.use(cors({
 app.use(express.json({ limit: "1mb" }));
 
 app.get("/api/build-info", (_req, res) => {
-  res.json({ ok: true, version: "priority-group-ana-valeria-v1" });
+  res.json({ ok: true, version: "queue-fair-distribution-v1" });
 });
 
 const RESEND_DEFAULT_FROM = process.env.RESEND_DEFAULT_FROM || "ConsultaJá24h <contato@consultaja24h.com.br>";
@@ -905,6 +905,15 @@ async function initDB() {
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_fila_prioridade_ate
       ON fila_atendimentos(prioridade_ate)
       WHERE status='aguardando' AND prioridade_geral_notificada_em IS NULL`).catch(()=>{});
+    await pool.query(`UPDATE fila_atendimentos
+      SET prioridade_medico_id=NULL,
+          prioridade_ate=NULL,
+          prioridade_geral_notificada_em=NULL
+      WHERE prioridade_medico_id IS NOT NULL
+         OR prioridade_ate IS NOT NULL
+         OR prioridade_geral_notificada_em IS NOT NULL`).then(r => {
+      if (r.rowCount) console.log(`[DB] Prioridades antigas removidas: ${r.rowCount}`);
+    }).catch(e => console.warn("[DB] Falha ao remover prioridades antigas:", e.message));
     await pool.query(
       `UPDATE fila_atendimentos
           SET triagem = BTRIM(SPLIT_PART(triagem, 'DADOS ORGANIZADOS PELA TRIAGEM', 2))
@@ -2975,26 +2984,6 @@ async function notificarMedicos(at) {
     "Aguardando", "", triagemParaPlanilha(at.triagem, at.queixa), at.tipo||"", "", String(at.id)
   ]).catch(() => {});
 
-  const medicosPrioritarios = atendimentoAceitaPrioridadeSemanal(at)
-    ? await obterMedicosGrupoPrioridadeInicial()
-    : [];
-  const medicoReferenciaPrioridade = medicosPrioritarios.find(
-    med => String(med.email || "").trim().toLowerCase() === ANA_VALERIA_PRIORIDADE_EMAIL
-  ) || medicosPrioritarios[0] || null;
-  if (medicoReferenciaPrioridade) {
-    const prioridade = await pool.query(
-      `UPDATE fila_atendimentos
-          SET prioridade_medico_id=$1,
-              prioridade_ate=NOW() + ($2 * INTERVAL '1 minute'),
-              prioridade_geral_notificada_em=NULL
-        WHERE id=$3
-        RETURNING prioridade_ate`,
-      [medicoReferenciaPrioridade.id, PRIORIDADE_FILA_MINUTOS, at.id]
-    );
-    at.prioridade_medico_id = medicoReferenciaPrioridade.id;
-    at.prioridade_ate = prioridade.rows[0]?.prioridade_ate;
-  }
-
   await enviarEmailMedicos({
     nome: nomeFila, tel: at.tel, tipo: at.tipo,
     triagem: at.triagem, linkRetorno,
@@ -3002,15 +2991,13 @@ async function notificarMedicos(at) {
     horarioAgendado: null, horarioAgendadoRaw: null,
     especialidadeSolicitada: at.especialidade_solicitada,
     fallbackClinico: at.fallback_decisao === "clinico",
-    destinatariosPermitidos: medicoReferenciaPrioridade
-      ? Array.from(EMAILS_GRUPO_PRIORIDADE_INICIAL)
-      : null,
+    destinatariosPermitidos: null,
     subject: at.especialidade_solicitada
       ? `${nomeEspecialidadeImediata(at.especialidade_solicitada).toUpperCase()} - PACIENTE NOVO NA FILA - ${nomeFila}`
       : "PACIENTE NOVO NA FILA - " + nomeFila
   });
 
-  console.log(`[NOTIFICACAO] Atendimento #${at.id} notificado${medicoReferenciaPrioridade ? " primeiro para o grupo prioritario" : " para a equipe"}.`);
+  console.log(`[NOTIFICACAO] Atendimento #${at.id} notificado para a equipe.`);
 }
 
 async function liberarPrioridadesVencidas() {
@@ -3057,10 +3044,6 @@ async function liberarPrioridadesVencidas() {
     console.log(`[PRIORIDADE] Atendimento #${at.id} liberado para toda a equipe.`);
   }
 }
-
-setInterval(() => {
-  liberarPrioridadesVencidas().catch(e => console.error("[PRIORIDADE] Erro ao liberar fila:", e.message));
-}, 30 * 1000);
 
 // ── Helper: libera atendimento para médicos (timer + endpoint de aprovação) ───
 async function liberarAtendimentoParaMedicos(atendimentoId) {
@@ -4131,16 +4114,6 @@ app.get("/api/atendimento/assumir-email", async (req, res) => {
       `SELECT email,especialidade FROM medicos WHERE id=$1 AND ativo=true AND status='aprovado'`,
       [medicoId]
     )).rows[0];
-    const emailMedicoReserva = Number(medicoId) === 0
-      ? ADMIN_MEDICO_EMAIL
-      : String(medicoReserva?.email || "").trim().toLowerCase();
-    const prioridadeAtiva = reserva.rows[0]?.prioridade_medico_id
-      && reserva.rows[0]?.prioridade_ate
-      && new Date(reserva.rows[0].prioridade_ate).getTime() > Date.now();
-    if (prioridadeAtiva
-        && !emailPertenceGrupoPrioridadeInicial(emailMedicoReserva)) {
-      return res.status(403).send(`<html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#060d0b;color:#fff"><h2 style="color:#ffbd2e">Prioridade em andamento</h2><p>Este atendimento está reservado por alguns minutos ao profissional escalado.</p><a href="${PAINEL_URL}" style="color:#b4e05a">Ir para o painel</a></body></html>`);
-    }
     if (reserva.rows[0]?.categoria_atendimento === "especialista_imediato"
         && reserva.rows[0]?.fallback_decisao !== "clinico"
         && Number(medicoId) !== 0) {
@@ -4168,10 +4141,6 @@ app.get("/api/atendimento/assumir-email", async (req, res) => {
     }
     const paciente = result.rows[0];
     console.log(`[ASSUMIR-EMAIL] ${medicoNome} assumiu atendimento #${atendimentoId} (${paciente.nome}) via e-mail`);
-    if (prioridadeAtiva && emailPertenceGrupoPrioridadeInicial(emailMedicoReserva)) {
-      notificarEquipeAposAssuncaoPrioritaria(atendimentoId)
-        .catch(e => console.error("[PRIORIDADE] Erro ao comunicar assunção à equipe:", e.message));
-    }
     // Redireciona para o painel com o atendimento já marcado
     return res.redirect(`${PAINEL_URL}?assumiu=${atendimentoId}`);
   } catch(e) {
@@ -7938,7 +7907,6 @@ app.get("/api/fila", checkMedico, async (req, res) => {
   try {
     const emailMedico = String(req.medico.email || "").trim().toLowerCase();
     const isAdmin = emailMedico === ADMIN_MEDICO_EMAIL;
-    const pertenceGrupoPrioridade = emailPertenceGrupoPrioridadeInicial(emailMedico);
     const medicoDb = await pool.query(
       `SELECT especialidade FROM medicos WHERE id=$1 LIMIT 1`,
       [req.medico.id]
@@ -7973,16 +7941,6 @@ app.get("/api/fila", checkMedico, async (req, res) => {
                   AND LOWER(TRIM(COALESCE(triagem,''))) NOT LIKE '(aguardando triagem%'
                   AND (horario_agendado IS NULL OR horario_agendado <= NOW() + INTERVAL '15 minutes')
                   AND (
-                    prioridade_medico_id IS NULL
-                    OR prioridade_medico_id=$3
-                    OR $4::boolean
-                    OR status='assumido'
-                    OR (
-                      status='aguardando'
-                      AND (prioridade_ate <= NOW() OR prioridade_geral_notificada_em IS NOT NULL)
-                    )
-                  )
-                  AND (
                     COALESCE(categoria_atendimento,'clinico') <> 'especialista_imediato'
                     OR fallback_decisao='clinico'
                     OR (
@@ -8001,8 +7959,6 @@ app.get("/api/fila", checkMedico, async (req, res) => {
       params = [
         especialidadeMedico,
         Object.keys(ESPECIALIDADES_IMEDIATAS),
-        Number(req.medico.id),
-        pertenceGrupoPrioridade,
       ];
     }
     const result = await pool.query(query, params || []);
@@ -8215,13 +8171,6 @@ app.post("/api/atendimento/assumir", checkMedico, async (req, res) => {
     const atendimento = atendimentoResult.rows[0];
     if (!atendimento) return res.status(404).json({ ok: false, error: "Atendimento nao encontrado" });
     const isAdmin = medico.email === "gustavosgbf@gmail.com";
-    const pertenceGrupoPrioridade = emailPertenceGrupoPrioridadeInicial(medico.email);
-    const prioridadeAtiva = atendimento.prioridade_medico_id
-      && atendimento.prioridade_ate
-      && new Date(atendimento.prioridade_ate).getTime() > Date.now();
-    if (prioridadeAtiva && !isAdmin && !pertenceGrupoPrioridade) {
-      return res.status(403).json({ ok:false, error:"Atendimento reservado temporariamente ao profissional escalado" });
-    }
     const reservadoEspecialista = atendimento.categoria_atendimento === "especialista_imediato"
       && atendimento.fallback_decisao !== "clinico";
     if (
@@ -8238,11 +8187,6 @@ app.post("/api/atendimento/assumir", checkMedico, async (req, res) => {
     );
     if (result.rowCount===0) return res.status(409).json({ ok: false, error: "Paciente ja foi assumido" });
     const at2 = result.rows[0];
-
-    if (prioridadeAtiva && pertenceGrupoPrioridade) {
-      notificarEquipeAposAssuncaoPrioritaria(filaId)
-        .catch(e => console.error("[PRIORIDADE] Erro ao comunicar assunção à equipe:", e.message));
-    }
 
     // Da baixa no agendamento para sair do badge de agendamentos
     if (at2.agendamento_id) {
