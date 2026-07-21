@@ -3049,7 +3049,7 @@ async function liberarPrioridadesVencidas() {
       triagem: at.triagem,
       linkRetorno: `${process.env.SITE_URL || "https://consultaja24h.com.br"}/triagem.html?consulta=${at.id}`,
       atendimentoId: at.id,
-      subject: `FILA LIBERADA - PACIENTE AGUARDANDO - ${nomeFila}`,
+      subject: `PACIENTE NOVO NA FILA - ${nomeFila}`,
       especialidadeSolicitada: at.especialidade_solicitada,
       fallbackClinico: at.fallback_decisao === "clinico",
       destinatariosPermitidos: destinatariosEquipe
