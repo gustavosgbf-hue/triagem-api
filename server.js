@@ -1647,8 +1647,8 @@ const PSI_COMISSAO_PCT = parseFloat(process.env.PSI_COMISSAO_PCT || '20');
 
 if (!PAGBANK_TOKEN) console.error("[PAGBANK] Token não configurado");
 
-const LIMITE_ATENDIMENTOS_JANELA_DIAS = 5;
-const LIMITE_ATENDIMENTOS_QUANTIDADE = 2;
+const LIMITE_ATENDIMENTOS_JANELA_DIAS = 7;
+const LIMITE_ATENDIMENTOS_QUANTIDADE = 3;
 
 async function buscarBloqueioManualAtendimento(atendimentoId) {
   const id = parseInt(atendimentoId, 10);
@@ -1715,6 +1715,10 @@ async function buscarLimiteAtendimentos(atendimentoId) {
          FROM fila_atendimentos f, atual a
         WHERE f.id <> $1
           AND f.pagamento_status = 'confirmado'
+          AND COALESCE(f.status, '') NOT IN ('cancelado', 'expirado', 'arquivado')
+          AND COALESCE(f.reembolso_status, '') NOT IN (
+            'processando', 'concluido', 'parcial_concluido', 'manual_pendente'
+          )
           AND COALESCE(f.pagamento_confirmado_em, f.criado_em)
               >= NOW() - ($2::text || ' days')::interval
           AND (
