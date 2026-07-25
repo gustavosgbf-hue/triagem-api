@@ -13,6 +13,15 @@ import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import multer from "multer";
 import { createHash, randomUUID } from "crypto";
 import rateLimit from "express-rate-limit";
+import {
+  codigoErroMemed,
+  encontrarIngredienteExato,
+  extrairTermosAlergia,
+  formatarDataMemed,
+  mensagemErroMemed,
+  normalizarDataIso,
+  validarDadosPrescritor,
+} from "./memed-utils.js";
 const { Pool } = pg;
 
 const pool = new Pool({
@@ -7281,7 +7290,7 @@ app.put("/api/admin/medico/:id/dados-regulatorios", checkAdmin, async (req, res)
             ok: false,
             pendente: true,
             status: sync.status,
-            error: sync.data?.errors?.[0]?.detail || sync.data?.error || "Memed recusou a atualização"
+            error: mensagemErroMemed(sync.data, sync.status)
           };
     }
     return res.json({ ok: true, medico: med, memed });
@@ -7307,13 +7316,14 @@ app.put("/api/admin/especialista/:id/dados-regulatorios", checkAdmin, async (req
     );
     if (!result.rowCount) return res.status(404).json({ ok: false, error: "Especialista não encontrado" });
     const especialista = result.rows[0];
-    const sync = await atualizarPrescritorMemed(especialista, `esp-${especialista.id}`);
+    const externalId = await externalIdMemedEspecialista(especialista);
+    const sync = await atualizarPrescritorMemed(especialista, externalId);
     return res.json({
       ok: true,
       especialista,
       memed: sync.ok
         ? { ok: true, pendente: false }
-        : { ok: false, pendente: true, status: sync.status, error: sync.data?.errors?.[0]?.detail || sync.data?.error || "Memed recusou a atualização" }
+        : { ok: false, pendente: true, status: sync.status, error: mensagemErroMemed(sync.data, sync.status) }
     });
   } catch (err) {
     console.error("[MEMED] Erro regulatório especialista:", err.message);
@@ -7328,38 +7338,46 @@ const MEMED_API_KEY = process.env.MEMED_API_KEY || "";
 const MEMED_SECRET_KEY = process.env.MEMED_SECRET_KEY || "";
 
 function normalizarDataNascimentoMedico(valor) {
-  const texto = String(valor || "").trim();
-  if (!texto) return "";
-  const br = texto.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
-  const iso = br ? `${br[3]}-${br[2]}-${br[1]}` : texto;
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(iso)) return "";
-  const [ano, mes, dia] = iso.split("-").map(Number);
-  const data = new Date(Date.UTC(ano, mes - 1, dia));
-  if (
-    data.getUTCFullYear() !== ano ||
-    data.getUTCMonth() !== mes - 1 ||
-    data.getUTCDate() !== dia ||
-    data > new Date()
-  ) return "";
-  return iso;
+  return normalizarDataIso(valor);
+}
+
+function atributosPrescritorMemed(med) {
+  const dados = validarDadosPrescritor(med);
+  const partesNome = String(med.nome_exibicao || med.nome || "Médico").trim().split(/\s+/);
+  return {
+    dados,
+    attributes: {
+      nome: partesNome[0],
+      sobrenome: partesNome.slice(1).join(" ") || "ConsultaJa",
+      cpf: dados.cpf,
+      data_nascimento: dados.dataNascimento,
+      board: {
+        board_code: "CRM",
+        board_number: dados.crm,
+        board_state: dados.uf
+      }
+    }
+  };
+}
+
+function respostaErroMemed(res, sync, fallbackStatus = 502) {
+  const status = sync?.status === 400 || sync?.status === 422 ? 422 : fallbackStatus;
+  return res.status(status).json({
+    ok: false,
+    code: codigoErroMemed(sync?.data) || "memed_validation_failed",
+    error: mensagemErroMemed(sync?.data, sync?.status)
+  });
 }
 
 async function atualizarPrescritorMemed(med, externalId) {
-  const cpf = String(med.cpf_medico || "").replace(/\D/g, "");
-  const dataNascimento = normalizarDataNascimentoMedico(med.data_nascimento_medico);
-  const partesNome = String(med.nome || "Médico").trim().split(/\s+/);
-  const uf = String(med.uf || "").trim().toUpperCase();
-  const attributes = {
-    nome: partesNome[0],
-    sobrenome: partesNome.slice(1).join(" ") || "ConsultaJa",
-    board: {
-      board_code: "CRM",
-      board_number: String(med.crm || "").replace(/\D/g, ""),
-      board_state: uf
-    }
-  };
-  if (cpf) attributes.cpf = cpf;
-  if (dataNascimento) attributes.data_nascimento = dataNascimento;
+  const { dados, attributes } = atributosPrescritorMemed(med);
+  if (dados.faltantes.length) {
+    return {
+      ok: false,
+      status: 400,
+      data: { code: "missing_regulatory_data", missing: dados.faltantes }
+    };
+  }
 
   const patchUrl = `${MEMED_API_URL}/sinapse-prescricao/usuarios/${externalId}?api-key=${MEMED_API_KEY}&secret-key=${MEMED_SECRET_KEY}`;
   const patchRes = await fetch(patchUrl, {
@@ -7369,6 +7387,66 @@ async function atualizarPrescritorMemed(med, externalId) {
   });
   const patchData = await patchRes.json().catch(() => ({}));
   return { ok: patchRes.ok, status: patchRes.status, data: patchData };
+}
+
+async function externalIdMemedEspecialista(especialista) {
+  const email = String(especialista?.email || "").trim();
+  if (email) {
+    const { rows } = await pool.query(
+      `SELECT id, memed_external_id
+         FROM medicos
+        WHERE LOWER(email)=LOWER($1)
+        ORDER BY ativo DESC, id
+        LIMIT 1`,
+      [email]
+    );
+    if (rows.length) {
+      return rows[0].memed_external_id || `consultaja-${rows[0].id}`;
+    }
+  }
+  return `esp-${especialista.id}`;
+}
+
+const MEMED_INGREDIENT_IDS_DOCUMENTADOS = new Map([
+  ["dipirona", 622],
+  ["losartana potassica", 2584],
+  ["amoxicilina", 174],
+]);
+const memedIngredientCache = new Map();
+
+async function resolverIngredienteMemed(termo) {
+  if (MEMED_INGREDIENT_IDS_DOCUMENTADOS.has(termo)) {
+    return MEMED_INGREDIENT_IDS_DOCUMENTADOS.get(termo);
+  }
+  if (memedIngredientCache.has(termo)) return memedIngredientCache.get(termo);
+
+  const url = new URL(`${MEMED_API_URL}/drugs/ingredients`);
+  url.searchParams.set("api-key", MEMED_API_KEY);
+  url.searchParams.set("secret-key", MEMED_SECRET_KEY);
+  url.searchParams.set("terms", termo);
+  url.searchParams.set("limit", "10");
+  url.searchParams.set("order[field]", "name");
+  url.searchParams.set("order[sort]", "ASC");
+  const response = await fetch(url, {
+    headers: { "Accept": "application/vnd.api+json", "Content-Type": "application/json" }
+  });
+  if (!response.ok) throw new Error(`ingredient_lookup_${response.status}`);
+  const data = await response.json().catch(() => ({}));
+  const id = encontrarIngredienteExato(termo, data?.data || []);
+  memedIngredientCache.set(termo, id);
+  return id;
+}
+
+async function resolverAlergiasMemed(texto) {
+  const termos = extrairTermosAlergia(texto);
+  const ids = [];
+  let naoMapeadas = 0;
+  for (const termo of termos) {
+    const id = await resolverIngredienteMemed(termo);
+    if (id) ids.push(id);
+    else naoMapeadas += 1;
+  }
+  return { ids: [...new Set(ids)], naoMapeadas };
 }
 
 // ── Middleware combinado: aceita token de médico OU especialista ──────────────
@@ -7395,8 +7473,39 @@ function checkMedicoOuEspecialista(req, res, next) {
   }
 }
 
+app.get("/api/atendimento/:id/memed-context", checkMedico, async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, medico_id, data_nascimento, alergias
+         FROM fila_atendimentos
+        WHERE id=$1
+        LIMIT 1`,
+      [req.params.id]
+    );
+    if (!rows.length) return res.status(404).json({ ok: false, error: "Atendimento não encontrado" });
+    const atendimento = rows[0];
+    if (!medicoPodeEscreverNoAtendimento(req.medico, atendimento)) {
+      return res.status(403).json({ ok: false, error: "Médico não vinculado ao atendimento" });
+    }
+
+    const alergias = await resolverAlergiasMemed(atendimento.alergias);
+    return res.json({
+      ok: true,
+      data_nascimento: formatarDataMemed(atendimento.data_nascimento),
+      alergia_ids: alergias.ids,
+      alergias_nao_mapeadas: alergias.naoMapeadas > 0
+    });
+  } catch (err) {
+    console.error(`[MEMED] Contexto do atendimento #${req.params.id}:`, err.message);
+    return res.status(502).json({ ok: false, error: "Não foi possível preparar os dados clínicos para a Memed" });
+  }
+});
+
 app.get("/api/memed/token", checkMedicoOuEspecialista, async (req, res) => {
   try {
+    if (!MEMED_API_KEY || !MEMED_SECRET_KEY) {
+      return res.status(503).json({ ok: false, error: "Integração Memed não configurada" });
+    }
     // Branch especialista — redireciona para lógica própria
     if (req._isEspecialista) {
       const { rows: espRows } = await pool.query(
@@ -7405,14 +7514,19 @@ app.get("/api/memed/token", checkMedicoOuEspecialista, async (req, res) => {
       );
       if (espRows.length === 0) return res.status(404).json({ ok: false, error: 'Especialista não encontrado' });
       const esp = espRows[0];
-      if (!esp.uf || esp.uf.trim().length < 2) {
-        return res.status(400).json({ ok: false, error: 'UF não cadastrada. Atualize seu perfil.' });
+      const dadosRegulatorios = validarDadosPrescritor(esp);
+      if (dadosRegulatorios.faltantes.length) {
+        return res.status(422).json({
+          ok: false,
+          code: "missing_regulatory_data",
+          error: `Complete os dados regulatórios antes de prescrever: ${dadosRegulatorios.faltantes.join(", ")}.`
+        });
       }
-      const uf = esp.uf.trim().toUpperCase();
+      const uf = dadosRegulatorios.uf;
       const partesNome = (esp.nome_exibicao || esp.nome || 'Especialista').trim().split(/\s+/);
       const nomeLocal = partesNome[0];
       const sobrenomeLocal = partesNome.slice(1).join(' ') || 'ConsultaJa';
-      const externalId = `esp-${esp.id}`;
+      const externalId = await externalIdMemedEspecialista(esp);
       const getUrl = `${MEMED_API_URL}/sinapse-prescricao/usuarios/${externalId}?api-key=${MEMED_API_KEY}&secret-key=${MEMED_SECRET_KEY}`;
       const getRes = await fetch(getUrl, { headers: { 'Accept': 'application/vnd.api+json', 'Content-Type': 'application/json' } });
       if (getRes.ok) {
@@ -7423,9 +7537,14 @@ app.get("/api/memed/token", checkMedicoOuEspecialista, async (req, res) => {
           const cpfMemed = String(getData?.data?.attributes?.cpf || '').replace(/\D/g, '');
           const dataLocal = normalizarDataNascimentoMedico(esp.data_nascimento_medico);
           const dataMemed = normalizarDataNascimentoMedico(getData?.data?.attributes?.data_nascimento);
-          if ((cpfLocal && cpfLocal !== cpfMemed) || (dataLocal && dataLocal !== dataMemed)) {
+          const crmMemed = String(getData?.data?.attributes?.board?.board_number || '').replace(/\D/g, '');
+          const ufMemed = String(getData?.data?.attributes?.board?.board_state || '').trim().toUpperCase();
+          if (cpfLocal !== cpfMemed || dataLocal !== dataMemed || dadosRegulatorios.crm !== crmMemed || uf !== ufMemed) {
             const sync = await atualizarPrescritorMemed(esp, externalId);
-            if (!sync.ok) console.error(`[MEMED] PATCH regulatório especialista id=${esp.id}:`, JSON.stringify(sync.data).substring(0, 300));
+            if (!sync.ok) {
+              console.error(`[MEMED] PATCH especialista id=${esp.id} status=${sync.status} code=${codigoErroMemed(sync.data) || "unknown"}`);
+              return respostaErroMemed(res, sync);
+            }
             return res.json({ ok: true, token: sync.data?.data?.attributes?.token || token });
           }
           return res.json({ ok: true, token });
@@ -7439,14 +7558,17 @@ app.get("/api/memed/token", checkMedicoOuEspecialista, async (req, res) => {
           nome: nomeLocal, sobrenome: sobrenomeLocal,
           email: esp.email || `esp${esp.id}@consultaja24h.com.br`,
           external_id: externalId,
-          cpf: String(esp.cpf_medico || '').replace(/\D/g, '') || undefined,
-          data_nascimento: normalizarDataNascimentoMedico(esp.data_nascimento_medico) || undefined,
-          board: { board_code: 'CRM', board_number: (esp.crm || '').replace(/\D/g, ''), board_state: uf },
+          cpf: dadosRegulatorios.cpf,
+          data_nascimento: dadosRegulatorios.dataNascimento,
+          board: { board_code: 'CRM', board_number: dadosRegulatorios.crm, board_state: uf },
         }}}),
       });
-      const postData = await postRes.json();
+      const postData = await postRes.json().catch(() => ({}));
       const token = postData?.data?.attributes?.token;
-      if (!token) return res.status(502).json({ ok: false, error: 'Não foi possível carregar a prescrição' });
+      if (!token) {
+        console.error(`[MEMED] POST especialista id=${esp.id} status=${postRes.status} code=${codigoErroMemed(postData) || "unknown"}`);
+        return respostaErroMemed(res, { status: postRes.status, data: postData });
+      }
       return res.json({ ok: true, token });
     }
     // Branch médico normal (lógica original abaixo)
@@ -7458,12 +7580,15 @@ app.get("/api/memed/token", checkMedicoOuEspecialista, async (req, res) => {
     if (medResult.rowCount === 0) return res.status(404).json({ ok: false, error: "Médico não encontrado" });
     const med = medResult.rows[0];
 
-    // UF obrigatória — não assume fallback
-    if (!med.uf || med.uf.trim().length < 2) {
-      console.warn(`[MEMED] Médico id=${med.id} sem UF cadastrada.`);
-      return res.status(400).json({ ok: false, error: "UF do médico não cadastrada. Atualize seu perfil antes de usar a prescrição." });
+    const dadosRegulatorios = validarDadosPrescritor(med);
+    if (dadosRegulatorios.faltantes.length) {
+      return res.status(422).json({
+        ok: false,
+        code: "missing_regulatory_data",
+        error: `Complete os dados regulatórios antes de prescrever: ${dadosRegulatorios.faltantes.join(", ")}.`
+      });
     }
-    const ufLocal = med.uf.trim().toUpperCase();
+    const ufLocal = dadosRegulatorios.uf;
 
     // Separa nome/sobrenome a partir do banco (usado tanto no GET quanto no POST)
     const partesNome = (med.nome || "Médico").trim().split(/\s+/);
@@ -7490,18 +7615,20 @@ app.get("/api/memed/token", checkMedicoOuEspecialista, async (req, res) => {
 
         // Mantém os dados cadastrais exigidos pela Memed/CFM sincronizados.
         const ufMemed       = (getData?.data?.attributes?.board?.board_state || "").trim().toUpperCase();
+        const crmMemed      = String(getData?.data?.attributes?.board?.board_number || "").replace(/\D/g, "");
         const sobrenomeMemed = (getData?.data?.attributes?.sobrenome || "").trim().toLowerCase();
         const cpfLocal = String(med.cpf_medico || "").replace(/\D/g, "");
         const cpfMemed = String(getData?.data?.attributes?.cpf || "").replace(/\D/g, "");
         const dataLocal = normalizarDataNascimentoMedico(med.data_nascimento_medico);
         const dataMemed = normalizarDataNascimentoMedico(getData?.data?.attributes?.data_nascimento);
         const ufOk          = ufMemed === ufLocal;
+        const crmOk         = crmMemed === dadosRegulatorios.crm;
         const sobrenomeOk   = sobrenomeMemed === sobrenomeLocal.toLowerCase();
         const cpfOk         = !cpfLocal || cpfMemed === cpfLocal;
         const dataOk        = !dataLocal || dataMemed === dataLocal;
 
-        if (!ufOk || !sobrenomeOk || !cpfOk || !dataOk) {
-          console.warn(`[MEMED] Inconsistência médico id=${med.id}: UF=${ufOk} sobrenome=${sobrenomeOk} CPF=${cpfOk} nascimento=${dataOk}`);
+        if (!ufOk || !crmOk || !sobrenomeOk || !cpfOk || !dataOk) {
+          console.warn(`[MEMED] Inconsistência médico id=${med.id}: CRM=${crmOk} UF=${ufOk} sobrenome=${sobrenomeOk} CPF=${cpfOk} nascimento=${dataOk}`);
           // Tenta corrigir via PATCH — sem recriar usuário
           try {
             const sync = await atualizarPrescritorMemed(med, externalId);
@@ -7510,13 +7637,12 @@ app.get("/api/memed/token", checkMedicoOuEspecialista, async (req, res) => {
               const tokenCorrigido = sync.data?.data?.attributes?.token || token;
               return res.json({ ok: true, token: tokenCorrigido, externalId });
             } else {
-              console.error(`[MEMED] PATCH falhou médico id=${med.id}:`, JSON.stringify(sync.data).substring(0, 300));
-              // Não quebra — retorna token atual mesmo com dados ainda desatualizados
-              return res.json({ ok: true, token, externalId });
+              console.error(`[MEMED] PATCH médico id=${med.id} status=${sync.status} code=${codigoErroMemed(sync.data) || "unknown"}`);
+              return respostaErroMemed(res, sync);
             }
           } catch (patchErr) {
             console.error(`[MEMED] Erro PATCH médico id=${med.id}:`, patchErr.message);
-            return res.json({ ok: true, token, externalId });
+            return res.status(502).json({ ok: false, error: "Falha ao validar os dados do prescritor na Memed" });
           }
         }
 
@@ -7526,8 +7652,6 @@ app.get("/api/memed/token", checkMedicoOuEspecialista, async (req, res) => {
     }
 
     // Médico não existe no Memed — cadastra
-    const crmNumero = (med.crm || "").replace(/\D/g, "");
-
     const payload = {
       data: {
         type: "usuarios",
@@ -7535,14 +7659,14 @@ app.get("/api/memed/token", checkMedicoOuEspecialista, async (req, res) => {
           external_id: externalId,
           nome: nomeLocal,
           sobrenome: sobrenomeLocal,
-          cpf: (med.cpf_medico || "").replace(/\D/g, "") || undefined,
-          data_nascimento: med.data_nascimento_medico || undefined,
+          cpf: dadosRegulatorios.cpf,
+          data_nascimento: dadosRegulatorios.dataNascimento,
           email: med.email || undefined,
           telefone: (med.telefone || "").replace(/\D/g, "") || undefined,
           especialidade: med.especialidade || undefined,
           board: {
             board_code: "CRM",
-            board_number: crmNumero,
+            board_number: dadosRegulatorios.crm,
             board_state: ufLocal
           }
         }
@@ -7560,11 +7684,13 @@ app.get("/api/memed/token", checkMedicoOuEspecialista, async (req, res) => {
       headers: { "Accept": "application/vnd.api+json", "Content-Type": "application/json" },
       body: JSON.stringify(payload)
     });
-    const postData = await postRes.json();
-    console.log("[MEMED] Cadastro prescritor:", JSON.stringify(postData).substring(0, 200));
+    const postData = await postRes.json().catch(() => ({}));
 
     const token = postData?.data?.attributes?.token;
-    if (!token) return res.status(500).json({ ok: false, error: "Não foi possível obter token Memed", detail: postData });
+    if (!token) {
+      console.error(`[MEMED] POST médico id=${med.id} status=${postRes.status} code=${codigoErroMemed(postData) || "unknown"}`);
+      return respostaErroMemed(res, { status: postRes.status, data: postData });
+    }
 
     await pool.query(`UPDATE medicos SET memed_external_id=$1 WHERE id=$2`, [externalId, medicoId]);
     return res.json({ ok: true, token, externalId });
@@ -9998,6 +10124,7 @@ app.get('/api/admin/psicologia/indicadores', checkAdmin, async (req, res) => {
     `ALTER TABLE agendamentos_especialistas ADD COLUMN IF NOT EXISTS data_nascimento TEXT`,
     `ALTER TABLE agendamentos_especialistas ADD COLUMN IF NOT EXISTS sexo TEXT`,
     `ALTER TABLE agendamentos_especialistas ADD COLUMN IF NOT EXISTS cpf TEXT`,
+    `ALTER TABLE agendamentos_especialistas ADD COLUMN IF NOT EXISTS alergias TEXT`,
   ];
   for (const sql of migs) {
     await pool.query(sql).catch(e => console.warn('[ESP-MIGRATION2]', e.message));
@@ -10074,6 +10201,7 @@ app.get('/api/especialista/consultas', authEspecialista, async (req, res) => {
          ae.prontuario_texto,
          ae.data_nascimento,
          ae.sexo,
+         ae.alergias,
          ae.pagamento_status
        FROM agendamentos_especialistas ae
       WHERE ae.especialista_id = $1 AND ae.pagamento_status = 'confirmado'
@@ -10108,6 +10236,7 @@ app.get('/api/especialista/consulta/:id', authEspecialista, async (req, res) => 
          ae.prontuario_texto,
          ae.data_nascimento,
          ae.sexo,
+         ae.alergias,
          ae.pagamento_status,
          ae.valor_cobrado
        FROM agendamentos_especialistas ae
@@ -10119,6 +10248,31 @@ app.get('/api/especialista/consulta/:id', authEspecialista, async (req, res) => 
   } catch (e) {
     console.error('[ESP-CONSULTA] Erro:', e.message);
     return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.get('/api/especialista/consulta/:id/memed-context', authEspecialista, async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!id) return res.status(400).json({ ok: false, error: 'ID inválido' });
+    const { rows } = await pool.query(
+      `SELECT data_nascimento, alergias
+         FROM agendamentos_especialistas
+        WHERE id=$1 AND especialista_id=$2 AND pagamento_status='confirmado'
+        LIMIT 1`,
+      [id, req.especialistaId]
+    );
+    if (!rows.length) return res.status(404).json({ ok: false, error: 'Consulta não encontrada' });
+    const alergias = await resolverAlergiasMemed(rows[0].alergias);
+    return res.json({
+      ok: true,
+      data_nascimento: formatarDataMemed(rows[0].data_nascimento),
+      alergia_ids: alergias.ids,
+      alergias_nao_mapeadas: alergias.naoMapeadas > 0
+    });
+  } catch (e) {
+    console.error(`[MEMED] Contexto especialista consulta #${req.params.id}:`, e.message);
+    return res.status(502).json({ ok: false, error: 'Não foi possível preparar os dados clínicos para a Memed' });
   }
 });
 
