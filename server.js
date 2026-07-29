@@ -899,6 +899,14 @@ async function initDB() {
     for (const [col, tipo] of cols) {
       await pool.query(`ALTER TABLE fila_atendimentos ADD COLUMN IF NOT EXISTS ${col} ${tipo}`);
     }
+    await pool.query(`
+      UPDATE fila_atendimentos f
+         SET mostrar_avaliacao_google=false
+        FROM medicos m
+       WHERE m.id=f.medico_id
+         AND LOWER(TRIM(COALESCE(m.email,'')))='anavaleriabrandao@hotmail.com'
+         AND f.mostrar_avaliacao_google IS DISTINCT FROM false
+    `);
     await pool.query(`CREATE TABLE IF NOT EXISTS escala_prioridade_medico (
       id SERIAL PRIMARY KEY,
       medico_id INTEGER NOT NULL REFERENCES medicos(id) ON DELETE CASCADE,
