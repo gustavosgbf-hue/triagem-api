@@ -889,6 +889,7 @@ async function initDB() {
       ['prioridade_medico_id','INTEGER'],
       ['prioridade_ate','TIMESTAMPTZ'],
       ['prioridade_geral_notificada_em','TIMESTAMPTZ'],
+      ['mostrar_avaliacao_google','BOOLEAN NOT NULL DEFAULT true'],
     ];
     // Coluna para controle de lembrete de agendamento
     await pool.query(`ALTER TABLE agendamentos ADD COLUMN IF NOT EXISTS lembrete_enviado BOOLEAN DEFAULT false`).catch(()=>{});
@@ -3643,8 +3644,8 @@ app.post("/api/chat/upload", rlUpload, upload.single("arquivo"), async (req, res
       if (!med) return res.status(401).json({ ok: false, error: "Token de medico obrigatorio" });
       if (!medicoPodeEscreverNoAtendimento(med, atendimento.rows[0])) return res.status(403).json({ ok: false, error: "Medico nao vinculado ao atendimento" });
       req.body.autorId = med.id;
-    } else if (!["assumido","encerrado"].includes(atendimento.rows[0].status)) {
-      return res.status(403).json({ ok: false, error: "Chat ainda nao liberado para este atendimento" });
+    } else if (atendimento.rows[0].status !== "assumido") {
+      return res.status(403).json({ ok: false, error: "Chat indisponivel para envio neste atendimento" });
     } else if (!origemPacientePermitida(req)) {
       return res.status(403).json({ ok: false, error: "Origem nao autorizada" });
     }
@@ -3681,8 +3682,8 @@ app.post("/api/chat/enviar", rlMensagem, async (req, res) => {
       if (!med) return res.status(401).json({ ok: false, error: "Token de medico obrigatorio" });
       if (!medicoPodeEscreverNoAtendimento(med, atendimento.rows[0])) return res.status(403).json({ ok: false, error: "Medico nao vinculado ao atendimento" });
       autorIdSeguro = med.id;
-    } else if (!["assumido","encerrado"].includes(atendimento.rows[0].status)) {
-      return res.status(403).json({ ok: false, error: "Chat ainda nao liberado para este atendimento" });
+    } else if (atendimento.rows[0].status !== "assumido") {
+      return res.status(403).json({ ok: false, error: "Chat indisponivel para envio neste atendimento" });
     } else if (!origemPacientePermitida(req)) {
       return res.status(403).json({ ok: false, error: "Origem nao autorizada" });
     }
@@ -3716,7 +3717,7 @@ app.get("/api/atendimento/status/:id", async (req, res) => {
               nome, tel, cpf, data_nascimento, idade, sexo, alergias, cronicas, medicacoes, queixa, email,
               pagamento_status, pagbank_order_id, efi_charge_id, categoria_atendimento,
               especialidade_solicitada, valor_cobrado_centavos, fallback_disponivel_em,
-              fallback_decisao, fallback_decidido_em, reembolso_status,
+              fallback_decisao, fallback_decidido_em, reembolso_status, mostrar_avaliacao_google,
               reembolso_valor_centavos, reembolso_processado_em,
               (fallback_disponivel_em IS NOT NULL AND NOW() >= fallback_disponivel_em) AS fallback_disponivel
          FROM fila_atendimentos WHERE id = $1`,
@@ -8439,13 +8440,32 @@ app.get("/api/aprovacao/cancelar", async (req, res) => {
 
 app.post("/api/atendimento/encerrar", async (req, res) => {
   try {
-    const { filaId, status, documentos_emitidos } = req.body || {};
+    const { filaId, status, documentos_emitidos, mostrar_avaliacao_google } = req.body || {};
     if (!filaId) return res.status(400).json({ ok: false, error: "filaId e obrigatorio" });
-    const result = await pool.query(
-      `UPDATE fila_atendimentos SET status='encerrado',encerrado_em=NOW(),status_atendimento=$2,documentos_emitidos=$3 WHERE id=$1 RETURNING *`,
-      [filaId,status||"Encerrado",documentos_emitidos||"Nenhum"]
+    const responsavel = await pool.query(
+      `SELECT LOWER(TRIM(COALESCE(m.email,''))) AS medico_email
+         FROM fila_atendimentos f
+         LEFT JOIN medicos m ON m.id=f.medico_id
+        WHERE f.id=$1`,
+      [filaId]
     );
-    if (result.rowCount===0) return res.status(404).json({ ok: false, error: "Atendimento nao encontrado" });
+    if (responsavel.rowCount === 0) {
+      return res.status(404).json({ ok: false, error: "Atendimento nao encontrado" });
+    }
+    const medicoEmail = responsavel.rows[0].medico_email;
+    let exibirAvaliacao = true;
+    if (medicoEmail === "anavaleriabrandao@hotmail.com") {
+      exibirAvaliacao = false;
+    } else if (medicoEmail === "gustavosgbf@gmail.com") {
+      exibirAvaliacao = mostrar_avaliacao_google === true;
+    }
+    const result = await pool.query(
+      `UPDATE fila_atendimentos
+          SET status='encerrado',encerrado_em=NOW(),status_atendimento=$2,
+              documentos_emitidos=$3,mostrar_avaliacao_google=$4
+        WHERE id=$1 RETURNING *`,
+      [filaId,status||"Encerrado",documentos_emitidos||"Nenhum",exibirAvaliacao]
+    );
     const at = result.rows[0];
     const agora = new Date().toLocaleString("pt-BR",{timeZone:"America/Fortaleza"});
     appendToSheet("Atendimentos",[agora,at.nome||"",at.tel||"",at.cpf||"","Encerrado",at.medico_nome||"",triagemParaPlanilha(at.triagem, at.queixa),at.tipo||"",at.documentos_emitidos||"",String(at.id)]).catch(e=>console.error("[Sheets]",e));
