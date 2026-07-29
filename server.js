@@ -889,7 +889,7 @@ async function initDB() {
       ['prioridade_medico_id','INTEGER'],
       ['prioridade_ate','TIMESTAMPTZ'],
       ['prioridade_geral_notificada_em','TIMESTAMPTZ'],
-      ['mostrar_avaliacao_google','BOOLEAN NOT NULL DEFAULT true'],
+      ['mostrar_avaliacao_google','BOOLEAN NOT NULL DEFAULT false'],
     ];
     // Coluna para controle de lembrete de agendamento
     await pool.query(`ALTER TABLE agendamentos ADD COLUMN IF NOT EXISTS lembrete_enviado BOOLEAN DEFAULT false`).catch(()=>{});
@@ -899,6 +899,10 @@ async function initDB() {
     for (const [col, tipo] of cols) {
       await pool.query(`ALTER TABLE fila_atendimentos ADD COLUMN IF NOT EXISTS ${col} ${tipo}`);
     }
+    await pool.query(`
+      ALTER TABLE fila_atendimentos
+      ALTER COLUMN mostrar_avaliacao_google SET DEFAULT false
+    `);
     await pool.query(`
       UPDATE fila_atendimentos f
          SET mostrar_avaliacao_google=false
