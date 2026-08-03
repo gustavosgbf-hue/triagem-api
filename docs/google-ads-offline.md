@@ -75,3 +75,32 @@ curl -X POST "https://triagem-api.onrender.com/api/admin/google-ads/offline/retr
   -H "Content-Type: application/json" \
   -d '{"limit":25,"force":true}'
 ```
+
+## Margem operacional no encerramento
+
+O pagamento continua enviando a conversao principal existente, sem mudanca. Ao encerrar uma consulta, o backend tambem pode enviar uma segunda conversao com o valor retido pela plataforma:
+
+- atendimento do admin ou renovacao: valor cobrado menos reembolso registrado;
+- atendimento de outro medico: 30% do valor cobrado menos reembolso registrado.
+
+Esse valor ainda nao desconta automaticamente a tarifa do meio de pagamento. O percentual de 30% pode ser alterado por `MARGEM_PLATAFORMA_MEDICO_PERCENTUAL`.
+
+Crie no Google Ads uma nova acao de importacao chamada, por exemplo, `Margem operacional - encerramento`. Ela precisa ficar como **secundaria**, fora de `Conversoes`, durante a coleta inicial, para nao duplicar a quantidade usada pelo CPA desejado.
+
+Depois configure no Render:
+
+```txt
+GOOGLE_ADS_MARGIN_CONVERSION_ACTION_ID=ID_DA_ACAO_SECUNDARIA
+MARGEM_PLATAFORMA_MEDICO_PERCENTUAL=0.30
+```
+
+Sem `GOOGLE_ADS_MARGIN_CONVERSION_ACTION_ID`, o backend apenas registra a margem calculada como `unconfigured`; a conversao principal segue funcionando normalmente.
+
+Depois de configurar a acao, os encerramentos anteriores podem ser reenviados de forma idempotente:
+
+```bash
+curl -X POST "https://triagem-api.onrender.com/api/admin/google-ads/margem/retry" \
+  -H "Authorization: Bearer TOKEN_DO_ADMIN" \
+  -H "Content-Type: application/json" \
+  -d '{"limit":100}'
+```

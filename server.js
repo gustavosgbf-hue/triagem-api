@@ -62,13 +62,9 @@ const RESEND_DEFAULT_FROM = process.env.RESEND_DEFAULT_FROM || "ConsultaJá24h <
 const RESEND_FILA_FROM = process.env.RESEND_FILA_FROM || "ConsultaJá24h Fila <fila@consultaja24h.com.br>";
 const ADMIN_MEDICO_EMAIL = "gustavosgbf@gmail.com";
 const MARIANA_PRIORIDADE_EMAIL = "marianamartinsc1@gmail.com";
-const ANA_VALERIA_PRIORIDADE_EMAIL = "anavaleriabrandao@hotmail.com";
-const EMAILS_GRUPO_PRIORIDADE_INICIAL = new Set([
-  ADMIN_MEDICO_EMAIL,
-  MARIANA_PRIORIDADE_EMAIL,
-  ANA_VALERIA_PRIORIDADE_EMAIL,
-]);
 const PRIORIDADE_FILA_MINUTOS = 5;
+const PRIORIDADE_ADMIN_HORA_INICIO = 15;
+const PRIORIDADE_ADMIN_HORA_FIM = 21;
 
 async function enviarResendComFallback({ apiKey, from, fallbackFrom = RESEND_DEFAULT_FROM, to, subject, html, text, headers, replyTo, tag }) {
   const payload = { from, to, subject, html };
@@ -255,6 +251,22 @@ function googleAdsOfflineConfig() {
   };
 }
 
+function googleAdsMarginConfig() {
+  const base = googleAdsOfflineConfig();
+  const conversionCustomerId = normalizarGoogleAdsCustomerId(
+    process.env.GOOGLE_ADS_CONVERSION_CUSTOMER_ID || base.customerId
+  );
+  const conversionActionResource = limitarTexto(process.env.GOOGLE_ADS_MARGIN_CONVERSION_ACTION_RESOURCE, 180);
+  const conversionActionId = limitarTexto(process.env.GOOGLE_ADS_MARGIN_CONVERSION_ACTION_ID, 80);
+  const actionResource = conversionActionResource ||
+    (conversionActionId && conversionCustomerId
+      ? `customers/${conversionCustomerId}/conversionActions/${conversionActionId}`
+      : "");
+  const missing = base.missing.filter(item => item !== "GOOGLE_ADS_CONVERSION_ACTION_ID");
+  if (!actionResource) missing.push("GOOGLE_ADS_MARGIN_CONVERSION_ACTION_ID");
+  return { ...base, configured: missing.length === 0, missing, actionResource };
+}
+
 let googleAdsTokenCache = { token: "", expiresAt: 0 };
 
 async function obterGoogleAdsAccessToken() {
@@ -351,6 +363,127 @@ async function marcarGoogleAdsOffline(atendimentoId, status, detalhes = {}) {
       limitarTexto(detalhes.orderId, 120)
     ]
   ).catch(e => console.warn("[GOOGLE-ADS-OFFLINE] Falha ao marcar status:", e.message));
+}
+
+async function marcarGoogleAdsMargem(atendimentoId, status, detalhes = {}) {
+  const id = parseInt(atendimentoId, 10);
+  if (!id) return;
+  await pool.query(
+    `UPDATE fila_atendimentos
+        SET google_ads_margem_status = $2,
+            google_ads_margem_tentativas = COALESCE(google_ads_margem_tentativas, 0) + 1,
+            google_ads_margem_job_id = COALESCE(NULLIF($3,''), google_ads_margem_job_id),
+            google_ads_margem_erro = $4,
+            google_ads_margem_order_id = COALESCE(NULLIF($5,''), google_ads_margem_order_id),
+            google_ads_margem_valor_centavos = COALESCE($6, google_ads_margem_valor_centavos),
+            google_ads_margem_enviado_em = CASE WHEN $2 IN ('sent','validated') THEN NOW() ELSE google_ads_margem_enviado_em END
+      WHERE id = $1`,
+    [
+      id,
+      limitarTexto(status, 40),
+      limitarTexto(detalhes.jobId, 120),
+      limitarTexto(detalhes.error, 900),
+      limitarTexto(detalhes.orderId, 120),
+      Number.isInteger(detalhes.valorCentavos) ? detalhes.valorCentavos : null
+    ]
+  ).catch(e => console.warn("[GOOGLE-ADS-MARGEM] Falha ao marcar status:", e.message));
+}
+
+function calcularMargemOperacionalCentavos(at, medicoEmail) {
+  const brutoInformado = Number(at?.valor_cobrado_centavos);
+  const reembolsoInformado = Number(at?.reembolso_valor_centavos);
+  const bruto = Math.max(0, Number.isFinite(brutoInformado) ? brutoInformado : 4990);
+  const reembolsado = Math.max(0, Number.isFinite(reembolsoInformado) ? reembolsoInformado : 0);
+  const liquidoAntesTaxas = Math.max(0, bruto - reembolsado);
+  const email = String(medicoEmail || "").trim().toLowerCase();
+  const atendimentoDoAdmin = email === ADMIN_MEDICO_EMAIL || String(at?.tipo || "").startsWith("renovacao_");
+  const percentualConfigurado = Number(process.env.MARGEM_PLATAFORMA_MEDICO_PERCENTUAL);
+  const percentualPlataforma = Math.min(1, Math.max(0,
+    Number.isFinite(percentualConfigurado) ? percentualConfigurado : 0.30
+  ));
+  return atendimentoDoAdmin
+    ? Math.round(liquidoAntesTaxas)
+    : Math.round(liquidoAntesTaxas * percentualPlataforma);
+}
+
+async function enviarConversaoMargemGoogleAds(at, medicoEmail, opts = {}) {
+  if (!at?.id) return { ok: false, skipped: "sem_atendimento" };
+  if (at.google_ads_margem_enviado_em && !opts.force) return { ok: true, skipped: "ja_enviado" };
+
+  const valorCentavos = calcularMargemOperacionalCentavos(at, medicoEmail);
+  if (valorCentavos <= 0) return { ok: false, skipped: "sem_margem" };
+  const cfg = googleAdsMarginConfig();
+  if (!cfg.configured) {
+    await marcarGoogleAdsMargem(at.id, "unconfigured", {
+      error: cfg.missing.join(","),
+      valorCentavos
+    });
+    return { ok: false, skipped: "unconfigured", missing: cfg.missing };
+  }
+
+  const click = selecionarGoogleAdsClickIds(at);
+  const userIdentifiers = cfg.sendUserData ? montarGoogleAdsUserIdentifiers(at) : [];
+  if (!click.field && userIdentifiers.length === 0) {
+    await marcarGoogleAdsMargem(at.id, "no_match_data", {
+      error: "sem_gclid_gbraid_wbraid",
+      valorCentavos
+    });
+    return { ok: false, skipped: "no_match_data" };
+  }
+
+  const orderId = limitarTexto(`CJ24H-MARGEM-${at.id}`, 64);
+  const conversion = {
+    ...click.payload,
+    conversionAction: cfg.actionResource,
+    conversionDateTime: formatarGoogleAdsDateTime(at.encerrado_em || new Date()),
+    conversionValue: valorCentavos / 100,
+    currencyCode: cfg.currency,
+    orderId,
+    conversionEnvironment: "WEB"
+  };
+  if (userIdentifiers.length) conversion.userIdentifiers = userIdentifiers;
+
+  const token = await obterGoogleAdsAccessToken();
+  const headers = {
+    Authorization: `Bearer ${token}`,
+    "developer-token": process.env.GOOGLE_ADS_DEVELOPER_TOKEN,
+    "Content-Type": "application/json"
+  };
+  if (cfg.loginCustomerId) headers["login-customer-id"] = cfg.loginCustomerId;
+  const endpoint = `https://googleads.googleapis.com/${cfg.apiVersion}/customers/${cfg.customerId}:uploadClickConversions`;
+  const res = await fetch(endpoint, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ conversions: [conversion], partialFailure: true, validateOnly: cfg.validateOnly })
+  });
+  const text = await res.text();
+  let data = {};
+  try { data = text ? JSON.parse(text) : {}; } catch (_) { data = { raw: text }; }
+  const partialError = data.partialFailureError || data.partial_failure_error;
+  if (!res.ok || partialError) {
+    const msg = partialError?.message || data.error?.message || text || `HTTP ${res.status}`;
+    await marcarGoogleAdsMargem(at.id, "failed", {
+      error: msg,
+      orderId,
+      jobId: data.jobId,
+      valorCentavos
+    });
+    return { ok: false, error: msg };
+  }
+
+  const status = cfg.validateOnly ? "validated" : "sent";
+  await marcarGoogleAdsMargem(at.id, status, {
+    jobId: data.jobId,
+    orderId,
+    error: "",
+    valorCentavos
+  });
+  console.log("GOOGLE_ADS_MARGIN_UPLOAD_OK", {
+    consultaId: String(at.id),
+    status,
+    valorCentavos
+  });
+  return { ok: true, status, valorCentavos };
 }
 
 async function enviarConversaoOfflineGoogleAds(at, metodo, origem, externalId, opts = {}) {
@@ -876,6 +1009,13 @@ async function initDB() {
       ['google_ads_offline_job_id','TEXT'],
       ['google_ads_offline_erro','TEXT'],
       ['google_ads_offline_order_id','TEXT'],
+      ['google_ads_margem_status','TEXT'],
+      ['google_ads_margem_enviado_em','TIMESTAMPTZ'],
+      ['google_ads_margem_tentativas','INTEGER DEFAULT 0'],
+      ['google_ads_margem_job_id','TEXT'],
+      ['google_ads_margem_erro','TEXT'],
+      ['google_ads_margem_order_id','TEXT'],
+      ['google_ads_margem_valor_centavos','INTEGER'],
       ['categoria_atendimento','TEXT NOT NULL DEFAULT \'clinico\''],
       ['especialidade_solicitada','TEXT'],
       ['valor_cobrado_centavos','INTEGER NOT NULL DEFAULT 4990'],
@@ -927,15 +1067,23 @@ async function initDB() {
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_fila_prioridade_ate
       ON fila_atendimentos(prioridade_ate)
       WHERE status='aguardando' AND prioridade_geral_notificada_em IS NULL`).catch(()=>{});
-    await pool.query(`UPDATE fila_atendimentos
-      SET prioridade_medico_id=NULL,
-          prioridade_ate=NULL,
-          prioridade_geral_notificada_em=NULL
-      WHERE prioridade_medico_id IS NOT NULL
-         OR prioridade_ate IS NOT NULL
-         OR prioridade_geral_notificada_em IS NOT NULL`).then(r => {
-      if (r.rowCount) console.log(`[DB] Prioridades antigas removidas: ${r.rowCount}`);
-    }).catch(e => console.warn("[DB] Falha ao remover prioridades antigas:", e.message));
+    await pool.query(
+      `UPDATE fila_atendimentos f
+          SET prioridade_medico_id=NULL,
+              prioridade_ate=NULL,
+              prioridade_geral_notificada_em=NULL
+        WHERE f.status='aguardando'
+          AND f.prioridade_medico_id IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1
+              FROM medicos m
+             WHERE m.id=f.prioridade_medico_id
+               AND LOWER(TRIM(m.email))=$1
+          )`,
+      [ADMIN_MEDICO_EMAIL]
+    ).then(r => {
+      if (r.rowCount) console.log(`[DB] Reservas antigas fora da regra atual removidas: ${r.rowCount}`);
+    }).catch(e => console.warn("[DB] Falha ao limpar reservas antigas:", e.message));
     await pool.query(
       `UPDATE fila_atendimentos
           SET triagem = BTRIM(SPLIT_PART(triagem, 'DADOS ORGANIZADOS PELA TRIAGEM', 2))
@@ -1474,6 +1622,50 @@ app.post("/api/admin/google-ads/offline/retry", checkAdmin, async (req, res) => 
     res.json({ ok: true, total: resultados.length, resultados });
   } catch (e) {
     res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+app.post("/api/admin/google-ads/margem/retry", checkAdmin, async (req, res) => {
+  const limit = Math.min(100, Math.max(1, parseInt(req.body?.limit || req.query.limit || "25", 10) || 25));
+  const force = /^(1|true|yes|sim)$/i.test(String(req.body?.force || req.query.force || ""));
+  const cfg = googleAdsMarginConfig();
+  if (!cfg.configured) {
+    return res.status(400).json({ ok: false, error: "google_ads_margem_nao_configurado", missing: cfg.missing });
+  }
+  try {
+    const { rows } = await pool.query(
+      `SELECT f.*, LOWER(TRIM(COALESCE(m.email,''))) AS medico_email
+         FROM fila_atendimentos f
+         LEFT JOIN medicos m ON m.id=f.medico_id
+        WHERE f.status='encerrado'
+          AND f.encerrado_em IS NOT NULL
+          AND ($1::boolean OR f.google_ads_margem_enviado_em IS NULL)
+          AND (
+            COALESCE(f.ads_gclid,'') <> ''
+            OR COALESCE(f.ads_gbraid,'') <> ''
+            OR COALESCE(f.ads_wbraid,'') <> ''
+            OR $2::boolean
+          )
+        ORDER BY f.encerrado_em DESC
+        LIMIT $3`,
+      [force, cfg.sendUserData, limit]
+    );
+    const resultados = [];
+    for (const at of rows) {
+      const r = await enviarConversaoMargemGoogleAds(at, at.medico_email, { force })
+        .catch(e => ({ ok: false, error: e.message }));
+      resultados.push({
+        id: at.id,
+        ok: !!r.ok,
+        status: r.status || "",
+        skipped: r.skipped || "",
+        valorCentavos: r.valorCentavos || calcularMargemOperacionalCentavos(at, at.medico_email),
+        error: r.error || ""
+      });
+    }
+    return res.json({ ok: true, total: resultados.length, resultados });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
   }
 });
 
@@ -2389,6 +2581,11 @@ async function reenviarEmailsFilaAtual({ limit = 10 } = {}) {
       WHERE status = 'aguardando'
         AND pagamento_status = 'confirmado'
         AND tipo IN ('chat','video')
+        AND (
+          prioridade_medico_id IS NULL
+          OR prioridade_ate <= NOW()
+          OR prioridade_geral_notificada_em IS NOT NULL
+        )
       ORDER BY criado_em ASC
       LIMIT $1`,
     [limite]
@@ -2917,25 +3114,35 @@ function normalizarEmail(email) {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(e) ? e : null;
 }
 
-function atendimentoAceitaPrioridadeSemanal(at) {
+function atendimentoAceitaPrioridadeAdmin(at) {
   return ["chat", "video"].includes(String(at?.tipo || "").toLowerCase())
     && String(at?.categoria_atendimento || "clinico") !== "especialista_imediato"
-    && !at?.especialidade_solicitada;
+    && !at?.especialidade_solicitada
+    && !at?.horario_agendado;
 }
 
-function emailPertenceGrupoPrioridadeInicial(email) {
-  return EMAILS_GRUPO_PRIORIDADE_INICIAL.has(String(email || "").trim().toLowerCase());
+function estaNaJanelaPrioridadeAdmin(agora = new Date()) {
+  const partes = new Intl.DateTimeFormat("en-US", {
+    timeZone: "America/Fortaleza",
+    hour: "2-digit",
+    hour12: false
+  }).formatToParts(agora);
+  const hora = Number(partes.find(parte => parte.type === "hour")?.value);
+  return Number.isInteger(hora)
+    && hora >= PRIORIDADE_ADMIN_HORA_INICIO
+    && hora < PRIORIDADE_ADMIN_HORA_FIM;
 }
 
-async function obterMedicosGrupoPrioridadeInicial() {
+async function obterMedicoAdminParaPrioridade() {
   const { rows } = await pool.query(
     `SELECT id,nome,nome_exibicao,email
        FROM medicos
-      WHERE LOWER(TRIM(email)) = ANY($1::text[])
-        AND ativo=true AND status='aprovado'`,
-    [[MARIANA_PRIORIDADE_EMAIL, ANA_VALERIA_PRIORIDADE_EMAIL]]
+      WHERE LOWER(TRIM(email))=$1
+        AND ativo=true AND status='aprovado'
+      LIMIT 1`,
+    [ADMIN_MEDICO_EMAIL]
   );
-  return rows;
+  return rows[0] || null;
 }
 
 async function obterMarianaEmTurnoAgora() {
@@ -2955,47 +3162,48 @@ async function obterMarianaEmTurnoAgora() {
   return rows[0] || null;
 }
 
-async function notificarEquipeAposAssuncaoPrioritaria(atendimentoId) {
+async function aplicarPrioridadeAdminSeElegivel(atendimentoId) {
+  if (!estaNaJanelaPrioridadeAdmin()) return null;
+  const admin = await obterMedicoAdminParaPrioridade();
+  if (!admin) return null;
   const { rows } = await pool.query(
-    `SELECT id,nome,tel,tipo,triagem,queixa,especialidade_solicitada,fallback_decisao
-       FROM fila_atendimentos
-      WHERE id=$1 AND status='assumido'
+    `UPDATE fila_atendimentos
+        SET prioridade_medico_id=$2,
+            prioridade_ate=NOW() + ($3::text || ' minutes')::interval,
+            prioridade_geral_notificada_em=NULL
+      WHERE id=$1
+        AND status='aguardando'
+        AND pagamento_status IN ('confirmado','isento_admin')
+        AND prioridade_medico_id IS NULL
+        AND tipo IN ('chat','video')
+        AND COALESCE(categoria_atendimento,'clinico') <> 'especialista_imediato'
+        AND especialidade_solicitada IS NULL
+        AND horario_agendado IS NULL
+      RETURNING *`,
+    [atendimentoId, admin.id, PRIORIDADE_FILA_MINUTOS]
+  );
+  if (rows[0] && atendimentoAceitaPrioridadeAdmin(rows[0])) {
+    console.log(`[DISTRIBUICAO] Atendimento #${atendimentoId} reservado na janela operacional.`);
+    return { atendimento: rows[0], admin };
+  }
+  const existente = await pool.query(
+    `SELECT * FROM fila_atendimentos
+      WHERE id=$1
+        AND status='aguardando'
+        AND prioridade_medico_id=$2
+        AND prioridade_ate > NOW()
+        AND prioridade_geral_notificada_em IS NULL
       LIMIT 1`,
-    [atendimentoId]
+    [atendimentoId, admin.id]
   );
-  const at = rows[0];
-  if (!at) return;
-
-  const medicosResult = await pool.query(
-    `SELECT id,nome,email FROM medicos WHERE ativo=true AND status='aprovado'`
-  );
-  const destinatarios = filtrarMedicosAtivos(medicosResult.rows)
-    .map(med => String(med.email || "").trim().toLowerCase())
-    .filter(email => email && !emailPertenceGrupoPrioridadeInicial(email));
-  if (!destinatarios.length) return;
-
-  const nomeFila = normalizarNomePaciente(at.nome) || "Nome não informado";
-  const SITE_URL = process.env.SITE_URL || "https://consultaja24h.com.br";
-  await enviarEmailMedicos({
-    nome: nomeFila,
-    tel: at.tel,
-    tipo: at.tipo,
-    triagem: at.triagem || at.queixa,
-    linkRetorno: `${SITE_URL}/triagem.html?consulta=${at.id}`,
-    atendimentoId: at.id,
-    horarioAgendado: null,
-    horarioAgendadoRaw: null,
-    especialidadeSolicitada: at.especialidade_solicitada,
-    fallbackClinico: at.fallback_decisao === "clinico",
-    destinatariosPermitidos: destinatarios,
-    subject: `PACIENTE NOVO NA FILA - ${nomeFila}`
-  });
-  console.log(`[PRIORIDADE] Fluxo do atendimento #${at.id} comunicado à equipe após assunção.`);
+  return existente.rows[0] ? { atendimento: existente.rows[0], admin } : null;
 }
 
 // Notificacao centralizada: unica fonte de verdade para envio de email aos medicos
 async function notificarMedicos(at) {
   at = await garantirNomePacienteParaFila(at);
+  const prioridade = await aplicarPrioridadeAdminSeElegivel(at.id);
+  if (prioridade?.atendimento) at = prioridade.atendimento;
   const nomeFila = normalizarNomePaciente(at.nome) || "Nome não informado";
   const SITE_URL = process.env.SITE_URL || "https://consultaja24h.com.br";
   const linkRetorno = SITE_URL + "/triagem.html?consulta=" + at.id;
@@ -3013,7 +3221,7 @@ async function notificarMedicos(at) {
     horarioAgendado: null, horarioAgendadoRaw: null,
     especialidadeSolicitada: at.especialidade_solicitada,
     fallbackClinico: at.fallback_decisao === "clinico",
-    destinatariosPermitidos: null,
+    destinatariosPermitidos: prioridade ? [ADMIN_MEDICO_EMAIL] : null,
     subject: at.especialidade_solicitada
       ? `${nomeEspecialidadeImediata(at.especialidade_solicitada).toUpperCase()} - PACIENTE NOVO NA FILA - ${nomeFila}`
       : "PACIENTE NOVO NA FILA - " + nomeFila
@@ -3046,7 +3254,7 @@ async function liberarPrioridadesVencidas() {
   );
   const destinatariosEquipe = filtrarMedicosAtivos(medicosResult.rows)
     .map(med => String(med.email || "").trim().toLowerCase())
-    .filter(email => email && !emailPertenceGrupoPrioridadeInicial(email));
+    .filter(email => email && email !== ADMIN_MEDICO_EMAIL);
   if (!destinatariosEquipe.length) return;
 
   for (const at of rows) {
@@ -3067,6 +3275,10 @@ async function liberarPrioridadesVencidas() {
   }
 }
 
+setInterval(() => {
+  liberarPrioridadesVencidas().catch(e => console.error("[DISTRIBUICAO] Erro ao liberar reservas:", e.message));
+}, 30 * 1000);
+
 // ── Helper: libera atendimento para médicos (timer + endpoint de aprovação) ───
 async function liberarAtendimentoParaMedicos(atendimentoId) {
   const r = await pool.query(
@@ -3078,18 +3290,7 @@ async function liberarAtendimentoParaMedicos(atendimentoId) {
     console.log(`[APROVACAO] #${atendimentoId} já foi liberado ou cancelado — ignorando.`);
     return;
   }
-  const at = await garantirNomePacienteParaFila(r.rows[0]);
-  const nomeFila = normalizarNomePaciente(at.nome) || "Nome não informado";
-  const SITE_URL = process.env.SITE_URL || "https://consultaja24h.com.br";
-  const linkRetorno = `${SITE_URL}/triagem.html?consulta=${at.id}`;
-  const tipoLabel = at.tipo === "video" ? "Video" : "Chat";
-  const agora = new Date().toLocaleString("pt-BR", { timeZone: "America/Fortaleza" });
-  appendToSheet("Atendimentos",[agora,nomeFila,at.tel||"",at.cpf||"","Aguardando","",triagemParaPlanilha(at.triagem, at.queixa),at.tipo||"","",String(at.id)]).catch(()=>{});
-  await enviarEmailMedicos({
-    nome: nomeFila, tel: at.tel, tipo: at.tipo, triagem: at.triagem, linkRetorno,
-    atendimentoId: at.id, horarioAgendado: null, horarioAgendadoRaw: null,
-    subject: `PACIENTE NOVO NA FILA - ${nomeFila} (${tipoLabel})`
-  });
+  await notificarMedicos(r.rows[0]);
   console.log(`[LIBERADO] Atendimento #${atendimentoId} liberado para médicos.`);
 }
 
@@ -4142,6 +4343,12 @@ app.get("/api/atendimento/assumir-email", async (req, res) => {
       if (!medicoAtendeEspecialidade(medicoReserva, reserva.rows[0].especialidade_solicitada)) {
         return res.status(403).send(`<html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#060d0b;color:#fff"><h2 style="color:#ffbd2e">Atendimento reservado</h2><p>Este atendimento ainda está reservado ao especialista escolhido pelo paciente.</p><a href="${PAINEL_URL}" style="color:#b4e05a">Ir para o painel</a></body></html>`);
       }
+    }
+    const reservaAtiva = reserva.rows[0]?.prioridade_medico_id
+      && reserva.rows[0]?.prioridade_ate
+      && new Date(reserva.rows[0].prioridade_ate).getTime() > Date.now();
+    if (reservaAtiva && Number(reserva.rows[0].prioridade_medico_id) !== Number(medicoId)) {
+      return res.status(409).send(`<html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#060d0b;color:#fff"><h2 style="color:#ffbd2e">Atendimento indisponível</h2><p>Este atendimento não está disponível no momento.</p><a href="${PAINEL_URL}" style="color:#b4e05a">Ir para o painel</a></body></html>`);
     }
     // Tenta assumir com trava — só um médico consegue
     const result = await pool.query(
@@ -8080,6 +8287,12 @@ app.get("/api/fila", checkMedico, async (req, res) => {
                   AND LOWER(TRIM(COALESCE(triagem,''))) NOT LIKE '(aguardando triagem%'
                   AND (horario_agendado IS NULL OR horario_agendado <= NOW() + INTERVAL '15 minutes')
                   AND (
+                    prioridade_medico_id IS NULL
+                    OR prioridade_medico_id=$3
+                    OR medico_id=$3
+                    OR (status='aguardando' AND prioridade_ate <= NOW())
+                  )
+                  AND (
                     COALESCE(categoria_atendimento,'clinico') <> 'especialista_imediato'
                     OR fallback_decisao='clinico'
                     OR (
@@ -8098,20 +8311,31 @@ app.get("/api/fila", checkMedico, async (req, res) => {
       params = [
         especialidadeMedico,
         Object.keys(ESPECIALIDADES_IMEDIATAS),
+        req.medico.id,
       ];
     }
     const result = await pool.query(query, params || []);
     const fila = [];
     for (const row of result.rows) {
       try {
-        if (row.status === "aguardando") fila.push(await garantirNomePacienteParaFila(row));
-        else {
+        if (row.status === "aguardando") {
+          const atendimentoVisivel = await garantirNomePacienteParaFila(row);
+          if (!isAdmin) {
+            delete atendimentoVisivel.prioridade_medico_id;
+            delete atendimentoVisivel.prioridade_ate;
+          }
+          fila.push(atendimentoVisivel);
+        } else {
           const atendimentoVisivel = { ...row, nome: normalizarNomePaciente(row.nome) || "Nome não informado" };
           if (!isAdmin
               && row.status === "assumido"
               && Number(row.medico_id) !== Number(req.medico.id)) {
             atendimentoVisivel.medico_id = null;
             atendimentoVisivel.medico_nome = null;
+          }
+          if (!isAdmin) {
+            delete atendimentoVisivel.prioridade_medico_id;
+            delete atendimentoVisivel.prioridade_ate;
           }
           fila.push(atendimentoVisivel);
         }
@@ -8319,6 +8543,12 @@ app.post("/api/atendimento/assumir", checkMedico, async (req, res) => {
     ) {
       return res.status(403).json({ ok: false, error: "Atendimento reservado ao especialista selecionado" });
     }
+    const reservaAtiva = atendimento.prioridade_medico_id
+      && atendimento.prioridade_ate
+      && new Date(atendimento.prioridade_ate).getTime() > Date.now();
+    if (reservaAtiva && Number(atendimento.prioridade_medico_id) !== Number(medico.id)) {
+      return res.status(409).json({ ok: false, error: "Atendimento indisponível no momento" });
+    }
     const medicoNome = medico.nome_exibicao || medico.nome;
     const result = await pool.query(
       `UPDATE fila_atendimentos SET status='assumido',medico_id=$1,medico_nome=$2,assumido_em=NOW() WHERE id=$3 AND status='aguardando' RETURNING *`,
@@ -8479,8 +8709,12 @@ app.post("/api/atendimento/encerrar", async (req, res) => {
       [filaId,status||"Encerrado",documentos_emitidos||"Nenhum",exibirAvaliacao]
     );
     const at = result.rows[0];
+    if (!at) return res.status(404).json({ ok: false, error: "Atendimento nao encontrado" });
     const agora = new Date().toLocaleString("pt-BR",{timeZone:"America/Fortaleza"});
     appendToSheet("Atendimentos",[agora,at.nome||"",at.tel||"",at.cpf||"","Encerrado",at.medico_nome||"",triagemParaPlanilha(at.triagem, at.queixa),at.tipo||"",at.documentos_emitidos||"",String(at.id)]).catch(e=>console.error("[Sheets]",e));
+    await enviarConversaoMargemGoogleAds(at, medicoEmail).catch(e => {
+      console.warn("[GOOGLE-ADS-MARGEM] Erro inesperado:", e.message);
+    });
     return res.json({ ok: true, atendimento: at });
   } catch (err) { console.error("Erro em /api/atendimento/encerrar:", err); return res.status(500).json({ ok: false, error: "Erro ao encerrar atendimento" }); }
 });
