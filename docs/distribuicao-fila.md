@@ -9,7 +9,7 @@ Durante a reserva:
 - os demais medicos nao recebem selo ou indicacao de prioridade;
 - tentativas de assumir pelo painel ou por link antigo sao recusadas de forma atomica.
 
-Se o admin assumir durante a reserva, a equipe recebe entao o e-mail normal de paciente novo. O botao continua no e-mail, mas ao clicar informa que o atendimento ja foi assumido, sem identificar quem assumiu.
+Se o admin assumir durante a reserva, a equipe recebe entao o e-mail normal de paciente novo. O atendimento aparece no painel como ja assumido, sem identificar quem assumiu. O botao continua no e-mail, mas ao clicar tambem informa que o atendimento ja foi assumido.
 
 Se o atendimento continuar aguardando ao fim dos 5 minutos, ele passa a aparecer normalmente e o e-mail acionavel e enviado a equipe.
 

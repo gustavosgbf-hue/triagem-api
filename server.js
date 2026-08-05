@@ -8347,6 +8347,7 @@ app.get("/api/fila", checkMedico, async (req, res) => {
                     OR prioridade_medico_id=$3
                     OR medico_id=$3
                     OR (status='aguardando' AND prioridade_ate <= NOW())
+                    OR (status='assumido' AND prioridade_geral_notificada_em IS NOT NULL)
                   )
                   AND (
                     COALESCE(categoria_atendimento,'clinico') <> 'especialista_imediato'
