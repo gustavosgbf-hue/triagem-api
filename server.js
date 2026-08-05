@@ -3214,6 +3214,12 @@ async function notificarMedicos(at) {
     "Aguardando", "", triagemParaPlanilha(at.triagem, at.queixa), at.tipo||"", "", String(at.id)
   ]).catch(() => {});
 
+  // Durante a reserva do admin, o aviso geral só sai depois que ele assumir.
+  if (prioridade?.atendimento) {
+    console.log(`[NOTIFICACAO] Atendimento #${at.id} reservado sem aviso antecipado à equipe.`);
+    return;
+  }
+
   await enviarEmailMedicos({
     nome: nomeFila, tel: at.tel, tipo: at.tipo,
     triagem: at.triagem, linkRetorno,
@@ -3226,18 +3232,54 @@ async function notificarMedicos(at) {
       : "PACIENTE NOVO NA FILA - " + nomeFila
   });
 
-  if (prioridade?.atendimento) {
-    await pool.query(
-      `UPDATE fila_atendimentos
-          SET prioridade_geral_notificada_em=NOW()
-        WHERE id=$1
-          AND prioridade_medico_id=$2
-          AND prioridade_geral_notificada_em IS NULL`,
-      [at.id, prioridade.admin.id]
-    );
-  }
-
   console.log(`[NOTIFICACAO] Atendimento #${at.id} notificado para a equipe.`);
+}
+
+async function notificarMovimentoPrioridadesAssumidas() {
+  const admin = await obterMedicoAdminParaPrioridade();
+  if (!admin) return;
+  const { rows } = await pool.query(
+    `UPDATE fila_atendimentos
+        SET prioridade_geral_notificada_em=NOW()
+      WHERE id IN (
+        SELECT id FROM fila_atendimentos
+         WHERE status IN ('assumido','encerrado')
+           AND medico_id=$1
+           AND prioridade_medico_id=$1
+           AND assumido_em >= NOW() - INTERVAL '24 hours'
+           AND prioridade_geral_notificada_em IS NULL
+         ORDER BY assumido_em
+         FOR UPDATE SKIP LOCKED
+         LIMIT 20
+      )
+      RETURNING id,nome,tel,tipo,triagem,especialidade_solicitada,fallback_decisao`,
+    [admin.id]
+  );
+  if (!rows.length) return;
+
+  const medicosResult = await pool.query(
+    `SELECT email FROM medicos WHERE ativo=true AND status='aprovado'`
+  );
+  const destinatariosEquipe = filtrarMedicosAtivos(medicosResult.rows)
+    .map(med => String(med.email || "").trim().toLowerCase())
+    .filter(email => email && email !== ADMIN_MEDICO_EMAIL);
+  if (!destinatariosEquipe.length) return;
+
+  for (const at of rows) {
+    await enviarEmailMedicos({
+      nome: normalizarNomePaciente(at.nome) || "Nome não informado",
+      tel: at.tel,
+      tipo: at.tipo,
+      triagem: at.triagem,
+      linkRetorno: `${process.env.SITE_URL || "https://consultaja24h.com.br"}/triagem.html?consulta=${at.id}`,
+      atendimentoId: at.id,
+      subject: `PACIENTE NOVO NA FILA - ${normalizarNomePaciente(at.nome) || "Nome não informado"}`,
+      especialidadeSolicitada: at.especialidade_solicitada,
+      fallbackClinico: at.fallback_decisao === "clinico",
+      destinatariosPermitidos: destinatariosEquipe,
+    });
+    console.log(`[DISTRIBUICAO] Movimento do atendimento #${at.id} avisado à equipe.`);
+  }
 }
 
 async function liberarPrioridadesVencidas() {
@@ -3287,6 +3329,10 @@ async function liberarPrioridadesVencidas() {
 
 setInterval(() => {
   liberarPrioridadesVencidas().catch(e => console.error("[DISTRIBUICAO] Erro ao liberar reservas:", e.message));
+}, 30 * 1000);
+
+setInterval(() => {
+  notificarMovimentoPrioridadesAssumidas().catch(e => console.error("[DISTRIBUICAO] Erro ao avisar movimento:", e.message));
 }, 30 * 1000);
 
 // ── Helper: libera atendimento para médicos (timer + endpoint de aprovação) ───
@@ -8586,6 +8632,9 @@ app.post("/api/atendimento/assumir", checkMedico, async (req, res) => {
 
     const agora2 = new Date().toLocaleString("pt-BR",{timeZone:"America/Fortaleza"});
     appendToSheet("Atendimentos",[agora2,at2.nome||"",at2.tel||"",at2.cpf||"","Assumido",medicoNome||"",triagemParaPlanilha(at2.triagem, at2.queixa),at2.tipo||"","",String(filaId)]).catch(e=>console.error("[Sheets]",e));
+    if (isAdmin && Number(at2.prioridade_medico_id) === Number(medico.id)) {
+      notificarMovimentoPrioridadesAssumidas().catch(e => console.error("[DISTRIBUICAO] Erro ao avisar movimento:", e.message));
+    }
     return res.json({ ok: true, atendimento: at2 });
   } catch (err) { return res.status(500).json({ ok: false, error: "Erro ao assumir atendimento" }); }
 });

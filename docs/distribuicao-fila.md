@@ -5,10 +5,12 @@ Entre 15:00 e 21:00 no fuso `America/Fortaleza`, consultas clinicas imediatas po
 Durante a reserva:
 
 - somente o admin ve o atendimento disponivel na fila;
-- toda a equipe recebe o e-mail normal para acompanhar o movimento da plataforma;
+- nenhum e-mail e enviado a equipe antes de o admin decidir se vai assumir;
 - os demais medicos nao recebem selo ou indicacao de prioridade;
 - tentativas de assumir pelo painel ou por link antigo sao recusadas de forma atomica.
 
-Se o atendimento continuar aguardando ao fim dos 5 minutos, ele passa a aparecer normalmente para a equipe sem um segundo disparo de e-mail. Se o admin o assumir durante a reserva, o caso nao aparece posteriormente como ja assumido na fila dos demais.
+Se o admin assumir durante a reserva, a equipe recebe entao o e-mail normal de paciente novo. O botao continua no e-mail, mas ao clicar informa que o atendimento ja foi assumido, sem identificar quem assumiu.
+
+Se o atendimento continuar aguardando ao fim dos 5 minutos, ele passa a aparecer normalmente e o e-mail acionavel e enviado a equipe.
 
 Agendamentos, renovacoes e atendimentos de especialista imediato nao usam essa reserva.
