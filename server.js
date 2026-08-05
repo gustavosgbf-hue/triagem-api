@@ -3221,11 +3221,21 @@ async function notificarMedicos(at) {
     horarioAgendado: null, horarioAgendadoRaw: null,
     especialidadeSolicitada: at.especialidade_solicitada,
     fallbackClinico: at.fallback_decisao === "clinico",
-    destinatariosPermitidos: prioridade ? [ADMIN_MEDICO_EMAIL] : null,
     subject: at.especialidade_solicitada
       ? `${nomeEspecialidadeImediata(at.especialidade_solicitada).toUpperCase()} - PACIENTE NOVO NA FILA - ${nomeFila}`
       : "PACIENTE NOVO NA FILA - " + nomeFila
   });
+
+  if (prioridade?.atendimento) {
+    await pool.query(
+      `UPDATE fila_atendimentos
+          SET prioridade_geral_notificada_em=NOW()
+        WHERE id=$1
+          AND prioridade_medico_id=$2
+          AND prioridade_geral_notificada_em IS NULL`,
+      [at.id, prioridade.admin.id]
+    );
+  }
 
   console.log(`[NOTIFICACAO] Atendimento #${at.id} notificado para a equipe.`);
 }
