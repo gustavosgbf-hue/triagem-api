@@ -7998,10 +7998,53 @@ app.get("/api/admin/historico", checkAdmin, async (req, res) => {
       params
     );
     const medicos = await pool.query(`SELECT id,nome,nome_exibicao FROM medicos WHERE ativo=true ORDER BY nome`);
-    return res.json({ ok: true, historico: result.rows, medicos: medicos.rows });
+    const siteUrl = String(process.env.SITE_URL || "https://consultaja24h.com.br").replace(/\/+$/, "");
+    const historico = result.rows.map((atendimento) => ({
+      ...atendimento,
+      link_consulta: `${siteUrl}/triagem.html?consulta=${encodeURIComponent(String(atendimento.id))}`
+    }));
+    return res.json({ ok: true, historico, medicos: medicos.rows });
   } catch(e) {
     console.error("[ADMIN-HISTORICO]", e.message);
     return res.status(500).json({ ok: false, error: "Erro ao carregar histórico" });
+  }
+});
+
+// Consulta administrativa e somente leitura das mensagens de qualquer atendimento.
+app.get("/api/admin/atendimento/:id/chat", checkAdmin, async (req, res) => {
+  try {
+    const atendimentoId = Number.parseInt(req.params.id, 10);
+    if (!Number.isInteger(atendimentoId) || atendimentoId <= 0) {
+      return res.status(400).json({ ok: false, error: "Atendimento invalido" });
+    }
+
+    const atendimento = await pool.query(
+      `SELECT id,nome,tipo,status,medico_id,medico_nome
+         FROM fila_atendimentos
+        WHERE id=$1`,
+      [atendimentoId]
+    );
+    if (atendimento.rowCount === 0) {
+      return res.status(404).json({ ok: false, error: "Atendimento nao encontrado" });
+    }
+
+    const mensagens = await pool.query(
+      `SELECT id,atendimento_id,autor,texto,arquivo_url,arquivo_tipo,arquivo_nome,criado_em
+         FROM mensagens
+        WHERE atendimento_id=$1
+        ORDER BY criado_em ASC`,
+      [atendimentoId]
+    );
+    const siteUrl = String(process.env.SITE_URL || "https://consultaja24h.com.br").replace(/\/+$/, "");
+    return res.json({
+      ok: true,
+      atendimento: atendimento.rows[0],
+      mensagens: mensagens.rows,
+      link_consulta: `${siteUrl}/triagem.html?consulta=${encodeURIComponent(String(atendimentoId))}`
+    });
+  } catch (e) {
+    console.error("[ADMIN-CHAT]", e.message);
+    return res.status(500).json({ ok: false, error: "Erro ao carregar conversa" });
   }
 });
 
