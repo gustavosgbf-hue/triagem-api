@@ -5507,7 +5507,7 @@ function criarLinkSenhaGuest(email) {
     JWT_SECRET,
     { expiresIn: '24h' }
   );
-  return `https://painel.consultaja24h.com.br/paciente?criar_senha=${encodeURIComponent(token)}`;
+  return `https://consultaja24h.com.br/paciente?criar_senha=${encodeURIComponent(token)}`;
 }
 
 async function validarAcessoAgendamentoPsi(id, email, cpf) {
@@ -5535,7 +5535,7 @@ app.post('/api/psicologia/agendamento/:id/acesso-paciente', rlGeral, async (req,
     const ag = await validarAcessoAgendamentoPsi(req.params.id, req.body?.email, req.body?.cpf);
     if (!ag) return res.status(403).json({ ok: false, error: 'Não foi possível validar este agendamento' });
     if (ag.senha_hash !== '__GUEST__') {
-      return res.json({ ok: true, precisa_criar_senha: false, url: 'https://painel.consultaja24h.com.br/paciente' });
+      return res.json({ ok: true, precisa_criar_senha: false, url: 'https://consultaja24h.com.br/paciente' });
     }
     return res.json({ ok: true, precisa_criar_senha: true, url: criarLinkSenhaGuest(ag.paciente_email) });
   } catch (err) {
@@ -5765,7 +5765,7 @@ async function enviarEmailAdminPsicologia({ id, paciente_nome, psicologo_nome, h
 async function enviarEmailBoasVindasPaciente({ nome, email }) {
   const RESEND_KEY = process.env.RESEND_API_KEY;
   if (!RESEND_KEY) return;
-  const PAINEL_URL = 'https://painel.consultaja24h.com.br/paciente';
+  const PAINEL_URL = 'https://consultaja24h.com.br/paciente';
   const html = `<div style="background:#f2f0ec;padding:32px 20px;font-family:sans-serif">
     <div style="max-width:520px;margin:0 auto;background:#fff;border:1px solid rgba(22,18,14,.1);border-radius:16px;overflow:hidden">
       <div style="padding:24px;border-bottom:1px solid rgba(22,18,14,.08)">
