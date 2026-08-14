@@ -4575,6 +4575,48 @@ app.post('/api/paciente/login', rlLogin, async (req, res) => {
   } catch(err) { return res.status(500).json({ ok: false, error: 'Erro interno no login' }); }
 });
 
+// POST /api/paciente/ativar-conta-guest
+// Conclui o cadastro iniciado por um agendamento sem senha.
+app.post('/api/paciente/ativar-conta-guest', rlLogin, async (req, res) => {
+  try {
+    const { token, senha } = req.body || {};
+    if (!token || !senha) return res.status(400).json({ ok: false, error: 'Token e senha são obrigatórios' });
+    if (String(senha).length < 6) return res.status(400).json({ ok: false, error: 'A senha deve ter ao menos 6 caracteres' });
+
+    let payload;
+    try {
+      payload = jwt.verify(String(token), JWT_SECRET);
+    } catch (_) {
+      return res.status(400).json({ ok: false, error: 'Este link expirou. Solicite um novo acesso na confirmação do agendamento.' });
+    }
+    if (payload.tipo !== 'criar_senha_guest' || !payload.email) {
+      return res.status(400).json({ ok: false, error: 'Link de acesso inválido' });
+    }
+
+    const email = String(payload.email).trim().toLowerCase();
+    const { rows } = await pool.query(
+      `SELECT id, nome, email, cpf, tel, senha_hash FROM pacientes WHERE email = $1 LIMIT 1`,
+      [email]
+    );
+    if (!rows[0]) return res.status(404).json({ ok: false, error: 'Conta não encontrada' });
+    if (rows[0].senha_hash !== '__GUEST__') {
+      return res.status(409).json({ ok: false, error: 'Esta conta já possui senha. Entre normalmente com seu e-mail.' });
+    }
+
+    const senhaHash = await bcrypt.hash(String(senha), 10);
+    await pool.query(
+      `UPDATE pacientes SET senha_hash = $1 WHERE id = $2 AND senha_hash = '__GUEST__'`,
+      [senhaHash, rows[0].id]
+    );
+    const authToken = jwt.sign({ id: rows[0].id, tipo: 'paciente' }, JWT_SECRET, { expiresIn: '7d' });
+    const { senha_hash: _, ...paciente } = rows[0];
+    return res.json({ ok: true, token: authToken, paciente });
+  } catch (err) {
+    console.error('[GUEST-ATIVAR] Erro:', err.message);
+    return res.status(500).json({ ok: false, error: 'Não foi possível criar a senha agora' });
+  }
+});
+
 // GET /api/paciente/me
 app.get('/api/paciente/me', authPaciente, async (req, res) => {
   try {
@@ -5423,7 +5465,7 @@ app.get('/api/psicologia/agendamento/:id/status', rlGeral, async (req, res) => {
   try {
     const { rows } = await pool.query(
       `SELECT id, pagamento_status, status, valor_cobrado, psicologo_nome,
-              horario_agendado, tipo_consulta, formulario_url
+              horario_agendado, tipo_consulta, formulario_url, pagbank_order_id
          FROM agendamentos_psicologia WHERE id = $1 LIMIT 1`,
       [req.params.id]
     );
@@ -5456,6 +5498,66 @@ app.get('/api/psicologia/agendamento/:id/status', rlGeral, async (req, res) => {
     return res.json({ ok: true, agendamento: ag });
   } catch (e) {
     return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+function criarLinkSenhaGuest(email) {
+  const token = jwt.sign(
+    { email: String(email).trim().toLowerCase(), tipo: 'criar_senha_guest' },
+    JWT_SECRET,
+    { expiresIn: '24h' }
+  );
+  return `https://painel.consultaja24h.com.br/paciente?criar_senha=${encodeURIComponent(token)}`;
+}
+
+async function validarAcessoAgendamentoPsi(id, email, cpf) {
+  const emailNorm = String(email || '').trim().toLowerCase();
+  const cpfNorm = String(cpf || '').replace(/\D/g, '');
+  const { rows } = await pool.query(
+    `SELECT ap.id, ap.paciente_email, ap.paciente_cpf, ap.pagamento_status,
+            ap.paciente_nome, ap.psicologo_nome, ap.horario_agendado,
+            p.senha_hash
+       FROM agendamentos_psicologia ap
+       JOIN pacientes p ON p.id = ap.paciente_id
+      WHERE ap.id = $1 LIMIT 1`,
+    [id]
+  );
+  const ag = rows[0];
+  if (!ag || ag.pagamento_status !== 'confirmado') return null;
+  if (String(ag.paciente_email || '').trim().toLowerCase() !== emailNorm) return null;
+  if (String(ag.paciente_cpf || '').replace(/\D/g, '') !== cpfNorm) return null;
+  return ag;
+}
+
+// Disponibiliza o acesso somente a quem possui os dados usados no checkout pago.
+app.post('/api/psicologia/agendamento/:id/acesso-paciente', rlGeral, async (req, res) => {
+  try {
+    const ag = await validarAcessoAgendamentoPsi(req.params.id, req.body?.email, req.body?.cpf);
+    if (!ag) return res.status(403).json({ ok: false, error: 'Não foi possível validar este agendamento' });
+    if (ag.senha_hash !== '__GUEST__') {
+      return res.json({ ok: true, precisa_criar_senha: false, url: 'https://painel.consultaja24h.com.br/paciente' });
+    }
+    return res.json({ ok: true, precisa_criar_senha: true, url: criarLinkSenhaGuest(ag.paciente_email) });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: 'Não foi possível gerar o acesso' });
+  }
+});
+
+app.post('/api/psicologia/agendamento/:id/reenviar-acesso', rlGeral, async (req, res) => {
+  try {
+    const ag = await validarAcessoAgendamentoPsi(req.params.id, req.body?.email, req.body?.cpf);
+    if (!ag) return res.status(403).json({ ok: false, error: 'Não foi possível validar este agendamento' });
+    if (ag.senha_hash !== '__GUEST__') return res.json({ ok: true, conta_existente: true });
+    const enviado = await enviarEmailConviteContaGuest({
+      nome: ag.paciente_nome,
+      email: ag.paciente_email,
+      psicologo: ag.psicologo_nome,
+      horario: ag.horario_agendado
+    });
+    if (!enviado) return res.status(502).json({ ok: false, error: 'Não foi possível enviar o e-mail agora' });
+    return res.json({ ok: true });
+  } catch (err) {
+    return res.status(500).json({ ok: false, error: 'Não foi possível reenviar o acesso' });
   }
 });
 
@@ -5783,7 +5885,7 @@ async function enviarEmailConviteContaGuest({
   tipoAtendimento = 'sessão'
 }) {
   const RESEND_KEY = process.env.RESEND_API_KEY;
-  if (!RESEND_KEY || !email) return;
+  if (!RESEND_KEY || !email) return false;
   const nomeProfissional = profissional || psicologo || 'profissional';
 
   // Só envia se for conta guest (senha_hash = '__GUEST__')
@@ -5792,16 +5894,10 @@ async function enviarEmailConviteContaGuest({
       `SELECT senha_hash FROM pacientes WHERE email = $1 LIMIT 1`,
       [String(email).trim().toLowerCase()]
     );
-    if (!check.rows[0] || check.rows[0].senha_hash !== '__GUEST__') return;
-  } catch(_) { return; }
+    if (!check.rows[0] || check.rows[0].senha_hash !== '__GUEST__') return false;
+  } catch(_) { return false; }
 
-  const token = jwt.sign(
-    { email: String(email).trim().toLowerCase(), tipo: 'criar_senha_guest' },
-    JWT_SECRET,
-    { expiresIn: '24h' }
-  );
-  const PAINEL_URL = 'https://painel.consultaja24h.com.br';
-  const linkCriarSenha = `${PAINEL_URL}/paciente?criar_senha=${encodeURIComponent(token)}`;
+  const linkCriarSenha = criarLinkSenhaGuest(email);
 
   const horarioFmt = new Date(horario).toLocaleString('pt-BR', {
     timeZone: 'America/Fortaleza', weekday: 'long', day: '2-digit',
@@ -5844,9 +5940,16 @@ async function enviarEmailConviteContaGuest({
       })
     });
     const d = await r.json();
-    if (d.id) console.log(`[GUEST-CONVITE] Enviado para ${email}`);
-    else console.error('[GUEST-CONVITE] Resend recusou:', JSON.stringify(d));
-  } catch (e) { console.error('[GUEST-CONVITE] Erro:', e.message); }
+    if (d.id) {
+      console.log(`[GUEST-CONVITE] Enviado para ${email}`);
+      return true;
+    }
+    console.error('[GUEST-CONVITE] Resend recusou:', JSON.stringify(d));
+    return false;
+  } catch (e) {
+    console.error('[GUEST-CONVITE] Erro:', e.message);
+    return false;
+  }
 }
 
 // ── PSICOLOGIA: e-mail de notificação ao psicólogo ──────────────────────────
@@ -10355,7 +10458,7 @@ app.post('/api/psicologo/sessao/:id/iniciar', authPsicologo, async (req, res) =>
     const { rows } = await pool.query(
       `SELECT ap.id, ap.paciente_nome, ap.psicologo_id, ap.status_sessao,
               ap.pagamento_status, ap.horario_agendado, ap.iniciado_em,
-              p.sala_meet
+              ap.link_sessao, p.sala_meet
          FROM agendamentos_psicologia ap
          JOIN psicologos p ON p.id = ap.psicologo_id
         WHERE ap.id = $1 AND ap.psicologo_id = $2`,
@@ -10369,7 +10472,8 @@ app.post('/api/psicologo/sessao/:id/iniciar', authPsicologo, async (req, res) =>
     if (ag.pagamento_status !== 'confirmado') {
       return res.status(400).json({ ok: false, error: 'Pagamento não confirmado para este agendamento' });
     }
-    if (!ag.sala_meet) {
+    const linkSessao = ag.link_sessao || ag.sala_meet;
+    if (!linkSessao) {
       return res.status(400).json({ ok: false, error: 'Você ainda não configurou sua sala do Google Meet. Acesse seu perfil para cadastrar o link.' });
     }
 
@@ -10382,7 +10486,7 @@ app.post('/api/psicologo/sessao/:id/iniciar', authPsicologo, async (req, res) =>
                 iniciado_por  = $1,
                 link_sessao   = $2
           WHERE id = $3`,
-        [req.psicologoId, ag.sala_meet, agId]
+        [req.psicologoId, linkSessao, agId]
       );
     }
 
@@ -10390,7 +10494,7 @@ app.post('/api/psicologo/sessao/:id/iniciar', authPsicologo, async (req, res) =>
       psicologoId: req.psicologoId,
       agendamentoId: agId,
       tipoEvento: jaIniciado ? 'reingresso_sessao' : 'inicio_sessao',
-      detalhe: `Sessão iniciada via plataforma — Meet: ${ag.sala_meet}`,
+      detalhe: `Sessão iniciada via plataforma — Meet: ${linkSessao}`,
       ip,
     });
 
@@ -10399,7 +10503,7 @@ app.post('/api/psicologo/sessao/:id/iniciar', authPsicologo, async (req, res) =>
     return res.json({
       ok: true,
       ja_iniciado: jaIniciado,
-      link_meet: ag.sala_meet,
+      link_meet: linkSessao,
       aviso_contratual: AVISO_CONTRATUAL_PSI,
     });
   } catch (e) {
