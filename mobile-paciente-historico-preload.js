@@ -58,10 +58,10 @@ async function atendimentoDoPaciente(pacienteId, atendimentoId) {
        FROM fila_atendimentos f
       WHERE f.id=$1
         AND (
-          regexp_replace(COALESCE(f.cpf,''), '\\D', '', 'g') = $2
-          OR regexp_replace(COALESCE(f.pagador_cpf,''), '\\D', '', 'g') = $2
+          regexp_replace(COALESCE(to_jsonb(f)->>'cpf',''), '\\D', '', 'g') = $2
+          OR regexp_replace(COALESCE(to_jsonb(f)->>'pagador_cpf',''), '\\D', '', 'g') = $2
         )
-        AND RIGHT(regexp_replace(COALESCE(f.tel,''), '\\D', '', 'g'), 11) = $3
+        AND RIGHT(regexp_replace(COALESCE(to_jsonb(f)->>'tel',''), '\\D', '', 'g'), 11) = $3
       LIMIT 1`,
     [atendimentoId, cpf, phone],
   );
@@ -99,6 +99,7 @@ function installPatientHistoryRoutes(app) {
            NULLIF(TRIM(COALESCE(to_jsonb(f)->>'triagem','')), '') AS resumo,
            COALESCE(
              NULLIF(to_jsonb(f)->>'finalizado_em','')::timestamptz,
+             NULLIF(to_jsonb(f)->>'encerrado_em','')::timestamptz,
              NULLIF(to_jsonb(f)->>'assumido_em','')::timestamptz,
              NULLIF(to_jsonb(f)->>'criado_em','')::timestamptz,
              NOW()
@@ -107,7 +108,8 @@ function installPatientHistoryRoutes(app) {
         WHERE RIGHT(regexp_replace(COALESCE(to_jsonb(f)->>'tel',''), '\\D', '', 'g'), 11) = $1
           AND (
             $2 = '' OR
-            regexp_replace(COALESCE(to_jsonb(f)->>'cpf',''), '\\D', '', 'g') = $2
+            regexp_replace(COALESCE(to_jsonb(f)->>'cpf',''), '\\D', '', 'g') = $2 OR
+            regexp_replace(COALESCE(to_jsonb(f)->>'pagador_cpf',''), '\\D', '', 'g') = $2
           )
           AND COALESCE(to_jsonb(f)->>'status','') NOT IN ('cancelado','expirado')
         ORDER BY data_atendimento DESC
@@ -118,10 +120,13 @@ function installPatientHistoryRoutes(app) {
       const atendimentos = result.rows.map((row) => ({
         id: row.id,
         profissional_nome: row.profissional_nome || 'Profissional da ConsultaJá24h',
+        medico_nome: row.profissional_nome || null,
         tipo: row.tipo || 'consulta',
         status: row.status || 'concluído',
         resumo: row.resumo || '',
+        triagem: row.resumo || '',
         data_atendimento: row.data_atendimento,
+        criado_em: row.data_atendimento,
       }));
 
       return res.json({ ok: true, atendimentos });
@@ -144,36 +149,36 @@ function installPatientHistoryRoutes(app) {
 
       const result = await pool.query(
         `SELECT
-           f.id,
-           f.nome,
-           f.cpf,
-           f.tel,
-           f.email,
-           f.data_nascimento,
-           f.tipo,
-           f.status,
-           f.pagamento_status,
-           f.pagamento_metodo,
-           f.pagamento_confirmado_em,
-           f.pagbank_order_id,
-           f.pagbank_qr_text,
-           f.pagbank_qr_expira_em,
-           f.efi_charge_id,
-           f.triagem,
-           f.queixa,
-           f.atendimento_para_terceiro,
-           f.pagador_cpf,
-           f.medico_id,
-           f.medico_nome,
-           f.criado_em
+           (to_jsonb(f)->>'id')::int AS id,
+           NULLIF(to_jsonb(f)->>'nome','') AS nome,
+           NULLIF(to_jsonb(f)->>'cpf','') AS cpf,
+           NULLIF(to_jsonb(f)->>'tel','') AS tel,
+           NULLIF(to_jsonb(f)->>'email','') AS email,
+           NULLIF(to_jsonb(f)->>'data_nascimento','') AS data_nascimento,
+           NULLIF(to_jsonb(f)->>'tipo','') AS tipo,
+           NULLIF(to_jsonb(f)->>'status','') AS status,
+           NULLIF(to_jsonb(f)->>'pagamento_status','') AS pagamento_status,
+           NULLIF(to_jsonb(f)->>'pagamento_metodo','') AS pagamento_metodo,
+           NULLIF(to_jsonb(f)->>'pagamento_confirmado_em','')::timestamptz AS pagamento_confirmado_em,
+           NULLIF(to_jsonb(f)->>'pagbank_order_id','') AS pagbank_order_id,
+           NULLIF(to_jsonb(f)->>'pagbank_qr_text','') AS pagbank_qr_text,
+           NULLIF(to_jsonb(f)->>'pagbank_qr_expira_em','')::timestamptz AS pagbank_qr_expira_em,
+           NULLIF(to_jsonb(f)->>'efi_charge_id','') AS efi_charge_id,
+           NULLIF(to_jsonb(f)->>'triagem','') AS triagem,
+           NULLIF(to_jsonb(f)->>'queixa','') AS queixa,
+           COALESCE((to_jsonb(f)->>'atendimento_para_terceiro')::boolean, false) AS atendimento_para_terceiro,
+           NULLIF(to_jsonb(f)->>'pagador_cpf','') AS pagador_cpf,
+           NULLIF(to_jsonb(f)->>'medico_id','')::int AS medico_id,
+           NULLIF(to_jsonb(f)->>'medico_nome','') AS medico_nome,
+           NULLIF(to_jsonb(f)->>'criado_em','')::timestamptz AS criado_em
          FROM fila_atendimentos f
-        WHERE COALESCE(f.status,'') NOT IN ('encerrado','finalizado','cancelado','expirado','arquivado')
+        WHERE COALESCE(to_jsonb(f)->>'status','') NOT IN ('encerrado','finalizado','cancelado','expirado','arquivado')
           AND (
-            regexp_replace(COALESCE(f.cpf,''), '\\D', '', 'g') = $1
-            OR regexp_replace(COALESCE(f.pagador_cpf,''), '\\D', '', 'g') = $1
+            regexp_replace(COALESCE(to_jsonb(f)->>'cpf',''), '\\D', '', 'g') = $1
+            OR regexp_replace(COALESCE(to_jsonb(f)->>'pagador_cpf',''), '\\D', '', 'g') = $1
           )
-          AND RIGHT(regexp_replace(COALESCE(f.tel,''), '\\D', '', 'g'), 11) = $2
-        ORDER BY f.criado_em DESC
+          AND RIGHT(regexp_replace(COALESCE(to_jsonb(f)->>'tel',''), '\\D', '', 'g'), 11) = $2
+        ORDER BY NULLIF(to_jsonb(f)->>'criado_em','')::timestamptz DESC NULLS LAST
         LIMIT 1`,
         [cpf, phone],
       );
