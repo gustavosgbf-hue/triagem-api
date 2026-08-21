@@ -46,6 +46,15 @@ async function pacienteAtual(id) {
   return result.rows[0] || null;
 }
 
+function etapaDoAtendimento(row) {
+  const status = String(row?.status || '').toLowerCase();
+  const pagamento = String(row?.pagamento_status || '').toLowerCase();
+  if (pagamento !== 'confirmado') return 'pagamento';
+  if (status === 'triagem' || status === 'pagamento_pendente') return 'triagem';
+  if (status === 'assumido' || row?.medico_id) return 'chat';
+  return 'fila';
+}
+
 function installPatientHistoryRoutes(app) {
   if (app.locals.__patientHistoryInstalled) return;
   app.locals.__patientHistoryInstalled = true;
@@ -97,6 +106,69 @@ function installPatientHistoryRoutes(app) {
     } catch (error) {
       console.error('[PACIENTE-HISTORICO]', error);
       return res.status(500).json({ ok: false, error: 'Não foi possível carregar o histórico agora.' });
+    }
+  });
+
+  app.get('/api/paciente/atendimento-em-andamento', authPaciente, async (req, res) => {
+    try {
+      const paciente = await pacienteAtual(req.pacienteId);
+      if (!paciente) return res.status(404).json({ ok: false, error: 'Paciente não encontrado' });
+
+      const phone = normalizePhone(paciente.tel);
+      const cpf = normalizeCpf(paciente.cpf);
+      if (phone.length < 10 || cpf.length !== 11) {
+        return res.json({ ok: true, atendimento: null });
+      }
+
+      const result = await pool.query(
+        `SELECT
+           f.id,
+           f.nome,
+           f.cpf,
+           f.tel,
+           f.email,
+           f.data_nascimento,
+           f.tipo,
+           f.status,
+           f.pagamento_status,
+           f.pagamento_metodo,
+           f.pagamento_confirmado_em,
+           f.pagbank_order_id,
+           f.pagbank_qr_text,
+           f.pagbank_qr_expira_em,
+           f.efi_charge_id,
+           f.triagem,
+           f.queixa,
+           f.atendimento_para_terceiro,
+           f.pagador_cpf,
+           f.medico_id,
+           f.medico_nome,
+           f.criado_em
+         FROM fila_atendimentos f
+        WHERE COALESCE(f.status,'') NOT IN ('encerrado','finalizado','cancelado','expirado','arquivado')
+          AND (
+            regexp_replace(COALESCE(f.cpf,''), '\\D', '', 'g') = $1
+            OR regexp_replace(COALESCE(f.pagador_cpf,''), '\\D', '', 'g') = $1
+          )
+          AND RIGHT(regexp_replace(COALESCE(f.tel,''), '\\D', '', 'g'), 11) = $2
+        ORDER BY f.criado_em DESC
+        LIMIT 1`,
+        [cpf, phone],
+      );
+
+      const row = result.rows[0];
+      if (!row) return res.json({ ok: true, atendimento: null });
+
+      return res.json({
+        ok: true,
+        atendimento: {
+          ...row,
+          etapa: etapaDoAtendimento(row),
+        },
+      });
+    } catch (error) {
+      console.error('[PACIENTE-EM-ANDAMENTO]', error);
+      return res.status(500).json({ ok: false, error: 'Não foi possível recuperar o atendimento em andamento.' });
     }
   });
 }
