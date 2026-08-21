@@ -46,6 +46,28 @@ async function pacienteAtual(id) {
   return result.rows[0] || null;
 }
 
+async function atendimentoDoPaciente(pacienteId, atendimentoId) {
+  const paciente = await pacienteAtual(pacienteId);
+  if (!paciente) return null;
+  const cpf = normalizeCpf(paciente.cpf);
+  const phone = normalizePhone(paciente.tel);
+  if (cpf.length !== 11 || phone.length < 10) return null;
+
+  const result = await pool.query(
+    `SELECT f.*
+       FROM fila_atendimentos f
+      WHERE f.id=$1
+        AND (
+          regexp_replace(COALESCE(f.cpf,''), '\\D', '', 'g') = $2
+          OR regexp_replace(COALESCE(f.pagador_cpf,''), '\\D', '', 'g') = $2
+        )
+        AND RIGHT(regexp_replace(COALESCE(f.tel,''), '\\D', '', 'g'), 11) = $3
+      LIMIT 1`,
+    [atendimentoId, cpf, phone],
+  );
+  return result.rows[0] || null;
+}
+
 function etapaDoAtendimento(row) {
   const status = String(row?.status || '').toLowerCase();
   const pagamento = String(row?.pagamento_status || '').toLowerCase();
@@ -169,6 +191,61 @@ function installPatientHistoryRoutes(app) {
     } catch (error) {
       console.error('[PACIENTE-EM-ANDAMENTO]', error);
       return res.status(500).json({ ok: false, error: 'Não foi possível recuperar o atendimento em andamento.' });
+    }
+  });
+
+  app.get('/api/paciente/atendimento/:id/chat', authPaciente, async (req, res) => {
+    try {
+      const atendimentoId = Number(req.params.id);
+      if (!atendimentoId) return res.status(400).json({ ok: false, error: 'Atendimento inválido' });
+      const atendimento = await atendimentoDoPaciente(req.pacienteId, atendimentoId);
+      if (!atendimento) return res.status(404).json({ ok: false, error: 'Atendimento não encontrado' });
+
+      const result = await pool.query(
+        `SELECT id,atendimento_id,autor,texto,arquivo_url,arquivo_tipo,arquivo_nome,criado_em
+           FROM mensagens
+          WHERE atendimento_id=$1
+          ORDER BY criado_em ASC, id ASC`,
+        [atendimentoId],
+      );
+      return res.json({
+        ok: true,
+        atendimento: {
+          id: atendimento.id,
+          status: atendimento.status,
+          medico_nome: atendimento.medico_nome || null,
+          etapa: etapaDoAtendimento(atendimento),
+        },
+        mensagens: result.rows,
+      });
+    } catch (error) {
+      console.error('[PACIENTE-CHAT-GET]', error);
+      return res.status(500).json({ ok: false, error: 'Não foi possível carregar as mensagens.' });
+    }
+  });
+
+  app.post('/api/paciente/atendimento/:id/chat', authPaciente, async (req, res) => {
+    try {
+      const atendimentoId = Number(req.params.id);
+      const texto = String(req.body?.texto || '').trim().slice(0, 3000);
+      if (!atendimentoId || !texto) return res.status(400).json({ ok: false, error: 'Mensagem vazia' });
+
+      const atendimento = await atendimentoDoPaciente(req.pacienteId, atendimentoId);
+      if (!atendimento) return res.status(404).json({ ok: false, error: 'Atendimento não encontrado' });
+      if (String(atendimento.status || '').toLowerCase() !== 'assumido' || !atendimento.medico_id) {
+        return res.status(409).json({ ok: false, error: 'O chat será liberado quando um médico assumir o atendimento.' });
+      }
+
+      const result = await pool.query(
+        `INSERT INTO mensagens (atendimento_id,autor,autor_id,texto,arquivo_url,arquivo_tipo)
+         VALUES ($1,'paciente',$2,$3,NULL,NULL)
+         RETURNING id,atendimento_id,autor,texto,arquivo_url,arquivo_tipo,arquivo_nome,criado_em`,
+        [atendimentoId, req.pacienteId, texto],
+      );
+      return res.json({ ok: true, mensagem: result.rows[0] });
+    } catch (error) {
+      console.error('[PACIENTE-CHAT-SEND]', error);
+      return res.status(500).json({ ok: false, error: 'Não foi possível enviar a mensagem.' });
     }
   });
 }
