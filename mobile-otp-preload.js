@@ -2,7 +2,7 @@ import express from 'express';
 import pg from 'pg';
 import bcrypt from 'bcrypt';
 import jwt from 'jsonwebtoken';
-import { createHash, randomInt, randomUUID } from 'crypto';
+import { createHash, randomInt, randomUUID, timingSafeEqual } from 'crypto';
 
 const { Pool } = pg;
 const pool = new Pool({
@@ -12,6 +12,7 @@ const pool = new Pool({
 
 const OTP_TTL_MINUTES = 5;
 const OTP_MAX_ATTEMPTS = 6;
+const OTP_MAX_SENDS_10_MIN = 4;
 const JSON_BODY = express.json({ limit: '32kb' });
 
 function digits(value) {
@@ -47,6 +48,16 @@ function hashOtp(code, challengeId) {
   return createHash('sha256').update(`${challengeId}:${code}:${process.env.JWT_SECRET || ''}`).digest('hex');
 }
 
+function safeHashEquals(a, b) {
+  try {
+    const aa = Buffer.from(String(a || ''), 'hex');
+    const bb = Buffer.from(String(b || ''), 'hex');
+    return aa.length === bb.length && aa.length > 0 && timingSafeEqual(aa, bb);
+  } catch {
+    return false;
+  }
+}
+
 async function ensureOtpTable() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS paciente_otp_desafios (
@@ -75,6 +86,26 @@ function otpTableReady() {
   return tableReady;
 }
 
+async function cleanupExpiredChallenges() {
+  await pool.query(`DELETE FROM paciente_otp_desafios WHERE expira_em < NOW() - INTERVAL '1 day'`).catch(() => {});
+}
+
+async function assertSendRate(phone) {
+  await otpTableReady();
+  const result = await pool.query(
+    `SELECT COUNT(*)::int AS total
+       FROM paciente_otp_desafios
+      WHERE telefone=$1
+        AND criado_em > NOW() - INTERVAL '10 minutes'`,
+    [phone],
+  );
+  if (Number(result.rows[0]?.total || 0) >= OTP_MAX_SENDS_10_MIN) {
+    const error = new Error('Muitos códigos solicitados. Aguarde alguns minutos e tente novamente.');
+    error.statusCode = 429;
+    throw error;
+  }
+}
+
 async function findPatientByPhone(phone) {
   const result = await pool.query(
     `SELECT id, nome, email, cpf, tel
@@ -94,7 +125,7 @@ async function findHistoryIdentity(phone) {
        NULLIF(regexp_replace(COALESCE(to_jsonb(f)->>'cpf',''), '\\D', '', 'g'), '') AS cpf
        FROM fila_atendimentos f
       WHERE RIGHT(regexp_replace(COALESCE(to_jsonb(f)->>'tel',''), '\\D', '', 'g'), 11) = $1
-      ORDER BY COALESCE((to_jsonb(f)->>'criado_em')::timestamptz, NOW()) DESC
+      ORDER BY COALESCE(NULLIF(to_jsonb(f)->>'criado_em','')::timestamptz, NOW()) DESC
       LIMIT 1`,
     [phone],
   );
@@ -107,7 +138,10 @@ async function historyHasCpf(phone, cpf) {
     `SELECT 1
        FROM fila_atendimentos f
       WHERE RIGHT(regexp_replace(COALESCE(to_jsonb(f)->>'tel',''), '\\D', '', 'g'), 11) = $1
-        AND regexp_replace(COALESCE(to_jsonb(f)->>'cpf',''), '\\D', '', 'g') = $2
+        AND (
+          regexp_replace(COALESCE(to_jsonb(f)->>'cpf',''), '\\D', '', 'g') = $2
+          OR regexp_replace(COALESCE(to_jsonb(f)->>'pagador_cpf',''), '\\D', '', 'g') = $2
+        )
       LIMIT 1`,
     [phone, cpf],
   );
@@ -154,6 +188,9 @@ async function sendOtpEmail(email, code) {
 
 async function createChallenge({ phone, email, cpf = '', name = '' }) {
   await otpTableReady();
+  await assertSendRate(phone);
+  cleanupExpiredChallenges();
+
   const id = randomUUID();
   const code = String(randomInt(0, 1_000_000)).padStart(6, '0');
   const codeHash = hashOtp(code, id);
@@ -252,7 +289,11 @@ function installMobileOtpRoutes(app) {
       return res.json({ ok: true, challenge_id: challengeId, email_mascarado: maskEmail(suppliedEmail) });
     } catch (error) {
       console.error('[PACIENTE-OTP] solicitar:', error);
-      return res.status(500).json({ ok: false, error: 'Não foi possível enviar o código agora. Tente novamente.' });
+      const status = Number(error?.statusCode) || 500;
+      return res.status(status).json({
+        ok: false,
+        error: status === 429 ? error.message : 'Não foi possível enviar o código agora. Tente novamente.',
+      });
     }
   });
 
@@ -277,9 +318,8 @@ function installMobileOtpRoutes(app) {
         return res.status(429).json({ ok: false, error: 'Muitas tentativas. Solicite um novo código.' });
       }
 
-      const expected = challenge.codigo_hash;
       const received = hashOtp(code, challengeId);
-      if (expected !== received) {
+      if (!safeHashEquals(challenge.codigo_hash, received)) {
         await pool.query(`UPDATE paciente_otp_desafios SET tentativas=tentativas+1 WHERE id=$1`, [challengeId]);
         return res.status(401).json({ ok: false, error: 'Código incorreto' });
       }
