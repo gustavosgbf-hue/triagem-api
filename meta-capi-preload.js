@@ -1,3 +1,4 @@
+import './mobile-beta-test-preload.js';
 import express from "express";
 
 const META_GRAPH_API_VERSION = process.env.META_GRAPH_API_VERSION || "v23.0";
