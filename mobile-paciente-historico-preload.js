@@ -172,7 +172,9 @@ function installPatientHistoryRoutes(app) {
            NULLIF(to_jsonb(f)->>'medico_nome','') AS medico_nome,
            NULLIF(to_jsonb(f)->>'criado_em','')::timestamptz AS criado_em
          FROM fila_atendimentos f
-        WHERE COALESCE(to_jsonb(f)->>'status','') NOT IN ('encerrado','finalizado','cancelado','expirado','arquivado')
+        WHERE COALESCE(LOWER(to_jsonb(f)->>'status'),'') NOT IN ('encerrado','finalizado','finalizada','concluido','concluído','cancelado','expirado','arquivado')
+          AND NULLIF(to_jsonb(f)->>'encerrado_em','') IS NULL
+          AND NULLIF(to_jsonb(f)->>'finalizado_em','') IS NULL
           AND (
             regexp_replace(COALESCE(to_jsonb(f)->>'cpf',''), '\\D', '', 'g') = $1
             OR regexp_replace(COALESCE(to_jsonb(f)->>'pagador_cpf',''), '\\D', '', 'g') = $1
