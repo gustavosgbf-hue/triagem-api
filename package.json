@@ -4,7 +4,7 @@
   "type": "module",
   "main": "server.js",
   "scripts": {
-    "start": "node --import ./mobile-otp-preload.js --import ./mobile-paciente-historico-preload.js --import ./meta-capi-preload.js server.js",
+    "start": "node --import ./mobile-otp-preload.js --import ./mobile-beta-test-preload.js --import ./mobile-paciente-historico-preload.js --import ./meta-capi-preload.js server.js",
     "test": "node --test",
     "memed:backfill": "node scripts/backfill-memed-prescritores.mjs"
   },
@@ -12,7 +12,7 @@
     "@aws-sdk/client-s3": "^3.1008.0",
     "axios": "^1.13.6",
     "bcrypt": "^6.0.0",
-    "cors": "^2.8.5",
+    "cors": "^4.19.2",
     "express": "^4.19.2",
     "express-rate-limit": "^7.3.0",
     "googleapis": "^140.0.0",
