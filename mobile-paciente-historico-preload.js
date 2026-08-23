@@ -8,6 +8,8 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
+const BETA_TEST_PHONE = '98991344646';
+
 function digits(value) {
   return String(value || '').replace(/\D/g, '');
 }
@@ -71,7 +73,8 @@ async function atendimentoDoPaciente(pacienteId, atendimentoId) {
 function etapaDoAtendimento(row) {
   const status = String(row?.status || '').toLowerCase();
   const pagamento = String(row?.pagamento_status || '').toLowerCase();
-  if (pagamento !== 'confirmado') return 'pagamento';
+  const pagoOuIsento = pagamento === 'confirmado' || pagamento === 'isento_admin';
+  if (!pagoOuIsento) return 'pagamento';
   if (status === 'triagem' || status === 'pagamento_pendente') return 'triagem';
   if (status === 'assumido' || row?.medico_id) return 'chat';
   return 'fila';
@@ -147,6 +150,7 @@ function installPatientHistoryRoutes(app) {
         return res.json({ ok: true, atendimento: null });
       }
 
+      const beta = phone === BETA_TEST_PHONE;
       const result = await pool.query(
         `SELECT
            (to_jsonb(f)->>'id')::int AS id,
@@ -175,6 +179,7 @@ function installPatientHistoryRoutes(app) {
         WHERE COALESCE(LOWER(to_jsonb(f)->>'status'),'') NOT IN ('encerrado','finalizado','finalizada','concluido','concluído','cancelado','expirado','arquivado')
           AND NULLIF(to_jsonb(f)->>'encerrado_em','') IS NULL
           AND NULLIF(to_jsonb(f)->>'finalizado_em','') IS NULL
+          AND ($3::boolean = false OR COALESCE(to_jsonb(f)->>'pagamento_metodo','') = 'beta_test')
           AND (
             regexp_replace(COALESCE(to_jsonb(f)->>'cpf',''), '\\D', '', 'g') = $1
             OR regexp_replace(COALESCE(to_jsonb(f)->>'pagador_cpf',''), '\\D', '', 'g') = $1
@@ -182,7 +187,7 @@ function installPatientHistoryRoutes(app) {
           AND RIGHT(regexp_replace(COALESCE(to_jsonb(f)->>'tel',''), '\\D', '', 'g'), 11) = $2
         ORDER BY NULLIF(to_jsonb(f)->>'criado_em','')::timestamptz DESC NULLS LAST
         LIMIT 1`,
-        [cpf, phone],
+        [cpf, phone, beta],
       );
 
       const row = result.rows[0];
