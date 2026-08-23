@@ -99,6 +99,23 @@ async function atendimentoBetaAtivo(phone) {
   return rows[0] || null;
 }
 
+async function atendimentoBetaPorId(atendimentoId) {
+  const id = Number(atendimentoId);
+  if (!id) return null;
+  const { rows } = await pool.query(
+    `SELECT id,tel,pagamento_metodo
+       FROM fila_atendimentos
+      WHERE id=$1
+      LIMIT 1`,
+    [id],
+  );
+  const row = rows[0] || null;
+  if (!row) return null;
+  if (String(row.pagamento_metodo || '') !== 'beta_test') return null;
+  if (normalizePhone(row.tel) !== BETA_TEST_PHONE) return null;
+  return row;
+}
+
 async function criarOuReutilizarBeta({ paciente, nome, cpf, email, dataNascimento, paraTerceiro }) {
   const admin = await medicoAdmin();
   if (!admin) throw new Error('Administrador médico indisponível para o teste');
@@ -134,9 +151,6 @@ function installBetaTestRoutes(app) {
   if (app.locals.__mobileBetaTestInstalled) return;
   app.locals.__mobileBetaTestInstalled = true;
 
-  // Compatibilidade com a compilação atual do TestFlight: ela cria o atendimento
-  // por /api/notify antes de mostrar PIX/cartão. Para a conta beta, interceptamos
-  // somente quando telefone E CPF conferem com o cadastro beta no banco.
   app.use('/api/notify', async (req, res, next) => {
     if (req.method !== 'POST') return next();
     try {
@@ -170,6 +184,37 @@ function installBetaTestRoutes(app) {
     }
   });
 
+  // Se a compilação atual continuar a função de pagamento por alguns milissegundos
+  // após receber pagamentoConfirmado=true, bloqueamos qualquer chamada real aos provedores.
+  app.use('/api/pagbank/order', async (req, res, next) => {
+    if (req.method !== 'POST') return next();
+    try {
+      const beta = await atendimentoBetaPorId(req.body?.atendimentoId);
+      if (!beta) return next();
+      return res.json({
+        ok: true,
+        order_id: `BETA-${beta.id}`,
+        qr_code_text: `TESTE-BETA-${beta.id}-SEM-COBRANCA`,
+        valor: 0,
+      });
+    } catch (error) {
+      console.error('[MOBILE-BETA-PAGBANK]', error);
+      return res.status(500).json({ ok: false, error: 'Falha ao proteger o pagamento beta.' });
+    }
+  });
+
+  app.use('/api/efi/cartao/cobrar', async (req, res, next) => {
+    if (req.method !== 'POST') return next();
+    try {
+      const beta = await atendimentoBetaPorId(req.body?.atendimentoId);
+      if (!beta) return next();
+      return res.json({ ok: true, status: 'paid', charge_id: `BETA-${beta.id}` });
+    } catch (error) {
+      console.error('[MOBILE-BETA-EFI]', error);
+      return res.status(500).json({ ok: false, error: 'Falha ao proteger o pagamento beta.' });
+    }
+  });
+
   app.post('/api/paciente/beta/iniciar', authPaciente, async (req, res) => {
     try {
       const paciente = await pacienteBeta(req.pacienteId);
@@ -197,25 +242,14 @@ function installBetaTestRoutes(app) {
     }
   });
 
-  // Intercepta somente atendimentos criados pelo modo beta. Para qualquer outro
-  // atendimento, entrega a requisição à rota normal do server.js.
   app.use('/api/atendimento/atualizar-triagem', async (req, res, next) => {
     if (req.method !== 'POST') return next();
     try {
       const atendimentoId = Number(req.body?.atendimentoId);
       if (!atendimentoId) return next();
 
-      const beta = await pool.query(
-        `SELECT id,tel,pagamento_metodo
-           FROM fila_atendimentos
-          WHERE id=$1
-          LIMIT 1`,
-        [atendimentoId],
-      );
-      const row = beta.rows[0];
-      if (!row || String(row.pagamento_metodo || '') !== 'beta_test' || normalizePhone(row.tel) !== BETA_TEST_PHONE) {
-        return next();
-      }
+      const row = await atendimentoBetaPorId(atendimentoId);
+      if (!row) return next();
 
       const admin = await medicoAdmin();
       if (!admin) return res.status(409).json({ ok: false, error: 'Administrador médico indisponível para o teste' });
