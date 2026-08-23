@@ -54,6 +54,22 @@ async function pacienteBeta(pacienteId) {
   return normalizePhone(paciente.tel) === BETA_TEST_PHONE ? paciente : null;
 }
 
+async function pacienteBetaPorDados(phone, cpf) {
+  const tel = normalizePhone(phone);
+  const cpfLimpo = normalizeCpf(cpf);
+  if (tel !== BETA_TEST_PHONE || cpfLimpo.length !== 11) return null;
+  const { rows } = await pool.query(
+    `SELECT id,nome,email,cpf,tel
+       FROM pacientes p
+      WHERE RIGHT(regexp_replace(COALESCE(p.tel,''), '\\D', '', 'g'), 11)=$1
+        AND regexp_replace(COALESCE(p.cpf,''), '\\D', '', 'g')=$2
+      ORDER BY id DESC
+      LIMIT 1`,
+    [tel, cpfLimpo],
+  );
+  return rows[0] || null;
+}
+
 async function medicoAdmin() {
   const { rows } = await pool.query(
     `SELECT id,nome,nome_exibicao,email
@@ -83,55 +99,96 @@ async function atendimentoBetaAtivo(phone) {
   return rows[0] || null;
 }
 
+async function criarOuReutilizarBeta({ paciente, nome, cpf, email, dataNascimento, paraTerceiro }) {
+  const admin = await medicoAdmin();
+  if (!admin) throw new Error('Administrador médico indisponível para o teste');
+
+  const phone = normalizePhone(paciente.tel);
+  const existente = await atendimentoBetaAtivo(phone);
+  if (existente) {
+    return { atendimentoId: Number(existente.id), reutilizado: true };
+  }
+
+  const nomeFinal = String(nome || paciente.nome || 'Paciente beta').trim().slice(0, 180);
+  const cpfFinal = normalizeCpf(cpf || paciente.cpf);
+  const emailFinal = String(email || paciente.email || '').trim().slice(0, 240);
+  const dataNascimentoFinal = String(dataNascimento || '').trim().slice(0, 20);
+  if (cpfFinal.length !== 11) throw new Error('CPF inválido para o teste');
+
+  const { rows } = await pool.query(
+    `INSERT INTO fila_atendimentos
+       (nome,tel,tel_documentos,cpf,email,data_nascimento,tipo,triagem,queixa,
+        status,pagamento_status,pagamento_metodo,atendimento_para_terceiro,
+        prioridade_medico_id,prioridade_ate,prioridade_geral_notificada_em,criado_em)
+     VALUES
+       ($1,$2,$2,$3,$4,$5,'chat','(triagem em andamento)','(teste beta do app)',
+        'triagem','isento_admin','beta_test',$6,$7,NOW() + INTERVAL '100 years',NULL,NOW())
+     RETURNING id`,
+    [nomeFinal, phone, cpfFinal, emailFinal, dataNascimentoFinal, !!paraTerceiro, admin.id],
+  );
+
+  return { atendimentoId: Number(rows[0].id), reutilizado: false };
+}
+
 function installBetaTestRoutes(app) {
   if (app.locals.__mobileBetaTestInstalled) return;
   app.locals.__mobileBetaTestInstalled = true;
+
+  // Compatibilidade com a compilação atual do TestFlight: ela cria o atendimento
+  // por /api/notify antes de mostrar PIX/cartão. Para a conta beta, interceptamos
+  // somente quando telefone E CPF conferem com o cadastro beta no banco.
+  app.use('/api/notify', async (req, res, next) => {
+    if (req.method !== 'POST') return next();
+    try {
+      const phone = normalizePhone(req.body?.tel);
+      if (phone !== BETA_TEST_PHONE) return next();
+
+      const paciente = await pacienteBetaPorDados(phone, req.body?.cpf);
+      if (!paciente) return next();
+
+      const beta = await criarOuReutilizarBeta({
+        paciente,
+        nome: req.body?.nome,
+        cpf: req.body?.cpf,
+        email: req.body?.email,
+        dataNascimento: req.body?.data_nascimento,
+        paraTerceiro: req.body?.atendimento_para_terceiro,
+      });
+
+      console.log(`[MOBILE-BETA] Atendimento #${beta.atendimentoId} criado/reutilizado sem cobrança`);
+      return res.json({
+        ok: true,
+        beta: true,
+        reutilizado: beta.reutilizado,
+        atendimentoId: beta.atendimentoId,
+        pagamentoConfirmado: true,
+        tipo: 'chat',
+      });
+    } catch (error) {
+      console.error('[MOBILE-BETA-NOTIFY]', error);
+      return res.status(500).json({ ok: false, error: 'Não foi possível iniciar o teste beta.' });
+    }
+  });
 
   app.post('/api/paciente/beta/iniciar', authPaciente, async (req, res) => {
     try {
       const paciente = await pacienteBeta(req.pacienteId);
       if (!paciente) return res.status(403).json({ ok: false, beta: false, error: 'Conta sem acesso ao modo beta' });
 
-      const admin = await medicoAdmin();
-      if (!admin) return res.status(409).json({ ok: false, error: 'Administrador médico indisponível para o teste' });
-
-      const phone = normalizePhone(paciente.tel);
-      const existente = await atendimentoBetaAtivo(phone);
-      if (existente) {
-        return res.json({
-          ok: true,
-          beta: true,
-          reutilizado: true,
-          atendimentoId: Number(existente.id),
-          pagamentoConfirmado: true,
-        });
-      }
-
-      const nome = String(req.body?.nome || paciente.nome || 'Paciente beta').trim().slice(0, 180);
-      const cpf = normalizeCpf(req.body?.cpf || paciente.cpf);
-      const email = String(req.body?.email || paciente.email || '').trim().slice(0, 240);
-      const dataNascimento = String(req.body?.dataNascimento || '').trim().slice(0, 20);
-      const paraTerceiro = !!req.body?.atendimentoParaTerceiro;
-
-      if (cpf.length !== 11) return res.status(400).json({ ok: false, error: 'CPF inválido para o teste' });
-
-      const { rows } = await pool.query(
-        `INSERT INTO fila_atendimentos
-           (nome,tel,tel_documentos,cpf,email,data_nascimento,tipo,triagem,queixa,
-            status,pagamento_status,pagamento_metodo,atendimento_para_terceiro,
-            prioridade_medico_id,prioridade_ate,prioridade_geral_notificada_em,criado_em)
-         VALUES
-           ($1,$2,$2,$3,$4,$5,'chat','(triagem em andamento)','(teste beta do app)',
-            'triagem','isento_admin','beta_test',$6,$7,NOW() + INTERVAL '100 years',NULL,NOW())
-         RETURNING id`,
-        [nome, phone, cpf, email, dataNascimento, paraTerceiro, admin.id],
-      );
+      const beta = await criarOuReutilizarBeta({
+        paciente,
+        nome: req.body?.nome,
+        cpf: req.body?.cpf,
+        email: req.body?.email,
+        dataNascimento: req.body?.dataNascimento,
+        paraTerceiro: req.body?.atendimentoParaTerceiro,
+      });
 
       return res.json({
         ok: true,
         beta: true,
-        reutilizado: false,
-        atendimentoId: Number(rows[0].id),
+        reutilizado: beta.reutilizado,
+        atendimentoId: beta.atendimentoId,
         pagamentoConfirmado: true,
       });
     } catch (error) {
