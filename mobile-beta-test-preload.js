@@ -25,6 +25,13 @@ function normalizeCpf(value) {
   return digits(value).slice(0, 11);
 }
 
+function etapaBeta(row) {
+  const status = String(row?.status || '').toLowerCase();
+  if (status === 'assumido' || row?.medico_id) return 'chat';
+  if (status === 'aguardando') return 'fila';
+  return 'triagem';
+}
+
 function authPaciente(req, res, next) {
   try {
     const raw = String(req.headers.authorization || '');
@@ -151,6 +158,28 @@ function installBetaTestRoutes(app) {
   if (app.locals.__mobileBetaTestInstalled) return;
   app.locals.__mobileBetaTestInstalled = true;
 
+  // Para a conta beta, a recuperação de atendimento considera SOMENTE atendimentos
+  // criados pelo modo beta. Isso impede que tentativas antigas de PIX pendente
+  // prendam o TestFlight na tela "Pagamento pendente".
+  app.get('/api/paciente/atendimento-em-andamento', authPaciente, async (req, res, next) => {
+    try {
+      const paciente = await pacienteBeta(req.pacienteId);
+      if (!paciente) return next();
+      const ativo = await atendimentoBetaAtivo(normalizePhone(paciente.tel));
+      if (!ativo) return res.json({ ok: true, atendimento: null });
+      return res.json({
+        ok: true,
+        atendimento: {
+          ...ativo,
+          etapa: etapaBeta(ativo),
+        },
+      });
+    } catch (error) {
+      console.error('[MOBILE-BETA-EM-ANDAMENTO]', error);
+      return res.status(500).json({ ok: false, error: 'Não foi possível recuperar o atendimento beta.' });
+    }
+  });
+
   app.use('/api/notify', async (req, res, next) => {
     if (req.method !== 'POST') return next();
     try {
@@ -184,8 +213,6 @@ function installBetaTestRoutes(app) {
     }
   });
 
-  // Se a compilação atual continuar a função de pagamento por alguns milissegundos
-  // após receber pagamentoConfirmado=true, bloqueamos qualquer chamada real aos provedores.
   app.use('/api/pagbank/order', async (req, res, next) => {
     if (req.method !== 'POST') return next();
     try {
