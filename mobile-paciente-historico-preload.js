@@ -1,3 +1,4 @@
+import './mobile-beta-test-preload.js';
 import express from 'express';
 import pg from 'pg';
 import jwt from 'jsonwebtoken';
@@ -73,8 +74,8 @@ async function atendimentoDoPaciente(pacienteId, atendimentoId) {
 function etapaDoAtendimento(row) {
   const status = String(row?.status || '').toLowerCase();
   const pagamento = String(row?.pagamento_status || '').toLowerCase();
-  const pagoOuIsento = pagamento === 'confirmado' || pagamento === 'isento_admin';
-  if (!pagoOuIsento) return 'pagamento';
+  const pagamentoLiberado = pagamento === 'confirmado' || pagamento === 'isento_admin';
+  if (!pagamentoLiberado) return 'pagamento';
   if (status === 'triagem' || status === 'pagamento_pendente') return 'triagem';
   if (status === 'assumido' || row?.medico_id) return 'chat';
   return 'fila';
@@ -150,7 +151,7 @@ function installPatientHistoryRoutes(app) {
         return res.json({ ok: true, atendimento: null });
       }
 
-      const beta = phone === BETA_TEST_PHONE;
+      const isBeta = phone === BETA_TEST_PHONE;
       const result = await pool.query(
         `SELECT
            (to_jsonb(f)->>'id')::int AS id,
@@ -187,7 +188,7 @@ function installPatientHistoryRoutes(app) {
           AND RIGHT(regexp_replace(COALESCE(to_jsonb(f)->>'tel',''), '\\D', '', 'g'), 11) = $2
         ORDER BY NULLIF(to_jsonb(f)->>'criado_em','')::timestamptz DESC NULLS LAST
         LIMIT 1`,
-        [cpf, phone, beta],
+        [cpf, phone, isBeta],
       );
 
       const row = result.rows[0];
