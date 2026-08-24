@@ -140,6 +140,66 @@ function installPatientHistoryRoutes(app) {
     }
   });
 
+  app.get('/api/paciente/documentos', authPaciente, async (req, res) => {
+    try {
+      const paciente = await pacienteAtual(req.pacienteId);
+      if (!paciente) return res.status(404).json({ ok: false, error: 'Paciente não encontrado' });
+
+      const phone = normalizePhone(paciente.tel);
+      const cpf = normalizeCpf(paciente.cpf);
+      if (phone.length < 10) return res.json({ ok: true, documentos: [] });
+
+      const result = await pool.query(
+        `SELECT
+           m.id,
+           m.atendimento_id,
+           m.arquivo_url,
+           m.arquivo_tipo,
+           m.arquivo_nome,
+           m.criado_em,
+           NULLIF(TRIM(COALESCE(to_jsonb(f)->>'medico_nome','')), '') AS profissional_nome,
+           COALESCE(
+             NULLIF(to_jsonb(f)->>'finalizado_em','')::timestamptz,
+             NULLIF(to_jsonb(f)->>'encerrado_em','')::timestamptz,
+             NULLIF(to_jsonb(f)->>'assumido_em','')::timestamptz,
+             NULLIF(to_jsonb(f)->>'criado_em','')::timestamptz,
+             m.criado_em
+           ) AS data_atendimento
+         FROM mensagens m
+         JOIN fila_atendimentos f ON f.id = m.atendimento_id
+        WHERE m.arquivo_url IS NOT NULL
+          AND LOWER(COALESCE(m.arquivo_tipo,'')) = 'pdf'
+          AND RIGHT(regexp_replace(COALESCE(to_jsonb(f)->>'tel',''), '\\D', '', 'g'), 11) = $1
+          AND (
+            $2 = '' OR
+            regexp_replace(COALESCE(to_jsonb(f)->>'cpf',''), '\\D', '', 'g') = $2 OR
+            regexp_replace(COALESCE(to_jsonb(f)->>'pagador_cpf',''), '\\D', '', 'g') = $2
+          )
+          AND COALESCE(to_jsonb(f)->>'status','') NOT IN ('cancelado','expirado')
+        ORDER BY m.criado_em DESC, m.id DESC
+        LIMIT 100`,
+        [phone, cpf],
+      );
+
+      const documentos = result.rows.map((row) => ({
+        id: row.id,
+        atendimento_id: row.atendimento_id,
+        arquivo_url: row.arquivo_url,
+        arquivo_tipo: row.arquivo_tipo || 'pdf',
+        arquivo_nome: row.arquivo_nome || 'Documento médico.pdf',
+        profissional_nome: row.profissional_nome || 'Profissional da ConsultaJá24h',
+        medico_nome: row.profissional_nome || null,
+        criado_em: row.criado_em,
+        data_atendimento: row.data_atendimento,
+      }));
+
+      return res.json({ ok: true, documentos });
+    } catch (error) {
+      console.error('[PACIENTE-DOCUMENTOS]', error);
+      return res.status(500).json({ ok: false, error: 'Não foi possível carregar seus documentos agora.' });
+    }
+  });
+
   app.get('/api/paciente/atendimento-em-andamento', authPaciente, async (req, res) => {
     try {
       const paciente = await pacienteAtual(req.pacienteId);
