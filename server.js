@@ -3967,6 +3967,9 @@ app.post("/api/chat/enviar", rlMensagem, async (req, res) => {
 
 app.get("/api/chat/:atendimentoId", async (req, res) => {
   try {
+    res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+    res.set("Pragma", "no-cache");
+    res.set("Expires", "0");
     const { atendimentoId } = req.params;
     const auth = req.headers["authorization"] || "";
     const token = auth.replace("Bearer ","").trim();
