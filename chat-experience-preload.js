@@ -53,6 +53,13 @@ function authPaciente(req, res, next) {
   }
 }
 
+function noStore(res) {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.set('Pragma', 'no-cache');
+  res.set('Expires', '0');
+  res.set('Surrogate-Control', 'no-store');
+}
+
 async function pacienteAtual(id) {
   const { rows } = await pool.query(
     'SELECT id, nome, email, cpf, tel FROM pacientes WHERE id=$1 LIMIT 1',
@@ -115,7 +122,8 @@ function installChatExperience(app) {
   // esta rota atende o painel sem exigir mudanças no contrato existente.
   app.get('/api/chat/:atendimentoId', async (req, res, next) => {
     try {
-      res.set('X-Chat-History-Version', '2026-08-24-preload-cors-fix');
+      noStore(res);
+      res.set('X-Chat-History-Version', '2026-08-24-preload-cors-nostore');
       await ensureChatSchema();
       const atendimentoId = Number(req.params.atendimentoId);
       if (!atendimentoId) return next();
@@ -159,6 +167,7 @@ function installChatExperience(app) {
 
   app.get('/api/paciente/atendimento/:id/chat-v2', authPaciente, async (req, res) => {
     try {
+      noStore(res);
       await ensureChatSchema();
       const atendimentoId = Number(req.params.id);
       if (!atendimentoId) return res.status(400).json({ ok: false, error: 'Atendimento inválido' });
@@ -198,6 +207,7 @@ function installChatExperience(app) {
 
   app.post('/api/paciente/atendimento/:id/chat-v2', express.json({ limit: '1mb' }), authPaciente, async (req, res) => {
     try {
+      noStore(res);
       await ensureChatSchema();
       const atendimentoId = Number(req.params.id);
       const texto = String(req.body?.texto || '').trim().slice(0, 3000);
