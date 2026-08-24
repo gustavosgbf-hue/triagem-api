@@ -1,4 +1,5 @@
 import express from 'express';
+import cors from 'cors';
 import pg from 'pg';
 import jwt from 'jsonwebtoken';
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
@@ -13,6 +14,15 @@ const pool = new Pool({
 const MEMED_API_URL = process.env.MEMED_API_URL || 'https://api.memed.com.br/v1';
 const MEMED_API_KEY = process.env.MEMED_API_KEY || '';
 const MEMED_SECRET_KEY = process.env.MEMED_SECRET_KEY || '';
+const panelCors = cors({
+  origin: [
+    'https://painel.consultaja24h.com.br',
+    'https://consultaja24h.com.br',
+    'https://www.consultaja24h.com.br',
+    /^https:\/\/.*\.pages\.dev$/,
+  ],
+  credentials: true,
+});
 
 const r2 = new S3Client({
   region: 'auto',
@@ -133,7 +143,8 @@ function installMemedChatRoutes(app) {
   if (app.locals.__memedChatInstalled) return;
   app.locals.__memedChatInstalled = true;
 
-  app.post('/api/memed/prescricao-chat', express.json({ limit: '64kb' }), authMedico, async (req, res) => {
+  app.options('/api/memed/prescricao-chat', panelCors);
+  app.post('/api/memed/prescricao-chat', panelCors, express.json({ limit: '64kb' }), authMedico, async (req, res) => {
     try {
       if (req.tipoProfissional !== 'medico') {
         return res.status(409).json({ ok: false, error: 'Envio automático disponível inicialmente no painel médico.' });
