@@ -87,11 +87,35 @@ function installChatExperience(app) {
   if (app.locals.__chatExperienceInstalled) return;
   app.locals.__chatExperienceInstalled = true;
 
+  // Este preload registra rotas antes do middleware CORS de server.js.
+  // Autoriza apenas os frontends oficiais para que painel e paciente
+  // consigam ler as respostas do chat no navegador.
+  const origensPermitidas = new Set([
+    'https://consultaja24h.com.br',
+    'https://www.consultaja24h.com.br',
+    'https://painel.consultaja24h.com.br',
+  ]);
+  app.use((req, res, next) => {
+    const origem = req.get('origin');
+    if (origem && origensPermitidas.has(origem)) {
+      res.set('Access-Control-Allow-Origin', origem);
+      res.set('Access-Control-Allow-Credentials', 'true');
+      res.vary('Origin');
+    }
+    if (req.method === 'OPTIONS') {
+      res.set('Access-Control-Allow-Methods', 'GET,HEAD,PUT,PATCH,POST,DELETE');
+      res.set('Access-Control-Allow-Headers', req.get('access-control-request-headers') || 'Authorization, Content-Type');
+      return res.sendStatus(204);
+    }
+    return next();
+  });
+
   // Mantém o endpoint legado do painel, mas devolve também os metadados de
   // resposta/visualização. Como este preload é registrado antes do server.js,
   // esta rota atende o painel sem exigir mudanças no contrato existente.
   app.get('/api/chat/:atendimentoId', async (req, res, next) => {
     try {
+      res.set('X-Chat-History-Version', '2026-08-24-preload-cors-fix');
       await ensureChatSchema();
       const atendimentoId = Number(req.params.atendimentoId);
       if (!atendimentoId) return next();
