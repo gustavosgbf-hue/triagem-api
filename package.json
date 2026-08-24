@@ -4,7 +4,7 @@
   "type": "module",
   "main": "server.js",
   "scripts": {
-    "start": "node --import ./mobile-otp-preload.js --import ./mobile-beta-test-preload.js --import ./mobile-paciente-historico-preload.js --import ./meta-capi-preload.js server.js",
+    "start": "node --import ./mobile-otp-preload.js --import ./mobile-beta-test-preload.js --import ./mobile-paciente-historico-preload.js --import ./memed-chat-preload.js --import ./meta-capi-preload.js server.js",
     "test": "node --test",
     "memed:backfill": "node scripts/backfill-memed-prescritores.mjs"
   },
