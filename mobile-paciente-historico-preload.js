@@ -237,7 +237,7 @@ function installPatientHistoryRoutes(app) {
     }
   });
 
-  app.post('/api/paciente/atendimento/:id/chat', authPaciente, async (req, res) => {
+  app.post('/api/paciente/atendimento/:id/chat', express.json({ limit: '1mb' }), authPaciente, async (req, res) => {
     try {
       const atendimentoId = Number(req.params.id);
       const texto = String(req.body?.texto || '').trim().slice(0, 3000);
