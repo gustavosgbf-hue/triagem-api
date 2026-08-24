@@ -23,18 +23,51 @@ jobs:
 
           memed = Path('memed-chat-preload.js')
           text = memed.read_text(encoding='utf-8')
-          old = """      const arquivoNome = `Receita_Memed_${safePrescriptionId}.pdf`;\n\n      const { rows: existingRows } = await pool.query(\n        `SELECT id,atendimento_id,autor,texto,arquivo_url,arquivo_tipo,arquivo_nome,criado_em\n           FROM mensagens\n          WHERE atendimento_id=$1 AND autor='medico' AND arquivo_nome=$2\n          ORDER BY id DESC\n          LIMIT 1`,\n        [atendimentoId, arquivoNome],\n      );\n      if (existingRows[0]) {\n        return res.json({ ok: true, reutilizado: true, mensagem: existingRows[0] });\n      }\n"""
-          new = """      const { rows: existingRows } = await pool.query(\n        `SELECT id,atendimento_id,autor,texto,arquivo_url,arquivo_tipo,arquivo_nome,criado_em\n           FROM mensagens\n          WHERE atendimento_id=$1\n            AND autor='medico'\n            AND arquivo_tipo='pdf'\n            AND arquivo_url LIKE '%/chat/memed/%'\n            AND arquivo_url LIKE $2\n          ORDER BY id DESC\n          LIMIT 1`,\n        [atendimentoId, `%/${safePrescriptionId}-%`],\n      );\n      if (existingRows[0]) {\n        return res.json({ ok: true, reutilizado: true, mensagem: existingRows[0] });\n      }\n\n      const agora = new Date();\n      const partes = new Intl.DateTimeFormat('pt-BR', {\n        timeZone: 'America/Fortaleza',\n        day: '2-digit', month: '2-digit', year: 'numeric',\n        hour: '2-digit', minute: '2-digit', second: '2-digit',\n        hour12: false,\n      }).formatToParts(agora).reduce((acc, p) => ({ ...acc, [p.type]: p.value }), {});\n      const arquivoNome = `Documento_Medico_${partes.day}-${partes.month}-${partes.year}_${partes.hour}-${partes.minute}-${partes.second}.pdf`;\n"""
-          if old not in text:
-              raise SystemExit('Expected Memed filename block not found')
-          text = text.replace(old, new, 1)
-          text = text.replace("""        ContentType: 'application/pdf',\n      }));""", """        ContentType: 'application/pdf',\n        ContentDisposition: `inline; filename=\"${arquivoNome}\"`,\n      }));""", 1)
+
+          if 'Documento_Medico_${partes.day}' not in text:
+              text = text.replace(
+                  "      const arquivoNome = `Receita_Memed_${safePrescriptionId}.pdf`;\n",
+                  """      const agora = new Date();
+      const partes = new Intl.DateTimeFormat('pt-BR', {
+        timeZone: 'America/Fortaleza',
+        day: '2-digit', month: '2-digit', year: 'numeric',
+        hour: '2-digit', minute: '2-digit', second: '2-digit',
+        hour12: false,
+      }).formatToParts(agora).reduce((acc, p) => ({ ...acc, [p.type]: p.value }), {});
+      const arquivoNome = `Documento_Medico_${partes.day}-${partes.month}-${partes.year}_${partes.hour}-${partes.minute}-${partes.second}.pdf`;
+""",
+                  1,
+              )
+
+              text = text.replace(
+                  "          WHERE atendimento_id=$1 AND autor='medico' AND arquivo_nome=$2\n",
+                  """          WHERE atendimento_id=$1
+            AND autor='medico'
+            AND arquivo_tipo='pdf'
+            AND arquivo_url LIKE '%/chat/memed/%'
+            AND arquivo_url LIKE $2
+""",
+                  1,
+              )
+              text = text.replace(
+                  "        [atendimentoId, arquivoNome],\n",
+                  "        [atendimentoId, `%/${safePrescriptionId}-%`],\n",
+                  1,
+              )
+              text = text.replace(
+                  "        ContentType: 'application/pdf',\n",
+                  "        ContentType: 'application/pdf',\n        ContentDisposition: `inline; filename=\"${arquivoNome}\"`,\n",
+                  1,
+              )
+
+          if 'Documento_Medico_${partes.day}' not in text:
+              raise SystemExit('Could not patch Memed filename')
           memed.write_text(text, encoding='utf-8')
 
           hist = Path('mobile-paciente-historico-preload.js')
           text = hist.read_text(encoding='utf-8')
-          marker = """  app.get('/api/paciente/atendimento-em-andamento', authPaciente, async (req, res) => {"""
-          route = r"""
+          marker = "  app.get('/api/paciente/atendimento-em-andamento', authPaciente, async (req, res) => {"
+          route = r'''
   app.get('/api/paciente/documentos', authPaciente, async (req, res) => {
     try {
       const paciente = await pacienteAtual(req.pacienteId);
@@ -95,12 +128,12 @@ jobs:
     }
   });
 
-"""
-          if marker not in text:
-              raise SystemExit('Patient history insertion point not found')
-          if "/api/paciente/documentos" not in text:
+'''
+          if '/api/paciente/documentos' not in text:
+              if marker not in text: raise SystemExit('Patient history insertion point not found')
               text = text.replace(marker, route + marker, 1)
           hist.write_text(text, encoding='utf-8')
+
       - name: Commit changes
         run: |
           git config user.name "github-actions[bot]"
