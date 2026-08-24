@@ -157,7 +157,7 @@ function installBetaTestRoutes(app) {
   app.locals.__mobileBetaTestInstalled = true;
 
   app.get('/api/mobile-beta-health', (_req, res) => {
-    return res.json({ ok: true, betaModule: true, version: 'elektra-phone-only-v2' });
+    return res.json({ ok: true, betaModule: true, version: 'elektra-pix-paid-v3' });
   });
 
   app.get('/api/paciente/atendimento-em-andamento', authPaciente, async (req, res, next) => {
@@ -166,13 +166,7 @@ function installBetaTestRoutes(app) {
       if (!paciente) return next();
       const ativo = await atendimentoBetaAtivo(normalizePhone(paciente.tel));
       if (!ativo) return res.json({ ok: true, atendimento: null });
-      return res.json({
-        ok: true,
-        atendimento: {
-          ...ativo,
-          etapa: etapaBeta(ativo),
-        },
-      });
+      return res.json({ ok: true, atendimento: { ...ativo, etapa: etapaBeta(ativo) } });
     } catch (error) {
       console.error('[MOBILE-BETA-EM-ANDAMENTO]', error);
       return res.status(500).json({ ok: false, error: 'Não foi possível recuperar o atendimento beta.' });
@@ -184,12 +178,8 @@ function installBetaTestRoutes(app) {
     try {
       const phone = normalizePhone(req.body?.tel);
       if (phone !== BETA_TEST_PHONE) return next();
-
       const paciente = await pacienteBetaPorTelefone(phone);
-      if (!paciente) {
-        console.warn('[MOBILE-BETA-NOTIFY] Número beta recebido, mas nenhum paciente foi encontrado no cadastro');
-        return res.status(409).json({ ok: false, error: 'Conta beta não encontrada no cadastro de pacientes.' });
-      }
+      if (!paciente) return res.status(409).json({ ok: false, error: 'Conta beta não encontrada no cadastro de pacientes.' });
 
       const beta = await criarOuReutilizarBeta({
         paciente,
@@ -201,14 +191,7 @@ function installBetaTestRoutes(app) {
       });
 
       console.log(`[MOBILE-BETA] Atendimento #${beta.atendimentoId} criado/reutilizado sem cobrança`);
-      return res.json({
-        ok: true,
-        beta: true,
-        reutilizado: beta.reutilizado,
-        atendimentoId: beta.atendimentoId,
-        pagamentoConfirmado: true,
-        tipo: 'chat',
-      });
+      return res.json({ ok: true, beta: true, reutilizado: beta.reutilizado, atendimentoId: beta.atendimentoId, pagamentoConfirmado: true, tipo: 'chat' });
     } catch (error) {
       console.error('[MOBILE-BETA-NOTIFY]', error);
       return res.status(500).json({ ok: false, error: 'Não foi possível iniciar o teste beta.' });
@@ -220,15 +203,27 @@ function installBetaTestRoutes(app) {
     try {
       const beta = await atendimentoBetaPorId(req.body?.atendimentoId);
       if (!beta) return next();
-      return res.json({
-        ok: true,
-        order_id: `BETA-${beta.id}`,
-        qr_code_text: `TESTE-BETA-${beta.id}-SEM-COBRANCA`,
-        valor: 0,
-      });
+      return res.json({ ok: true, order_id: `BETA-${beta.id}`, qr_code_text: `TESTE-BETA-${beta.id}-SEM-COBRANCA`, valor: 0 });
     } catch (error) {
       console.error('[MOBILE-BETA-PAGBANK]', error);
       return res.status(500).json({ ok: false, error: 'Falha ao proteger o pagamento beta.' });
+    }
+  });
+
+  // A compilação atual continua na tela de PIX mesmo depois de receber
+  // pagamentoConfirmado=true. Quando ela consulta o PIX falso BETA-<id>,
+  // respondemos como já pago para disparar onPagamentoConfirmado e abrir a triagem.
+  app.get('/api/pagbank/order/:orderId', async (req, res, next) => {
+    try {
+      const orderId = String(req.params.orderId || '');
+      const match = /^BETA-(\d+)$/.exec(orderId);
+      if (!match) return next();
+      const beta = await atendimentoBetaPorId(Number(match[1]));
+      if (!beta) return next();
+      return res.json({ ok: true, pago: true, status: 'PAID', beta: true });
+    } catch (error) {
+      console.error('[MOBILE-BETA-PAGBANK-STATUS]', error);
+      return res.status(500).json({ ok: false, error: 'Falha ao confirmar o PIX beta.' });
     }
   });
 
@@ -248,7 +243,6 @@ function installBetaTestRoutes(app) {
     try {
       const paciente = await pacienteBeta(req.pacienteId);
       if (!paciente) return res.status(403).json({ ok: false, beta: false, error: 'Conta sem acesso ao modo beta' });
-
       const beta = await criarOuReutilizarBeta({
         paciente,
         nome: req.body?.nome,
@@ -257,14 +251,7 @@ function installBetaTestRoutes(app) {
         dataNascimento: req.body?.dataNascimento,
         paraTerceiro: req.body?.atendimentoParaTerceiro,
       });
-
-      return res.json({
-        ok: true,
-        beta: true,
-        reutilizado: beta.reutilizado,
-        atendimentoId: beta.atendimentoId,
-        pagamentoConfirmado: true,
-      });
+      return res.json({ ok: true, beta: true, reutilizado: beta.reutilizado, atendimentoId: beta.atendimentoId, pagamentoConfirmado: true });
     } catch (error) {
       console.error('[MOBILE-BETA-INICIAR]', error);
       return res.status(500).json({ ok: false, error: 'Não foi possível iniciar o teste beta.' });
@@ -276,10 +263,8 @@ function installBetaTestRoutes(app) {
     try {
       const atendimentoId = Number(req.body?.atendimentoId);
       if (!atendimentoId) return next();
-
       const row = await atendimentoBetaPorId(atendimentoId);
       if (!row) return next();
-
       const admin = await medicoAdmin();
       if (!admin) return res.status(409).json({ ok: false, error: 'Administrador médico indisponível para o teste' });
 
