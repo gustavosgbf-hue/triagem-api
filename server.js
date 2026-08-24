@@ -3967,6 +3967,20 @@ app.post("/api/chat/enviar", rlMensagem, async (req, res) => {
 
 app.get("/api/chat/:atendimentoId", async (req, res) => {
   try {
+    // Esta rota passa também pela política global de CORS, mas o proxy de produção
+    // estava removendo os cabeçalhos apenas desta resposta. Reafirma somente as
+    // origens oficiais para que paciente e painel consigam ler o histórico.
+    const origem = req.get("origin");
+    const origensChatPermitidas = new Set([
+      "https://consultaja24h.com.br",
+      "https://www.consultaja24h.com.br",
+      "https://painel.consultaja24h.com.br",
+    ]);
+    if (origem && origensChatPermitidas.has(origem)) {
+      res.set("Access-Control-Allow-Origin", origem);
+      res.set("Access-Control-Allow-Credentials", "true");
+      res.vary("Origin");
+    }
     res.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
     res.set("Pragma", "no-cache");
     res.set("Expires", "0");
