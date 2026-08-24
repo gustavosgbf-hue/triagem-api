@@ -3967,6 +3967,7 @@ app.post("/api/chat/enviar", rlMensagem, async (req, res) => {
 
 app.get("/api/chat/:atendimentoId", async (req, res) => {
   try {
+    res.set("X-Chat-History-Version", "2026-08-24-cors-fix");
     // Esta rota passa também pela política global de CORS, mas o proxy de produção
     // estava removendo os cabeçalhos apenas desta resposta. Reafirma somente as
     // origens oficiais para que paciente e painel consigam ler o histórico.
