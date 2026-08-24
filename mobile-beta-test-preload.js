@@ -61,18 +61,16 @@ async function pacienteBeta(pacienteId) {
   return normalizePhone(paciente.tel) === BETA_TEST_PHONE ? paciente : null;
 }
 
-async function pacienteBetaPorDados(phone, cpf) {
+async function pacienteBetaPorTelefone(phone) {
   const tel = normalizePhone(phone);
-  const cpfLimpo = normalizeCpf(cpf);
-  if (tel !== BETA_TEST_PHONE || cpfLimpo.length !== 11) return null;
+  if (tel !== BETA_TEST_PHONE) return null;
   const { rows } = await pool.query(
     `SELECT id,nome,email,cpf,tel
        FROM pacientes p
       WHERE RIGHT(regexp_replace(COALESCE(p.tel,''), '\\D', '', 'g'), 11)=$1
-        AND regexp_replace(COALESCE(p.cpf,''), '\\D', '', 'g')=$2
       ORDER BY id DESC
       LIMIT 1`,
-    [tel, cpfLimpo],
+    [tel],
   );
   return rows[0] || null;
 }
@@ -158,9 +156,10 @@ function installBetaTestRoutes(app) {
   if (app.locals.__mobileBetaTestInstalled) return;
   app.locals.__mobileBetaTestInstalled = true;
 
-  // Para a conta beta, a recuperação de atendimento considera SOMENTE atendimentos
-  // criados pelo modo beta. Isso impede que tentativas antigas de PIX pendente
-  // prendam o TestFlight na tela "Pagamento pendente".
+  app.get('/api/mobile-beta-health', (_req, res) => {
+    return res.json({ ok: true, betaModule: true, version: 'elektra-phone-only-v2' });
+  });
+
   app.get('/api/paciente/atendimento-em-andamento', authPaciente, async (req, res, next) => {
     try {
       const paciente = await pacienteBeta(req.pacienteId);
@@ -186,13 +185,16 @@ function installBetaTestRoutes(app) {
       const phone = normalizePhone(req.body?.tel);
       if (phone !== BETA_TEST_PHONE) return next();
 
-      const paciente = await pacienteBetaPorDados(phone, req.body?.cpf);
-      if (!paciente) return next();
+      const paciente = await pacienteBetaPorTelefone(phone);
+      if (!paciente) {
+        console.warn('[MOBILE-BETA-NOTIFY] Número beta recebido, mas nenhum paciente foi encontrado no cadastro');
+        return res.status(409).json({ ok: false, error: 'Conta beta não encontrada no cadastro de pacientes.' });
+      }
 
       const beta = await criarOuReutilizarBeta({
         paciente,
         nome: req.body?.nome,
-        cpf: req.body?.cpf,
+        cpf: req.body?.cpf || paciente.cpf,
         email: req.body?.email,
         dataNascimento: req.body?.data_nascimento,
         paraTerceiro: req.body?.atendimento_para_terceiro,
@@ -250,7 +252,7 @@ function installBetaTestRoutes(app) {
       const beta = await criarOuReutilizarBeta({
         paciente,
         nome: req.body?.nome,
-        cpf: req.body?.cpf,
+        cpf: req.body?.cpf || paciente.cpf,
         email: req.body?.email,
         dataNascimento: req.body?.dataNascimento,
         paraTerceiro: req.body?.atendimentoParaTerceiro,
