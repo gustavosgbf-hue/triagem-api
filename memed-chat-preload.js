@@ -139,6 +139,23 @@ async function baixarPdf(url) {
   return buffer;
 }
 
+function nomeDocumentoMedico() {
+  const partes = new Intl.DateTimeFormat('pt-BR', {
+    timeZone: 'America/Fortaleza',
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  }).formatToParts(new Date()).reduce((acc, parte) => {
+    acc[parte.type] = parte.value;
+    return acc;
+  }, {});
+  return `Documento_Medico_${partes.day}-${partes.month}-${partes.year}_${partes.hour}-${partes.minute}-${partes.second}.pdf`;
+}
+
 function installMemedChatRoutes(app) {
   if (app.locals.__memedChatInstalled) return;
   app.locals.__memedChatInstalled = true;
@@ -170,20 +187,24 @@ function installMemedChatRoutes(app) {
 
       const safePrescriptionId = prescriptionId.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 80);
       if (!safePrescriptionId) return res.status(400).json({ ok: false, error: 'Identificador de prescrição inválido.' });
-      const arquivoNome = `Receita_Memed_${safePrescriptionId}.pdf`;
 
       const { rows: existingRows } = await pool.query(
         `SELECT id,atendimento_id,autor,texto,arquivo_url,arquivo_tipo,arquivo_nome,criado_em
            FROM mensagens
-          WHERE atendimento_id=$1 AND autor='medico' AND arquivo_nome=$2
+          WHERE atendimento_id=$1
+            AND autor='medico'
+            AND arquivo_tipo='pdf'
+            AND arquivo_url LIKE '%/chat/memed/%'
+            AND arquivo_url LIKE $2
           ORDER BY id DESC
           LIMIT 1`,
-        [atendimentoId, arquivoNome],
+        [atendimentoId, `%/${safePrescriptionId}-%`],
       );
       if (existingRows[0]) {
         return res.json({ ok: true, reutilizado: true, mensagem: existingRows[0] });
       }
 
+      const arquivoNome = nomeDocumentoMedico();
       const token = await tokenMemedMedico(req.medicoId);
       const remotePdfUrl = await urlPdfMemed(safePrescriptionId, token);
       const pdf = await baixarPdf(remotePdfUrl);
@@ -194,6 +215,7 @@ function installMemedChatRoutes(app) {
         Key: key,
         Body: pdf,
         ContentType: 'application/pdf',
+        ContentDisposition: `inline; filename="${arquivoNome}"`,
       }));
       const publicBase = String(process.env.R2_PUBLIC_URL || '').replace(/\/$/, '');
       if (!publicBase) throw new Error('R2_PUBLIC_URL não configurada');
@@ -206,11 +228,11 @@ function installMemedChatRoutes(app) {
         [atendimentoId, req.medicoId, arquivoUrl, arquivoNome],
       );
 
-      console.log(`[MEMED-CHAT] Prescrição ${safePrescriptionId} enviada ao atendimento #${atendimentoId}`);
+      console.log(`[MEMED-CHAT] Documento ${safePrescriptionId} enviado ao atendimento #${atendimentoId}`);
       return res.json({ ok: true, reutilizado: false, mensagem: rows[0] });
     } catch (error) {
       console.error('[MEMED-CHAT]', error?.message || error);
-      return res.status(502).json({ ok: false, error: error?.message || 'Não foi possível enviar a receita ao chat.' });
+      return res.status(502).json({ ok: false, error: error?.message || 'Não foi possível enviar o documento ao chat.' });
     }
   });
 }
