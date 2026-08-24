@@ -32,6 +32,14 @@ function etapaBeta(row) {
   return 'triagem';
 }
 
+function triagemBetaConcluida(row) {
+  const triagem = String(row?.triagem || '').trim().toLowerCase();
+  if (!triagem) return false;
+  return !triagem.startsWith('(triagem em andamento)')
+    && !triagem.startsWith('(aguardando triagem')
+    && !triagem.startsWith('(pagamento confirmado');
+}
+
 function authPaciente(req, res, next) {
   try {
     const raw = String(req.headers.authorization || '');
@@ -121,6 +129,36 @@ async function atendimentoBetaPorId(atendimentoId) {
   return row;
 }
 
+async function liberarBetaParaAdminSeConcluido(row) {
+  if (!row || String(row.status || '').toLowerCase() !== 'triagem' || !triagemBetaConcluida(row)) {
+    return row;
+  }
+
+  const admin = await medicoAdmin();
+  if (!admin) throw new Error('Administrador médico indisponível para o teste');
+
+  const { rows } = await pool.query(
+    `UPDATE fila_atendimentos
+        SET status='aguardando',
+            pagamento_status='isento_admin',
+            pagamento_metodo='beta_test',
+            prioridade_medico_id=$2,
+            prioridade_ate=NOW() + INTERVAL '100 years',
+            prioridade_geral_notificada_em=NULL
+      WHERE id=$1
+        AND status='triagem'
+        AND pagamento_metodo='beta_test'
+      RETURNING *`,
+    [row.id, admin.id],
+  );
+
+  const atualizado = rows[0] || row;
+  if (rows[0]) {
+    console.log(`[MOBILE-BETA] Atendimento #${row.id} recuperado da triagem e liberado somente para o admin ${admin.id}`);
+  }
+  return atualizado;
+}
+
 async function criarOuReutilizarBeta({ paciente, nome, cpf, email, dataNascimento, paraTerceiro }) {
   const admin = await medicoAdmin();
   if (!admin) throw new Error('Administrador médico indisponível para o teste');
@@ -157,15 +195,16 @@ function installBetaTestRoutes(app) {
   app.locals.__mobileBetaTestInstalled = true;
 
   app.get('/api/mobile-beta-health', (_req, res) => {
-    return res.json({ ok: true, betaModule: true, version: 'elektra-pix-paid-v3' });
+    return res.json({ ok: true, betaModule: true, version: 'elektra-queue-recovery-v4' });
   });
 
   app.get('/api/paciente/atendimento-em-andamento', authPaciente, async (req, res, next) => {
     try {
       const paciente = await pacienteBeta(req.pacienteId);
       if (!paciente) return next();
-      const ativo = await atendimentoBetaAtivo(normalizePhone(paciente.tel));
+      let ativo = await atendimentoBetaAtivo(normalizePhone(paciente.tel));
       if (!ativo) return res.json({ ok: true, atendimento: null });
+      ativo = await liberarBetaParaAdminSeConcluido(ativo);
       return res.json({ ok: true, atendimento: { ...ativo, etapa: etapaBeta(ativo) } });
     } catch (error) {
       console.error('[MOBILE-BETA-EM-ANDAMENTO]', error);
@@ -210,9 +249,6 @@ function installBetaTestRoutes(app) {
     }
   });
 
-  // A compilação atual continua na tela de PIX mesmo depois de receber
-  // pagamentoConfirmado=true. Quando ela consulta o PIX falso BETA-<id>,
-  // respondemos como já pago para disparar onPagamentoConfirmado e abrir a triagem.
   app.get('/api/pagbank/order/:orderId', async (req, res, next) => {
     try {
       const orderId = String(req.params.orderId || '');
