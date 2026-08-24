@@ -87,28 +87,50 @@ function installChatExperience(app) {
   if (app.locals.__chatExperienceInstalled) return;
   app.locals.__chatExperienceInstalled = true;
 
-  // O painel médico já consulta /api/chat/:id. Ao abrir/polling do chat,
-  // marcamos como visualizadas as mensagens do paciente sem alterar o contrato antigo.
-  app.use('/api/chat', async (req, _res, next) => {
+  // Mantém o endpoint legado do painel, mas devolve também os metadados de
+  // resposta/visualização. Como este preload é registrado antes do server.js,
+  // esta rota atende o painel sem exigir mudanças no contrato existente.
+  app.get('/api/chat/:atendimentoId', async (req, res, next) => {
     try {
-      if (req.method !== 'GET') return next();
-      const match = String(req.path || '').match(/^\/(\d+)\/?$/);
-      if (!match) return next();
-      const raw = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
-      if (!raw) return next();
-      const decoded = jwt.verify(raw, process.env.JWT_SECRET || '');
-      if (!decoded?.id || decoded?.tipo === 'paciente') return next();
       await ensureChatSchema();
-      await pool.query(
-        `UPDATE mensagens
-            SET lido_medico_em = COALESCE(lido_medico_em, NOW())
-          WHERE atendimento_id=$1 AND autor='paciente'`,
-        [Number(match[1])],
+      const atendimentoId = Number(req.params.atendimentoId);
+      if (!atendimentoId) return next();
+
+      const raw = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
+      let decoded = null;
+      if (raw) {
+        try { decoded = jwt.verify(raw, process.env.JWT_SECRET || ''); } catch {}
+      }
+
+      let autorizado = !!decoded;
+      if (!autorizado) {
+        const check = await pool.query('SELECT id FROM fila_atendimentos WHERE id=$1', [atendimentoId]);
+        autorizado = check.rowCount > 0;
+      }
+      if (!autorizado) return res.status(403).json({ ok: false, error: 'Acesso negado' });
+
+      if (decoded?.id && decoded?.tipo !== 'paciente') {
+        await pool.query(
+          `UPDATE mensagens
+              SET lido_medico_em = COALESCE(lido_medico_em, NOW())
+            WHERE atendimento_id=$1 AND autor='paciente'`,
+          [atendimentoId],
+        );
+      }
+
+      const { rows } = await pool.query(
+        `SELECT id, atendimento_id, autor, texto, arquivo_url, arquivo_tipo, arquivo_nome,
+                criado_em, reply_to_id, lido_paciente_em, lido_medico_em
+           FROM mensagens
+          WHERE atendimento_id=$1
+          ORDER BY criado_em ASC, id ASC`,
+        [atendimentoId],
       );
-    } catch {
-      // Nunca bloquear a leitura do chat legado por falha no recibo.
+      return res.json({ ok: true, mensagens: rows });
+    } catch (error) {
+      console.error('[CHAT-LEGACY-V2]', error);
+      return next();
     }
-    next();
   });
 
   app.get('/api/paciente/atendimento/:id/chat-v2', authPaciente, async (req, res) => {
