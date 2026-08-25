@@ -76,6 +76,25 @@ function ensureProfileSchema() {
   return profileReadyPromise;
 }
 
+let deletionReadyPromise;
+function ensureDeletionSchema() {
+  if (!deletionReadyPromise) {
+    deletionReadyPromise = pool.query(`
+      CREATE TABLE IF NOT EXISTS patient_account_deletion_requests (
+        id BIGSERIAL PRIMARY KEY,
+        patient_id BIGINT NOT NULL UNIQUE,
+        status TEXT NOT NULL DEFAULT 'pending',
+        requested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `).catch((error) => {
+      deletionReadyPromise = null;
+      throw error;
+    });
+  }
+  return deletionReadyPromise;
+}
+
 async function getPatient(id) {
   await ensureProfileSchema();
   const result = await pool.query(
@@ -128,6 +147,37 @@ function installPatientProfileRoutes(app) {
     } catch (error) {
       console.error('[PACIENTE-PERFIL-POST]', error);
       return res.status(500).json({ ok: false, error: 'Não foi possível salvar os dados do paciente agora.' });
+    }
+  });
+
+  app.post('/api/paciente/exclusao-conta', JSON_BODY, authPaciente, async (req, res) => {
+    try {
+      await ensureDeletionSchema();
+      const paciente = await getPatient(req.pacienteId);
+      if (!paciente) return res.status(404).json({ ok: false, error: 'Paciente não encontrado' });
+
+      const result = await pool.query(
+        `INSERT INTO patient_account_deletion_requests (patient_id, status, requested_at, updated_at)
+         VALUES ($1, 'pending', NOW(), NOW())
+         ON CONFLICT (patient_id)
+         DO UPDATE SET status='pending', requested_at=NOW(), updated_at=NOW()
+         RETURNING id, status, requested_at`,
+        [req.pacienteId],
+      );
+
+      console.log('[PACIENTE-EXCLUSAO-CONTA]', {
+        patient_id: req.pacienteId,
+        request_id: result.rows[0]?.id,
+      });
+
+      return res.json({
+        ok: true,
+        solicitacao: result.rows[0],
+        message: 'Solicitação de exclusão registrada. Dados médicos sujeitos a obrigação legal de guarda poderão ser preservados pelo prazo aplicável.',
+      });
+    } catch (error) {
+      console.error('[PACIENTE-EXCLUSAO-CONTA]', error);
+      return res.status(500).json({ ok: false, error: 'Não foi possível registrar a solicitação de exclusão agora.' });
     }
   });
 }
