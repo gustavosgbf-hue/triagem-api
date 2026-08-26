@@ -8919,12 +8919,8 @@ app.post("/api/atendimento/encerrar", async (req, res) => {
       return res.status(404).json({ ok: false, error: "Atendimento nao encontrado" });
     }
     const medicoEmail = responsavel.rows[0].medico_email;
-    let exibirAvaliacao = true;
-    if (medicoEmail === "anavaleriabrandao@hotmail.com") {
-      exibirAvaliacao = false;
-    } else if (medicoEmail === "gustavosgbf@gmail.com") {
-      exibirAvaliacao = mostrar_avaliacao_google === true;
-    }
+    const exibirAvaliacao = medicoEmail === ADMIN_MEDICO_EMAIL
+      && mostrar_avaliacao_google === true;
     const result = await pool.query(
       `UPDATE fila_atendimentos
           SET status='encerrado',encerrado_em=NOW(),status_atendimento=$2,
