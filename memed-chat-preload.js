@@ -108,7 +108,9 @@ async function tokenMemedMedico(medicoId) {
 }
 
 async function urlPdfMemed(prescriptionId, token) {
-  const waits = [0, 2000, 5000, 9000];
+  // A Memed pode disparar prescricaoImpressa antes do PDF final estar disponível.
+  // Mantemos a busca por até ~37s; o painel ainda possui retries externos.
+  const waits = [0, 2000, 5000, 10000, 20000];
   let lastStatus = 0;
   for (const wait of waits) {
     if (wait) await sleep(wait);
