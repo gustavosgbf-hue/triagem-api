@@ -50,3 +50,49 @@ test('atendimento para terceiro exige nome e nascimento', () => {
   );
   assert.equal(patientMatch.strong, true);
 });
+
+test('mãe e filho com o mesmo telefone não têm histórico misturado', () => {
+  const result = identitySignals(
+    { nome: 'Maria da Silva', cpf: '52998224725', tel: '98999990000' },
+    { nome: 'João da Silva', cpf: '11144477735', tel: '98999990000' },
+  );
+  assert.equal(result.phoneMatch, true);
+  assert.equal(result.cpfMatch, false);
+  assert.equal(result.strong, false);
+});
+
+test('marido e esposa com contato compartilhado continuam separados', () => {
+  const result = identitySignals(
+    { nome: 'Ana Souza', data_nascimento: '1990-02-10', tel: '98988880000' },
+    { nome: 'Carlos Souza', data_nascimento: '1988-07-04', tel: '98988880000' },
+  );
+  assert.equal(result.phoneMatch, true);
+  assert.equal(result.dobMatch, false);
+  assert.equal(result.strong, false);
+});
+
+test('CPF do pagador não identifica automaticamente paciente terceiro', () => {
+  const result = identitySignals(
+    {
+      nome: 'Criança Souza',
+      data_nascimento: '2018-03-12',
+      cpf: '11144477735',
+      tel: '98977770000',
+      atendimento_para_terceiro: true,
+      pagador_cpf: '52998224725',
+    },
+    { nome: 'Maria Souza', cpf: '52998224725', tel: '98977770000' },
+  );
+  assert.equal(result.phoneMatch, true);
+  assert.equal(result.strong, false);
+});
+
+test('mesmo telefone com CPF diferente não é identidade forte', () => {
+  const result = identitySignals(
+    { nome: 'Pessoa Um', cpf: '52998224725', tel: '98966660000' },
+    { nome: 'Pessoa Dois', cpf: '11144477735', tel: '98966660000' },
+  );
+  assert.equal(result.phoneMatch, true);
+  assert.equal(result.cpfMatch, false);
+  assert.equal(result.strong, false);
+});

@@ -14,6 +14,10 @@ import multer from "multer";
 import { createHash, randomUUID } from "crypto";
 import rateLimit from "express-rate-limit";
 import {
+  canResumePaidAttendance,
+  createPublicPatientLookupHandler,
+} from "./patient-identity-security.js";
+import {
   codigoErroMemed,
   encontrarIngredienteExato,
   extrairTermosAlergia,
@@ -1984,10 +1988,9 @@ function responderLimiteAtendimentos(res, limite) {
   });
 }
 
-async function buscarAtendimentoPagoAtivoPorIdentidade({ cpf, tel, especialidade }) {
+async function buscarAtendimentoPagoAtivoPorIdentidade({ cpf, especialidade, atendimentoParaTerceiro }) {
   const cpfLimpo = String(cpf || "").replace(/\D/g, "");
-  const telLimpo = String(tel || "").replace(/\D/g, "");
-  if (!cpfLimpo && !telLimpo) return null;
+  if (!canResumePaidAttendance({ cpf: cpfLimpo, atendimentoParaTerceiro })) return null;
   const especialidadeLimpa = normalizarEspecialidadeImediata(especialidade) || "";
   const { rows } = await pool.query(
     `SELECT id,nome,tel,cpf,email,tipo,status,pagamento_status,
@@ -1996,16 +1999,13 @@ async function buscarAtendimentoPagoAtivoPorIdentidade({ cpf, tel, especialidade
        FROM fila_atendimentos
       WHERE pagamento_status='confirmado'
         AND status IN ('triagem','aguardando','assumido')
+        AND COALESCE(atendimento_para_terceiro,false)=false
         AND COALESCE(pagamento_confirmado_em,criado_em) >= NOW() - INTERVAL '12 hours'
-        AND COALESCE(especialidade_solicitada,'') = $3::text
-        AND (
-          ($1::text <> '' AND regexp_replace(COALESCE(cpf,''), '\\D', '', 'g') = $1::text)
-          OR
-          ($1::text = '' AND $2::text <> '' AND regexp_replace(COALESCE(tel,''), '\\D', '', 'g') = $2::text)
-        )
+        AND COALESCE(especialidade_solicitada,'') = $2::text
+        AND regexp_replace(COALESCE(cpf,''), '\\D', '', 'g') = $1::text
       ORDER BY COALESCE(pagamento_confirmado_em,criado_em) DESC,id DESC
       LIMIT 1`,
-    [cpfLimpo, telLimpo, especialidadeLimpa]
+    [cpfLimpo, especialidadeLimpa]
   );
   return rows[0] || null;
 }
@@ -3491,7 +3491,7 @@ app.post("/api/atendimento/atualizar-triagem", async (req, res) => {
 // Best-effort: não bloqueia o fluxo principal se falhar.
 app.post("/api/atendimento/atualizar-cpf", async (req, res) => {
   try {
-    const { atendimentoId, orderId, pacienteId, telefone, cpf } = req.body || {};
+    const { atendimentoId, orderId, cpf } = req.body || {};
 
     // ── Validação do CPF ────────────────────────────────────────────────────
     const cpfNormalizado = String(cpf || "").replace(/\D/g, "");
@@ -3500,7 +3500,7 @@ app.post("/api/atendimento/atualizar-cpf", async (req, res) => {
     }
 
     // ── Pelo menos um identificador deve estar presente ─────────────────────
-    if (!atendimentoId && !orderId && !pacienteId && !telefone) {
+    if (!atendimentoId && !orderId) {
       return res.status(400).json({ ok: false, error: "Nenhum identificador informado" });
     }
 
@@ -3534,48 +3534,8 @@ app.post("/api/atendimento/atualizar-cpf", async (req, res) => {
       }
     }
 
-    // ── 3. Por pacienteId na tabela pacientes ────────────────────────────────
-    if (!updated && pacienteId) {
-      const r = await pool.query(
-        `UPDATE pacientes SET cpf = $1
-           WHERE id = $2
-           RETURNING id`,
-        [cpfNormalizado, pacienteId]
-      );
-      if (r.rowCount > 0) {
-        console.log(`[CPF-UPDATE] paciente #${pacienteId} — CPF atualizado via pacienteId`);
-        updated = true;
-      }
-    }
-
-    // ── 4. Por telefone normalizado (fallback, pega o atendimento mais recente) ──
-    if (!updated && telefone) {
-      const telNorm = String(telefone).replace(/\D/g, "");
-      const telBusca = telNorm.length > 11 && telNorm.startsWith("55")
-        ? telNorm.slice(2)
-        : telNorm;
-      if (telBusca.length >= 10) {
-        const r = await pool.query(
-          `UPDATE fila_atendimentos SET cpf = $1
-             WHERE id = (
-               SELECT id FROM fila_atendimentos
-                WHERE regexp_replace(tel, '\\D', '', 'g') LIKE $2
-                  AND pagamento_status = 'confirmado'
-                ORDER BY criado_em DESC
-                LIMIT 1
-             )
-             RETURNING id`,
-          [cpfNormalizado, `%${telBusca}`]
-        );
-        if (r.rowCount > 0) {
-          console.log(`[CPF-UPDATE] tel ${telBusca} — CPF atualizado via telefone fallback`);
-          updated = true;
-        }
-      }
-    }
-
     if (!updated) {
-      console.warn(`[CPF-UPDATE] Nenhum registro encontrado — atendimentoId:${atendimentoId} orderId:${orderId} pacienteId:${pacienteId}`);
+      console.warn(`[CPF-UPDATE] Nenhum registro encontrado — atendimentoId:${atendimentoId} orderId:${orderId}`);
       return res.status(404).json({ ok: false, error: "Atendimento nao encontrado" });
     }
 
@@ -3621,42 +3581,9 @@ app.post("/api/atendimento/atualizar-modalidade", async (req, res) => {
   }
 });
 
-// ── ROTA PÚBLICA: busca paciente por WhatsApp para autopreenchimento ──────────
-// Sem autenticação — retorna apenas campos básicos para UX de retorno
-app.get("/api/paciente/buscar", rlGeral, async (req, res) => {
-  try {
-    let tel = (req.query.tel || "").replace(/\D/g, "");
-    // Normaliza: remove DDI 55 se presente
-    if (tel.length > 11 && tel.startsWith("55")) tel = tel.slice(2);
-    if (tel.length < 10) return res.json({ ok: false });
-    // Busca o atendimento mais recente, priorizando cadastro com nome real.
-    const result = await pool.query(
-      `SELECT nome, tel, data_nascimento, cpf, email
-         FROM fila_atendimentos
-        WHERE regexp_replace(tel, '\\D', '', 'g') LIKE $1
-        ORDER BY
-          CASE WHEN LOWER(TRIM(COALESCE(nome,''))) IN ('','-','paciente','paciente whatsapp') THEN 1 ELSE 0 END,
-          criado_em DESC
-        LIMIT 1`,
-      [`%${tel}`]
-    );
-    if (result.rows.length === 0) return res.json({ ok: false });
-    const p = result.rows[0];
-    return res.json({
-      ok: true,
-      paciente: {
-        nome: p.nome || "",
-        tel: p.tel || "",
-        data_nascimento: p.data_nascimento || "",
-        cpf: p.cpf || "",
-        email: p.email || ""
-      }
-    });
-  } catch (e) {
-    console.error("Erro em /api/paciente/buscar:", e);
-    return res.json({ ok: false });
-  }
-});
+// Telefone só informa a existência de cadastro anterior. PII exige autenticação
+// ou prova adicional de identidade em um fluxo próprio.
+app.get("/api/paciente/buscar", rlGeral, createPublicPatientLookupHandler((sql, params) => pool.query(sql, params)));
 
 app.post("/api/notify", rlTriagem, async (req, res) => {
   try {
@@ -3691,8 +3618,8 @@ app.post("/api/notify", rlTriagem, async (req, res) => {
     if (triagemPlaceholder) {
       const atendimentoPago = await buscarAtendimentoPagoAtivoPorIdentidade({
         cpf: cpfLimpo,
-        tel: telLimpo,
-        especialidade: especialidadeImediata
+        especialidade: especialidadeImediata,
+        atendimentoParaTerceiro: atendimentoTerceiro
       });
       if (atendimentoPago) {
         await pool.query(
@@ -8805,11 +8732,17 @@ app.post("/api/atendimento/assumir", checkMedico, async (req, res) => {
   } catch (err) { return res.status(500).json({ ok: false, error: "Erro ao assumir atendimento" }); }
 });
 
-app.post("/api/atendimento/meet", async (req, res) => {
+app.post("/api/atendimento/meet", autenticarMedico, async (req, res) => {
   try {
     const { filaId, meetLink } = req.body || {};
     if (!filaId||!meetLink) return res.status(400).json({ ok: false, error: "filaId e meetLink obrigatorios" });
-    const result = await pool.query(`UPDATE fila_atendimentos SET meet_link=$1 WHERE id=$2 RETURNING id,meet_link`,[meetLink.trim(),filaId]);
+    const isAdmin = String(req.medico.email || "").trim().toLowerCase() === ADMIN_MEDICO_EMAIL;
+    const result = await pool.query(
+      `UPDATE fila_atendimentos SET meet_link=$1
+        WHERE id=$2 AND ($4::boolean OR medico_id=$3)
+        RETURNING id,meet_link`,
+      [meetLink.trim(), filaId, req.medico.id, isAdmin]
+    );
     if (result.rowCount===0) return res.status(404).json({ ok: false, error: "Atendimento nao encontrado" });
     return res.json({ ok: true, meet_link: result.rows[0].meet_link });
   } catch (err) { return res.status(500).json({ ok: false, error: "Erro ao salvar link" }); }
@@ -8905,12 +8838,12 @@ app.get("/api/aprovacao/cancelar", async (req, res) => {
   }
 });
 
-app.post("/api/atendimento/encerrar", async (req, res) => {
+app.post("/api/atendimento/encerrar", autenticarMedico, async (req, res) => {
   try {
     const { filaId, status, documentos_emitidos, mostrar_avaliacao_google } = req.body || {};
     if (!filaId) return res.status(400).json({ ok: false, error: "filaId e obrigatorio" });
     const responsavel = await pool.query(
-      `SELECT LOWER(TRIM(COALESCE(m.email,''))) AS medico_email
+      `SELECT f.medico_id, LOWER(TRIM(COALESCE(m.email,''))) AS medico_email
          FROM fila_atendimentos f
          LEFT JOIN medicos m ON m.id=f.medico_id
         WHERE f.id=$1`,
@@ -8920,6 +8853,10 @@ app.post("/api/atendimento/encerrar", async (req, res) => {
       return res.status(404).json({ ok: false, error: "Atendimento nao encontrado" });
     }
     const medicoEmail = responsavel.rows[0].medico_email;
+    const solicitanteEmail = String(req.medico.email || "").trim().toLowerCase();
+    if (solicitanteEmail !== ADMIN_MEDICO_EMAIL && String(req.medico.id) !== String(responsavel.rows[0].medico_id)) {
+      return res.status(403).json({ ok: false, error: "Apenas o medico responsavel pode encerrar este atendimento" });
+    }
     const exibirAvaliacao = medicoEmail === ADMIN_MEDICO_EMAIL
       && mostrar_avaliacao_google === true;
     const result = await pool.query(
