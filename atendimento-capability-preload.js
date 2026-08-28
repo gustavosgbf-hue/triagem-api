@@ -142,7 +142,7 @@ function deny(res) {
   return res.status(401).json({ ok: false, error: 'Acesso não autorizado' });
 }
 
-async function authorizeAttendance(req, res, atendimentoId) {
+async function authorizeAttendance(req, _res, atendimentoId) {
   const id = positiveId(atendimentoId);
   if (!id) return false;
   if (await doctorAuthorized(id, req)) return true;
@@ -193,7 +193,8 @@ function responseWithCapability(req, res, next) {
         return originalJson(nextPayload);
       } catch (error) {
         console.error('[ATENDIMENTO-CAPABILITY] Falha ao emitir capability:', error.message);
-        return originalJson(payload);
+        res.set('Cache-Control', 'no-store');
+        return res.status(503).json({ ok: false, error: 'Não foi possível iniciar a sessão segura.' });
       }
     };
 
@@ -269,16 +270,44 @@ async function notifyGate(req, res, next) {
   }
 }
 
+async function guardParsedMultipart(req, res, next) {
+  try {
+    const id = positiveId(req.body?.atendimentoId);
+    if (!id || !await authorizeAttendance(req, res, id)) return deny(res);
+    req.atendimentoCapabilityId = id;
+    return next();
+  } catch (error) {
+    console.error('[ATENDIMENTO-CAPABILITY] Falha no upload:', error.message);
+    return deny(res);
+  }
+}
+
+// O upload legado usa multipart. Inserimos a autorização DEPOIS do multer já
+// registrado pela rota original, evitando consumir o stream duas vezes.
+const originalPost = express.application.post;
+if (!originalPost.__cjCapabilityWrapped) {
+  const wrappedPost = function capabilityAwarePost(path, ...handlers) {
+    if (path === '/api/chat/upload' && handlers.length) {
+      handlers.splice(Math.max(0, handlers.length - 1), 0, guardParsedMultipart);
+    }
+    return originalPost.call(this, path, ...handlers);
+  };
+  wrappedPost.__cjCapabilityWrapped = true;
+  express.application.post = wrappedPost;
+}
+
 function installCapability(app) {
   if (app.locals.__atendimentoCapabilityInstalled) return;
   app.locals.__atendimentoCapabilityInstalled = true;
 
-  // Complementa CORS sem responder ao OPTIONS aqui. O middleware CORS existente
-  // continua sendo a fonte de verdade; apenas garante que o header próprio não
-  // seja descartado quando a origem é oficial.
+  // CORS para o header próprio. Não encerramos OPTIONS aqui; o middleware CORS
+  // existente continua responsável pelo preflight completo.
   app.use((req, res, next) => {
     const origin = req.get('origin');
     if (origin && OFFICIAL_ORIGINS.has(origin)) {
+      res.set('Access-Control-Allow-Origin', origin);
+      res.set('Access-Control-Allow-Credentials', 'true');
+      res.vary('Origin');
       const requested = String(req.get('access-control-request-headers') || '');
       if (requested && requested.toLowerCase().includes(TOKEN_HEADER)) {
         res.set('Access-Control-Allow-Headers', requested);
@@ -296,8 +325,7 @@ function installCapability(app) {
   app.get('/api/chat/:atendimentoId', guardParamId('atendimentoId'));
   app.get('/api/pagamento/elegibilidade/:atendimentoId', guardParamId('atendimentoId'));
 
-  // Pagamento por order também é protegido porque o order pode aparecer no
-  // storage do navegador e não substitui autorização explícita do atendimento.
+  // Pagamento por order também é protegido: order não substitui autorização.
   app.get('/api/pagbank/order/:orderId', guardOrder);
 
   // Mutações do fluxo do paciente.
@@ -310,6 +338,7 @@ function installCapability(app) {
 
   // Criação/consulta de cobrança vinculada a um atendimento existente.
   app.post('/api/pagbank/order', ...withJsonBody(guardBodyId('atendimentoId')));
+  app.post('/api/efi/cartao/cobrar', ...withJsonBody(guardBodyId('atendimentoId')));
 }
 
 const originalInit = express.application.init;
