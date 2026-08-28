@@ -4,7 +4,7 @@
   "type": "module",
   "main": "server.js",
   "scripts": {
-    "start": "node scripts/apply-review-beta-phone.mjs && node --import ./mobile-otp-preload.js --import ./mobile-beta-admin-only-preload.js --import ./mobile-beta-test-preload.js --import ./mobile-patient-active-preload.js --import ./mobile-paciente-historico-preload.js --import ./mobile-patient-profile-preload.js --import ./atendimento-capability-preload.js --import ./chat-experience-preload.js --import ./chat-upload-preload.js --import ./memed-chat-preload.js --import ./mobile-push-preload.js --import ./mobile-avaliacoes-preload.js --import ./meta-capi-preload.js --import ./medico-paciente-longitudinal-preload.js server.js",
+    "start": "node scripts/apply-review-beta-phone.mjs && node --import ./mobile-otp-preload.js --import ./mobile-beta-admin-only-preload.js --import ./mobile-beta-test-preload.js --import ./mobile-patient-active-preload.js --import ./mobile-paciente-historico-preload.js --import ./mobile-patient-profile-preload.js --import ./atendimento-capability-preload.js --import ./atendimento-capability-bootstrap-preload.js --import ./chat-experience-preload.js --import ./chat-upload-preload.js --import ./memed-chat-preload.js --import ./mobile-push-preload.js --import ./mobile-avaliacoes-preload.js --import ./meta-capi-preload.js --import ./medico-paciente-longitudinal-preload.js server.js",
     "test": "node --test",
     "memed:backfill": "node scripts/backfill-memed-prescritores.mjs"
   },
