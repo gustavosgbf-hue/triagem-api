@@ -968,6 +968,7 @@ async function initDB() {
       ['assumido_em','TIMESTAMP'],['encerrado_em','TIMESTAMP'],
       ['data_nascimento','TEXT'],
       ['prontuario','TEXT'],
+      ['prontuario_revisao','BIGINT NOT NULL DEFAULT 0'],
       ['solicita','TEXT'],
       ['agendamento_id','INTEGER'],
       ['horario_agendado','TIMESTAMP'],
@@ -9016,29 +9017,45 @@ app.post("/api/atendimento/atualizar-paciente", autenticarMedico, async (req, re
 });
 
 app.post("/api/atendimento/prontuario", autenticarMedico, async (req, res) => {
-  const { filaId, prontuario } = req.body;
+  const { filaId, prontuario, clientRevision } = req.body;
   if (!filaId || prontuario === undefined) {
     return res.status(400).json({ ok: false, error: "filaId e prontuario sao obrigatorios" });
   }
   try {
-    // Permite salvar se for o médico do atendimento OU se o atendimento estiver sendo encerrado
-    // (medico_id pode ser 0 quando assumido via e-mail pelo admin)
-    const r = await pool.query(
-      "UPDATE fila_atendimentos SET prontuario = $1 WHERE id = $2 AND (medico_id = $3 OR medico_id = 0 OR medico_id IS NULL OR $3 = (SELECT id FROM medicos WHERE email='gustavosgbf@gmail.com' LIMIT 1))",
-      [prontuario, filaId, req.medico.id]
-    );
-    if (r.rowCount === 0) {
-      // Fallback: tenta salvar sem restrição de médico (para casos de encerramento)
-      const r2 = await pool.query(
-        "UPDATE fila_atendimentos SET prontuario = $1 WHERE id = $2",
-        [prontuario, filaId]
-      );
-      if (r2.rowCount === 0) {
-        return res.status(403).json({ ok: false, error: "Atendimento nao encontrado." });
-      }
+    const atendimentoId = Number(filaId);
+    if (!Number.isInteger(atendimentoId) || atendimentoId <= 0) {
+      return res.status(400).json({ ok: false, error: "Atendimento invalido." });
     }
-    console.log("[prontuario] Salvo para atendimento #" + filaId);
-    res.json({ ok: true });
+    const revisaoInformada = Number(clientRevision);
+    const revisao = Number.isSafeInteger(revisaoInformada) && revisaoInformada > 0
+      ? revisaoInformada
+      : Date.now();
+    const isAdmin = String(req.medico.email || "").trim().toLowerCase() === "gustavosgbf@gmail.com";
+    const r = await pool.query(
+      `UPDATE fila_atendimentos
+          SET prontuario = $1, prontuario_revisao = $4
+        WHERE id = $2
+          AND ($5::boolean OR medico_id = $3)
+          AND COALESCE(prontuario_revisao, 0) <= $4
+        RETURNING id`,
+      [String(prontuario), atendimentoId, req.medico.id, revisao, isAdmin]
+    );
+    if (r.rowCount > 0) {
+      console.log("[prontuario] Salvo para atendimento #" + atendimentoId);
+      return res.json({ ok: true, revisao });
+    }
+
+    const existente = await pool.query(
+      "SELECT medico_id, COALESCE(prontuario_revisao,0) AS prontuario_revisao FROM fila_atendimentos WHERE id=$1 LIMIT 1",
+      [atendimentoId]
+    );
+    if (existente.rowCount === 0) {
+      return res.status(404).json({ ok: false, error: "Atendimento nao encontrado." });
+    }
+    if (!isAdmin && Number(existente.rows[0].medico_id || 0) !== Number(req.medico.id)) {
+      return res.status(403).json({ ok: false, error: "Apenas o medico responsavel pode salvar este prontuario." });
+    }
+    return res.json({ ok: true, revisao: Number(existente.rows[0].prontuario_revisao || 0), ignorado: true });
   } catch (err) {
     console.error("[prontuario] Erro ao salvar:", err.message);
     res.status(500).json({ ok: false, error: "Erro ao salvar prontuario" });
