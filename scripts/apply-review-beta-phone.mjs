@@ -29,7 +29,7 @@ src = src.replace(
   "if (!BETA_TEST_PHONES.has(phone)) return next();",
 );
 
-if (src.includes('BETA_TEST_PHONE')) {
+if (/\bBETA_TEST_PHONE\b/.test(src)) {
   throw new Error('Unpatched BETA_TEST_PHONE occurrence remains');
 }
 
