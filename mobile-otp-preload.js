@@ -15,6 +15,7 @@ const OTP_MAX_ATTEMPTS = 6;
 const OTP_MAX_SENDS_10_MIN = 4;
 const APP_REVIEW_PHONE = '98991344646';
 const APP_REVIEW_CODE = '246810';
+const APP_REVIEW_NAME = 'Apple Review Patient';
 const JSON_BODY = express.json({ limit: '32kb' });
 
 function digits(value) {
@@ -195,6 +196,24 @@ async function createChallenge({ phone, email, cpf = '', name = '' }) {
 
   const id = randomUUID();
   const isAppReview = normalizePhone(phone) === APP_REVIEW_PHONE;
+  if (isAppReview) {
+    // Keep the dedicated review identity professional and start every fresh login
+    // without a stale demo consultation blocking the reviewer.
+    await pool.query(
+      `UPDATE pacientes SET nome=$2
+         WHERE RIGHT(regexp_replace(COALESCE(tel,''), '\\D', '', 'g'), 11)=$1`,
+      [APP_REVIEW_PHONE, APP_REVIEW_NAME],
+    ).catch(() => {});
+    await pool.query(
+      `UPDATE fila_atendimentos f
+          SET status='arquivado'
+        WHERE RIGHT(regexp_replace(COALESCE(to_jsonb(f)->>'tel',''), '\\D', '', 'g'), 11)=$1
+          AND COALESCE(to_jsonb(f)->>'pagamento_metodo','')='beta_test'
+          AND COALESCE(LOWER(to_jsonb(f)->>'status'),'') NOT IN ('encerrado','finalizado','finalizada','concluido','concluído','cancelado','expirado','arquivado')`,
+      [APP_REVIEW_PHONE],
+    ).catch(() => {});
+    console.log('[PACIENTE-OTP] App Review account reset para uma sessão limpa.');
+  }
   const code = isAppReview
     ? APP_REVIEW_CODE
     : String(randomInt(0, 1_000_000)).padStart(6, '0');
@@ -340,6 +359,11 @@ function installMobileOtpRoutes(app) {
         cpf: normalizeCpf(challenge.cpf),
         name: challenge.nome || 'Paciente',
       });
+
+      if (normalizePhone(challenge.telefone) === APP_REVIEW_PHONE) {
+        await pool.query('UPDATE pacientes SET nome=$2 WHERE id=$1', [patient.id, APP_REVIEW_NAME]);
+        patient.nome = APP_REVIEW_NAME;
+      }
 
       await pool.query(`UPDATE paciente_otp_desafios SET consumido_em=NOW() WHERE id=$1`, [challengeId]);
 
