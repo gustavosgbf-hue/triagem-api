@@ -4001,7 +4001,8 @@ app.get("/api/atendimento/status/:id", async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT id, status, tipo, medico_nome, meet_link, criado_em, assumido_em, encerrado_em,
-              nome, tel, cpf, data_nascimento, idade, sexo, alergias, cronicas, medicacoes, queixa, email,
+              nome, tel, cpf, data_nascimento, idade, sexo, alergias, cronicas, medicacoes,
+              queixa, triagem, solicita, email,
               pagamento_status, pagbank_order_id, efi_charge_id, categoria_atendimento,
               especialidade_solicitada, valor_cobrado_centavos, fallback_disponivel_em,
               fallback_decisao, fallback_decidido_em, reembolso_status, mostrar_avaliacao_google,
