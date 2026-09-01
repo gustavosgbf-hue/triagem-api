@@ -1,0 +1,35 @@
+name: Apply App Review Account Patch
+
+on:
+  push:
+    paths:
+      - '.github/workflows/app-review-account-patch.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Patch dedicated review identity
+        run: node scripts/patch-app-review-account.mjs
+      - name: Syntax check
+        run: node --check mobile-otp-preload.js && node --check mobile-beta-test-preload.js
+      - name: Commit backend patch
+        run: |
+          if git diff --quiet -- mobile-otp-preload.js; then
+            echo "No patch changes needed"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add mobile-otp-preload.js
+          git commit -m "Normalize and reset App Review account"
+          git push
