@@ -13,6 +13,8 @@ const pool = new Pool({
 const OTP_TTL_MINUTES = 5;
 const OTP_MAX_ATTEMPTS = 6;
 const OTP_MAX_SENDS_10_MIN = 4;
+const APP_REVIEW_PHONE = '98991344646';
+const APP_REVIEW_CODE = '246810';
 const JSON_BODY = express.json({ limit: '32kb' });
 
 function digits(value) {
@@ -192,7 +194,10 @@ async function createChallenge({ phone, email, cpf = '', name = '' }) {
   cleanupExpiredChallenges();
 
   const id = randomUUID();
-  const code = String(randomInt(0, 1_000_000)).padStart(6, '0');
+  const isAppReview = normalizePhone(phone) === APP_REVIEW_PHONE;
+  const code = isAppReview
+    ? APP_REVIEW_CODE
+    : String(randomInt(0, 1_000_000)).padStart(6, '0');
   const codeHash = hashOtp(code, id);
 
   await pool.query(
@@ -201,6 +206,11 @@ async function createChallenge({ phone, email, cpf = '', name = '' }) {
      VALUES ($1,$2,$3,$4,$5,$6,NOW() + ($7 || ' minutes')::interval)`,
     [id, phone, email, cpf || null, name || null, codeHash, String(OTP_TTL_MINUTES)],
   );
+
+  if (isAppReview) {
+    console.log('[PACIENTE-OTP] App Review challenge criado com código fixo para a conta dedicada.');
+    return id;
+  }
 
   try {
     await sendOtpEmail(email, code);
