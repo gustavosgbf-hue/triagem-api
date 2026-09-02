@@ -240,6 +240,9 @@ function installBetaTestRoutes(app) {
 
   app.get('/api/paciente/atendimento-em-andamento', authPaciente, async (req, res, next) => {
     try {
+      res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private, max-age=0');
+      res.set('Pragma', 'no-cache');
+      res.set('Expires', '0');
       const paciente = await pacienteBeta(req.pacienteId);
       if (!paciente) return next();
       const ativo = await atendimentoBetaAtivo(normalizePhone(paciente.tel));
@@ -307,6 +310,9 @@ function installBetaTestRoutes(app) {
 
   app.get('/api/pagbank/order/:orderId', async (req, res, next) => {
     try {
+      res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private, max-age=0');
+      res.set('Pragma', 'no-cache');
+      res.set('Expires', '0');
       const orderId = String(req.params.orderId || '');
       const match = /^BETA-(\d+)$/.exec(orderId);
       if (!match) return next();
