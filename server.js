@@ -1862,7 +1862,7 @@ const PSI_COMISSAO_PCT = parseFloat(process.env.PSI_COMISSAO_PCT || '20');
 if (!PAGBANK_TOKEN) console.error("[PAGBANK] Token não configurado");
 
 const LIMITE_ATENDIMENTOS_JANELA_DIAS = 5;
-const LIMITE_ATENDIMENTOS_QUANTIDADE = 2;
+const LIMITE_ATENDIMENTOS_QUANTIDADE = 3;
 
 async function buscarBloqueioManualAtendimento(atendimentoId) {
   const id = parseInt(atendimentoId, 10);
