@@ -8,7 +8,7 @@ const pool = new Pool({
 
 const REVIEW_PHONE = '98991344646';
 const KEEP_ATTENDANCE_ID = 3432;
-const CLEANUP_THROUGH_ID = 3622;
+const CLEANUP_THROUGH_ID = 3624;
 
 function phoneExpr(alias = 'f') {
   return `RIGHT(regexp_replace(COALESCE(${alias}.tel,''), '\\D', '', 'g'), 11)`;
