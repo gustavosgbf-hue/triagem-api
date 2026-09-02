@@ -235,7 +235,7 @@ function installBetaTestRoutes(app) {
   app.locals.__mobileBetaTestInstalled = true;
 
   app.get('/api/mobile-beta-health', (_req, res) => {
-    return res.json({ ok: true, betaModule: true, version: 'app-review-sandbox-v6' });
+    return res.json({ ok: true, betaModule: true, version: 'app-review-sandbox-v7-body-parser' });
   });
 
   app.get('/api/paciente/atendimento-em-andamento', authPaciente, async (req, res, next) => {
@@ -251,7 +251,7 @@ function installBetaTestRoutes(app) {
     }
   });
 
-  app.use('/api/notify', async (req, res, next) => {
+  app.use('/api/notify', JSON_BODY, async (req, res, next) => {
     if (req.method !== 'POST') return next();
     try {
       const phone = normalizePhone(req.body?.tel);
@@ -274,7 +274,7 @@ function installBetaTestRoutes(app) {
     }
   });
 
-  app.use('/api/pagbank/order', async (req, res, next) => {
+  app.use('/api/pagbank/order', JSON_BODY, async (req, res, next) => {
     if (req.method !== 'POST') return next();
     try {
       const beta = await atendimentoBetaPorId(req.body?.atendimentoId);
@@ -292,7 +292,7 @@ function installBetaTestRoutes(app) {
     }
   });
 
-  app.use('/api/atendimento/vincular-order', async (req, res, next) => {
+  app.use('/api/atendimento/vincular-order', JSON_BODY, async (req, res, next) => {
     if (req.method !== 'POST') return next();
     try {
       const beta = await atendimentoBetaPorId(req.body?.atendimentoId);
@@ -320,7 +320,7 @@ function installBetaTestRoutes(app) {
     }
   });
 
-  app.use('/api/efi/cartao/cobrar', async (req, res, next) => {
+  app.use('/api/efi/cartao/cobrar', JSON_BODY, async (req, res, next) => {
     if (req.method !== 'POST') return next();
     try {
       const beta = await atendimentoBetaPorId(req.body?.atendimentoId);
@@ -334,8 +334,7 @@ function installBetaTestRoutes(app) {
     }
   });
 
-  // Compatibilidade com builds antigas: ainda cria o atendimento, mas não pula pagamento.
-  app.post('/api/paciente/beta/iniciar', authPaciente, async (req, res) => {
+  app.post('/api/paciente/beta/iniciar', authPaciente, JSON_BODY, async (req, res) => {
     try {
       const paciente = await pacienteBeta(req.pacienteId);
       if (!paciente) return res.status(403).json({ ok: false, beta: false, error: 'Conta sem acesso ao modo de revisão' });
@@ -354,7 +353,7 @@ function installBetaTestRoutes(app) {
     }
   });
 
-  app.use('/api/atendimento/atualizar-triagem', async (req, res, next) => {
+  app.use('/api/atendimento/atualizar-triagem', JSON_BODY, async (req, res, next) => {
     if (req.method !== 'POST') return next();
     try {
       const atendimentoId = Number(req.body?.atendimentoId);
