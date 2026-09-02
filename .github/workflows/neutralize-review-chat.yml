@@ -1,0 +1,65 @@
+name: Neutralize review chat copy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/neutralize-review-chat.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Patch review sandbox copy
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('mobile-beta-test-preload.js')
+          s = p.read_text()
+          s = s.replace("const REVIEW_PATIENT_NAME = 'Apple Review Patient';", "const REVIEW_PATIENT_NAME = 'Review Patient';")
+          s = s.replace("'(App Review - ambiente de demonstração)'", "'(Ambiente de demonstração)'")
+          s = s.replace(
+            "       ($1,'medico','Olá! Este é o ambiente demonstrativo da ConsultaJá24h para revisão da App Store. A conversa está disponível para testar a experiência do paciente, sem envolver um atendimento médico real.',NOW()),\n       ($1,'medico','Você pode enviar uma mensagem para testar o chat. Nenhuma cobrança real será realizada neste ambiente.',NOW() + INTERVAL '1 second')",
+            "       ($1,'medico','Olá! Seu atendimento foi iniciado. Você pode usar este chat para conversar com o profissional responsável pela consulta.',NOW()),\n       ($1,'medico','Se precisar complementar alguma informação, envie uma mensagem por aqui.',NOW() + INTERVAL '1 second')"
+          )
+          marker = """  if (!existente.rowCount) {
+    await pool.query("""
+          if marker in s and "Atualiza mensagens antigas do sandbox" not in s:
+            replacement = """  // Atualiza mensagens antigas do sandbox para uma cópia neutra, adequada também às capturas da loja.
+  await pool.query(
+    `UPDATE app_review_chat_mensagens
+        SET texto = CASE
+          WHEN texto ILIKE '%ambiente demonstrativo%revisão%' THEN 'Olá! Seu atendimento foi iniciado. Você pode usar este chat para conversar com o profissional responsável pela consulta.'
+          WHEN texto ILIKE '%Nenhuma cobrança real%' THEN 'Se precisar complementar alguma informação, envie uma mensagem por aqui.'
+          WHEN texto ILIKE '%retorno é automático%revisão%' THEN 'Mensagem recebida. Em um atendimento real, o profissional responsável poderá responder por este chat.'
+          ELSE texto
+        END
+      WHERE atendimento_id=$1
+        AND (texto ILIKE '%ambiente demonstrativo%revisão%'
+          OR texto ILIKE '%Nenhuma cobrança real%'
+          OR texto ILIKE '%retorno é automático%revisão%')`,
+    [atendimentoId],
+  );
+
+  if (!existente.rowCount) {
+    await pool.query("""
+            s = s.replace(marker, replacement, 1)
+          s = s.replace(
+            "VALUES ($1,'medico','Mensagem recebida. Este retorno é automático e existe apenas para demonstrar o funcionamento do chat durante a revisão da App Store.')",
+            "VALUES ($1,'medico','Mensagem recebida. Em um atendimento real, o profissional responsável poderá responder por este chat.')"
+          )
+          p.write_text(s)
+          PY
+      - name: Commit patch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add mobile-beta-test-preload.js
+          git commit -m "Use neutral copy in review sandbox chat" || exit 0
+          git push
