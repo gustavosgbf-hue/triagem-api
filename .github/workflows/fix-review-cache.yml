@@ -1,0 +1,65 @@
+name: Fix review response cache
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/fix-review-cache.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Add no-store headers to review status routes
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('mobile-beta-test-preload.js')
+          s = p.read_text()
+
+          old = """  app.get('/api/paciente/atendimento-em-andamento', authPaciente, async (req, res, next) => {
+    try {
+      const paciente = await pacienteBeta(req.pacienteId);"""
+          new = """  app.get('/api/paciente/atendimento-em-andamento', authPaciente, async (req, res, next) => {
+    try {
+      res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private, max-age=0');
+      res.set('Pragma', 'no-cache');
+      res.set('Expires', '0');
+      const paciente = await pacienteBeta(req.pacienteId);"""
+          if old not in s:
+              raise SystemExit('review in-progress route snippet not found')
+          s = s.replace(old, new, 1)
+
+          old = """  app.get('/api/pagbank/order/:orderId', async (req, res, next) => {
+    try {
+      const orderId = String(req.params.orderId || '');"""
+          new = """  app.get('/api/pagbank/order/:orderId', async (req, res, next) => {
+    try {
+      res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private, max-age=0');
+      res.set('Pragma', 'no-cache');
+      res.set('Expires', '0');
+      const orderId = String(req.params.orderId || '');"""
+          if old not in s:
+              raise SystemExit('review pix status route snippet not found')
+          s = s.replace(old, new, 1)
+
+          p.write_text(s)
+          PY
+      - name: Syntax check
+        run: node --check mobile-beta-test-preload.js
+      - name: Commit backend fix
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add mobile-beta-test-preload.js
+          git commit -m "Disable caching in review consultation status" || exit 0
+          git push
