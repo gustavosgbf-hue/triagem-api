@@ -7,6 +7,20 @@ function patchSql(sql) {
   if (typeof sql !== 'string') return sql;
   let next = sql;
 
+  // O atendimento de review precisa ficar visível no painel admin para sabermos
+  // quando Apple/Google estão testando. Mantemos o status como aguardando desde
+  // a criação, mas ele continua invisível para médicos comuns pelas regras abaixo.
+  if (
+    next.includes('INSERT INTO fila_atendimentos') &&
+    next.includes("'(aguardando pagamento)'") &&
+    next.includes("'pagamento_pendente','pendente','beta_test'")
+  ) {
+    next = next.replace(
+      "'pagamento_pendente','pendente','beta_test'",
+      "'aguardando','pendente','beta_test'",
+    );
+  }
+
   // Fila dos médicos não-admin: remove qualquer atendimento beta da consulta.
   if (
     next.includes('FROM fila_atendimentos') &&
@@ -60,4 +74,4 @@ Pool.prototype.query = function betaAdminOnlyQuery(config, values, callback) {
   return originalQuery.call(this, config, values, callback);
 };
 
-console.log('[MOBILE-BETA] Protecao admin-only ativa para fila e notificacoes.');
+console.log('[MOBILE-BETA] Review visivel ao admin e protegido da fila medica.');
