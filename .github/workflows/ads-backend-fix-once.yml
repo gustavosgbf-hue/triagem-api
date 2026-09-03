@@ -1,0 +1,27 @@
+name: Backend ads hardening once
+
+on:
+  push:
+    paths:
+      - '.github/workflows/ads-backend-fix-once.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply backend ads patch
+        run: python3 scripts/apply_ads_attribution_patch.py
+      - name: Syntax check
+        run: node --check server.js
+      - name: Validate and commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add server.js
+          git diff --cached --check
+          git commit -m "Harden ads attribution and Google conversion backup" || exit 0
+          git push
