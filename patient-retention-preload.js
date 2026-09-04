@@ -64,14 +64,14 @@ async function candidateRows(){
           AND COALESCE(LOWER(to_jsonb(f)->>'status'),'') NOT IN ('cancelado','expirado')) AS ultimo_atendimento
       FROM paciente_retencao_push s JOIN pacientes p ON p.id=s.paciente_id
      WHERE s.opt_in=TRUE
-       AND (s.ultimo_envio_em IS NULL OR s.ultimo_envio_em < NOW() - ($2 || ' days')::interval)
+       AND (s.ultimo_envio_em IS NULL OR s.ultimo_envio_em < NOW() - ($1 || ' days')::interval)
        AND NOT EXISTS (
          SELECT 1 FROM fila_atendimentos a
           WHERE RIGHT(regexp_replace(COALESCE(to_jsonb(a)->>'tel',''),'\\D','','g'),11)=RIGHT(regexp_replace(COALESCE(p.tel,''),'\\D','','g'),11)
             AND COALESCE(LOWER(to_jsonb(a)->>'status'),'') NOT IN ('encerrado','finalizado','finalizada','concluido','concluído','cancelado','expirado','arquivado')
             AND NULLIF(to_jsonb(a)->>'encerrado_em','') IS NULL)
      LIMIT 60
-  `,[AFTER_DAYS,REPEAT_DAYS]);
+  `,[REPEAT_DAYS]);
   return rows.filter(r=>r.ultimo_atendimento && new Date(r.ultimo_atendimento).getTime() <= Date.now()-AFTER_DAYS*86400000);
 }
 async function sendOne(row){
