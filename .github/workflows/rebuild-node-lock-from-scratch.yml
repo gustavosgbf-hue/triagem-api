@@ -1,0 +1,40 @@
+name: Rebuild backend npm lock from scratch
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/rebuild-node-lock-from-scratch.yml'
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Generate a fresh lockfile
+        run: |
+          rm -rf node_modules package-lock.json
+          npm install --package-lock-only --ignore-scripts
+          npm ci --ignore-scripts
+      - name: Validate installed runtime dependencies
+        run: |
+          test -d node_modules/express
+          test -d node_modules/web-push
+          test -d node_modules/pg
+          test -d node_modules/jsonwebtoken
+          node -e "Promise.all([import('express'),import('web-push'),import('pg'),import('jsonwebtoken')]).then(()=>console.log('runtime deps ok'))"
+          node --check mobile-otp-preload.js
+          node --check patient-retention-preload.js
+          node --check web-push-preload.js
+          node -e "const p=require('./package-lock.json'); for (const k of ['node_modules/express','node_modules/web-push','node_modules/pg','node_modules/jsonwebtoken']) { if(!p.packages[k]) throw new Error('missing '+k) }; console.log('fresh lock ok')"
+      - name: Commit fresh lockfile
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add package-lock.json
+          git commit -m 'Rebuild backend npm lock from scratch'
+          git push
