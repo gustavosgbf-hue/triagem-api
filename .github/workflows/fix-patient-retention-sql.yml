@@ -1,0 +1,39 @@
+name: Fix patient retention SQL
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/fix-patient-retention-sql.yml'
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fix SQL parameter numbering
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('patient-retention-preload.js')
+          s=p.read_text()
+          old="AND (s.ultimo_envio_em IS NULL OR s.ultimo_envio_em < NOW() - ($2 || ' days')::interval)"
+          new="AND (s.ultimo_envio_em IS NULL OR s.ultimo_envio_em < NOW() - ($1 || ' days')::interval)"
+          assert old in s
+          s=s.replace(old,new,1)
+          old2="  `,[AFTER_DAYS,REPEAT_DAYS]);"
+          new2="  `,[REPEAT_DAYS]);"
+          assert old2 in s
+          s=s.replace(old2,new2,1)
+          p.write_text(s)
+          PY
+      - name: Validate
+        run: node --check patient-retention-preload.js
+      - name: Commit
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add patient-retention-preload.js
+          git commit -m 'Fix retention worker SQL parameter'
+          git push
