@@ -1,3 +1,4 @@
+import './patient-retention-preload.js';
 import express from 'express';
 import pg from 'pg';
 import jwt from 'jsonwebtoken';
