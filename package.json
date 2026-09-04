@@ -4,7 +4,7 @@
   "type": "module",
   "main": "server.js",
   "scripts": {
-    "start": "node scripts/cleanup-review-history-once.mjs && node scripts/normalize-review-sandbox-labels.mjs && node scripts/patch-review-chat-copy.mjs && node --import ./mobile-otp-preload.js --import ./mobile-beta-admin-only-preload.js --import ./mobile-beta-test-preload.js --import ./mobile-beta-triage-fix-preload.js --import ./mobile-patient-active-preload.js --import ./mobile-paciente-historico-preload.js --import ./mobile-patient-profile-preload.js --import ./chat-experience-preload.js --import ./chat-upload-preload.js --import ./memed-chat-preload.js --import ./mobile-push-preload.js --import ./mobile-avaliacoes-preload.js --import ./meta-capi-preload.js --import ./payment-recovery-preload.js --import ./web-push-preload.js server.js",
+    "start": "node scripts/cleanup-review-history-once.mjs && node scripts/normalize-review-sandbox-labels.mjs && node scripts/patch-review-chat-copy.mjs && node --import ./mobile-otp-preload.js --import ./mobile-beta-admin-only-preload.js --import ./mobile-beta-test-preload.js --import ./mobile-beta-triage-fix-preload.js --import ./mobile-patient-active-preload.js --import ./mobile-paciente-historico-preload.js --import ./mobile-patient-profile-preload.js --import ./chat-experience-preload.js --import ./chat-upload-preload.js --import ./memed-chat-preload.js --import ./mobile-push-preload.js --import ./mobile-avaliacoes-preload.js --import ./meta-capi-preload.js --import ./payment-recovery-preload.js --import ./web-push-preload.js --import ./patient-retention-preload.js server.js",
     "test": "node --test",
     "memed:backfill": "node scripts/backfill-memed-prescritores.mjs"
   },
@@ -13,8 +13,6 @@
     "axios": "^1.13.6",
     "bcrypt": "^6.0.0",
     "cors": "^2.8.5",
-    "express": "^4.19.2",
-    "express-rate-limit": "^7.3.0",
     "googleapis": "^140.0.0",
     "jsonwebtoken": "^9.0.3",
     "multer": "^2.1.1",
