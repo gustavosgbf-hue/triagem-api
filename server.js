@@ -8346,7 +8346,7 @@ app.get("/api/admin/historico", checkAdmin, async (req, res) => {
     if (data_fim) { params.push(data_fim); where += ` AND criado_em < ($${params.length}::date + interval '1 day')`; }
     if (busca) { params.push(`%${busca}%`); where += ` AND (nome ILIKE $${params.length} OR tel ILIKE $${params.length} OR cpf ILIKE $${params.length})`; }
     const result = await pool.query(
-      `SELECT id,nome,tel,tel_documentos,cpf,email,tipo,triagem,queixa,status,pagamento_status,
+      `SELECT id,origem_plataforma,nome,tel,tel_documentos,cpf,email,tipo,triagem,queixa,status,pagamento_status,
               pagbank_order_id,efi_charge_id,pagamento_confirmado_em,ads_checkout_session_id,
               medico_id,medico_nome,prontuario,
               criado_em,assumido_em,encerrado_em,data_nascimento,idade,sexo,alergias,cronicas,medicacoes,
@@ -8427,7 +8427,7 @@ app.get("/api/admin/atendimentos/auditoria", checkAdmin, async (req, res) => {
       )`;
     }
     const { rows } = await pool.query(
-      `SELECT id,nome,tel,cpf,email,tipo,status,pagamento_status,triagem,queixa,
+      `SELECT id,origem_plataforma,nome,tel,cpf,email,tipo,status,pagamento_status,triagem,queixa,
               pagbank_order_id,pagbank_qr_expira_em,efi_charge_id,pagamento_metodo,pagamento_confirmado_em,
               ads_checkout_session_id,atendimento_para_terceiro,pagador_nome,pagador_cpf,
               medico_id,medico_nome,prioridade_medico_id,prioridade_ate,
@@ -8950,7 +8950,7 @@ app.get("/api/historico", checkMedico, async (req, res) => {
   try {
     const medicoId = req.medico.id;
     const result = await pool.query(
-      `SELECT id, nome, tel, tel_documentos, cpf, tipo, triagem, status,
+      `SELECT id, origem_plataforma, nome, tel, tel_documentos, cpf, tipo, triagem, status,
               status_atendimento, documentos_emitidos, medico_nome,
               criado_em, assumido_em, encerrado_em,
               data_nascimento, idade, sexo, alergias, cronicas, medicacoes, queixa, solicita,
