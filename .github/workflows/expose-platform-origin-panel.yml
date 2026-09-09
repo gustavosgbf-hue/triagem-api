@@ -1,0 +1,35 @@
+name: Expose platform origin to panel
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/add-platform-origin-to-panel-queries.mjs'
+      - '.github/workflows/expose-platform-origin-panel.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Patch server queries
+        run: node scripts/add-platform-origin-to-panel-queries.mjs
+      - name: Validate server syntax
+        run: node --check server.js
+      - name: Commit backend query changes
+        run: |
+          if git diff --quiet -- server.js; then
+            echo "Platform origin already exposed"
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add server.js
+            git commit -m "Expose platform origin in panel APIs"
+            git push origin HEAD:main
+          fi
