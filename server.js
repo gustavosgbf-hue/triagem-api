@@ -37,7 +37,9 @@ const adsAttributionSchemaReady = pool.query(`
     ADD COLUMN IF NOT EXISTS ads_fbclid TEXT,
     ADD COLUMN IF NOT EXISTS ads_first_touch JSONB,
     ADD COLUMN IF NOT EXISTS ads_last_touch JSONB,
-    ADD COLUMN IF NOT EXISTS ads_conversion_touch JSONB;
+    ADD COLUMN IF NOT EXISTS ads_conversion_touch JSONB,
+    ADD COLUMN IF NOT EXISTS app_install_id TEXT,
+    ADD COLUMN IF NOT EXISTS app_attribution_id TEXT;
 
   CREATE TABLE IF NOT EXISTS marketing_touchpoints (
     id BIGSERIAL PRIMARY KEY,
@@ -60,6 +62,48 @@ const adsAttributionSchemaReady = pool.query(`
   );
   CREATE INDEX IF NOT EXISTS idx_marketing_touchpoints_atendimento
     ON marketing_touchpoints (atendimento_id, captured_at);
+
+  CREATE TABLE IF NOT EXISTS app_attributions (
+    install_id TEXT PRIMARY KEY,
+    attribution_id TEXT,
+    platform TEXT NOT NULL DEFAULT 'android',
+    package_name TEXT,
+    raw_referrer TEXT,
+    gclid TEXT,
+    gbraid TEXT,
+    wbraid TEXT,
+    utm_source TEXT,
+    utm_medium TEXT,
+    utm_campaign TEXT,
+    utm_term TEXT,
+    utm_content TEXT,
+    referrer_click_at TIMESTAMPTZ,
+    install_begin_at TIMESTAMPTZ,
+    install_version TEXT,
+    firebase_app_instance_sha256 TEXT,
+    atendimento_id BIGINT,
+    captured_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
+  CREATE INDEX IF NOT EXISTS idx_app_attributions_attribution
+    ON app_attributions (attribution_id);
+  CREATE INDEX IF NOT EXISTS idx_app_attributions_atendimento
+    ON app_attributions (atendimento_id);
+
+  CREATE TABLE IF NOT EXISTS app_attribution_events (
+    id BIGSERIAL PRIMARY KEY,
+    event_key TEXT NOT NULL UNIQUE,
+    event_name TEXT NOT NULL,
+    attribution_id TEXT,
+    install_id TEXT,
+    atendimento_id BIGINT,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    captured_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  );
+  CREATE INDEX IF NOT EXISTS idx_app_attribution_events_attribution
+    ON app_attribution_events (attribution_id, captured_at);
+  CREATE INDEX IF NOT EXISTS idx_app_attribution_events_install
+    ON app_attribution_events (install_id, captured_at);
 `).catch(e => {
   console.warn('[ADS-ATTR-SCHEMA] Falha ao garantir schema:', e.message);
 });
@@ -148,6 +192,131 @@ const rlGeral = rateLimit({ windowMs: 60*1000, max: 120, standardHeaders: true, 
   message: { ok: false, error: "Muitas requisições. Aguarde." }});
 const rlCadastroMedico = rateLimit({ windowMs: 60*60*1000, max: 5, standardHeaders: true, legacyHeaders: false,
   message: { ok: false, error: "Muitos cadastros enviados. Tente novamente mais tarde." }});
+const rlAttribution = rateLimit({ windowMs: 60*1000, max: 40, standardHeaders: true, legacyHeaders: false,
+  message: { ok: false, error: "Muitas requisições de atribuição. Aguarde." }});
+
+const trackingTextBody = express.text({ type: "text/plain", limit: "8kb" });
+
+app.post("/api/tracking/play-click", rlAttribution, trackingTextBody, async (req, res) => {
+  try {
+    const body = trackingBody(req.body);
+    const attributionId = trackingId(body.attribution_id || body.cjaid);
+    if (!attributionId) return res.status(400).json({ ok: false, error: "attribution_id_invalido" });
+    const ads = normalizarAdsAttribution(body, req);
+    const capturedAt = trackingIsoDate(body.captured_at);
+    const eventKey = sha256Hex(JSON.stringify({
+      event: "google_play_click",
+      attributionId,
+      capturedAt,
+      placement: limitarTexto(body.placement, 120)
+    }));
+    await adsAttributionSchemaReady;
+    await pool.query(
+      `INSERT INTO app_attribution_events (
+         event_key,event_name,attribution_id,metadata,captured_at
+       ) VALUES ($1,'google_play_click',$2,$3::jsonb,COALESCE($4::timestamptz,NOW()))
+       ON CONFLICT (event_key) DO NOTHING`,
+      [
+        eventKey,
+        attributionId,
+        JSON.stringify({
+          placement: limitarTexto(body.placement, 120),
+          landing_url: limitarTexto(body.landing_url, 700),
+          gclid: ads.gclid,
+          gbraid: ads.gbraid,
+          wbraid: ads.wbraid,
+          ...ads.utm
+        }),
+        capturedAt
+      ]
+    );
+    return res.json({ ok: true });
+  } catch (e) {
+    console.warn("[APP-ATTR] Falha ao registrar clique na Play:", e.message);
+    return res.status(400).json({ ok: false, error: "tracking_payload_invalido" });
+  }
+});
+
+app.post("/api/tracking/app-install", rlAttribution, async (req, res) => {
+  try {
+    const body = trackingBody(req.body);
+    const installId = trackingId(body.install_id);
+    const attributionId = trackingId(body.attribution_id || body.cjaid);
+    if (!installId) return res.status(400).json({ ok: false, error: "install_id_invalido" });
+    if (limitarTexto(body.platform, 20) !== "android") {
+      return res.status(400).json({ ok: false, error: "plataforma_invalida" });
+    }
+    const ads = normalizarAdsAttribution(body, req);
+    const rawReferrer = limitarTexto(body.raw_referrer, 1800);
+    const firebaseInstanceHash = body.firebase_app_instance_id
+      ? sha256Hex(limitarTexto(body.firebase_app_instance_id, 300))
+      : "";
+    const capturedAt = trackingIsoDate(body.captured_at);
+    await adsAttributionSchemaReady;
+    await pool.query(
+      `INSERT INTO app_attributions (
+         install_id,attribution_id,platform,package_name,raw_referrer,
+         gclid,gbraid,wbraid,utm_source,utm_medium,utm_campaign,utm_term,utm_content,
+         referrer_click_at,install_begin_at,install_version,firebase_app_instance_sha256,captured_at,updated_at
+       ) VALUES (
+         $1,$2,'android',$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,
+         CASE WHEN $13::bigint > 0 THEN to_timestamp($13::bigint) END,
+         CASE WHEN $14::bigint > 0 THEN to_timestamp($14::bigint) END,
+         $15,$16,COALESCE($17::timestamptz,NOW()),NOW()
+       )
+       ON CONFLICT (install_id) DO UPDATE SET
+         attribution_id=COALESCE(app_attributions.attribution_id,EXCLUDED.attribution_id),
+         raw_referrer=COALESCE(app_attributions.raw_referrer,EXCLUDED.raw_referrer),
+         gclid=COALESCE(app_attributions.gclid,EXCLUDED.gclid),
+         gbraid=COALESCE(app_attributions.gbraid,EXCLUDED.gbraid),
+         wbraid=COALESCE(app_attributions.wbraid,EXCLUDED.wbraid),
+         utm_source=COALESCE(app_attributions.utm_source,EXCLUDED.utm_source),
+         utm_medium=COALESCE(app_attributions.utm_medium,EXCLUDED.utm_medium),
+         utm_campaign=COALESCE(app_attributions.utm_campaign,EXCLUDED.utm_campaign),
+         utm_term=COALESCE(app_attributions.utm_term,EXCLUDED.utm_term),
+         utm_content=COALESCE(app_attributions.utm_content,EXCLUDED.utm_content),
+         referrer_click_at=COALESCE(app_attributions.referrer_click_at,EXCLUDED.referrer_click_at),
+         install_begin_at=COALESCE(app_attributions.install_begin_at,EXCLUDED.install_begin_at),
+         install_version=COALESCE(app_attributions.install_version,EXCLUDED.install_version),
+         firebase_app_instance_sha256=COALESCE(app_attributions.firebase_app_instance_sha256,EXCLUDED.firebase_app_instance_sha256),
+         updated_at=NOW()`,
+      [
+        installId, attributionId || null, limitarTexto(body.package_name, 180) || null,
+        rawReferrer || null, ads.gclid || null, ads.gbraid || null, ads.wbraid || null,
+        ads.utm?.utm_source || null, ads.utm?.utm_medium || null, ads.utm?.utm_campaign || null,
+        ads.utm?.utm_term || null, ads.utm?.utm_content || null,
+        trackingEpochSeconds(body.referrer_click_timestamp_seconds),
+        trackingEpochSeconds(body.install_begin_timestamp_seconds),
+        limitarTexto(body.install_version, 80) || null,
+        firebaseInstanceHash || null,
+        capturedAt
+      ]
+    );
+    const eventKey = sha256Hex(`install_attribution_captured:${installId}`);
+    await pool.query(
+      `INSERT INTO app_attribution_events (
+         event_key,event_name,attribution_id,install_id,metadata,captured_at
+       ) VALUES ($1,'install_attribution_captured',$2,$3,$4::jsonb,COALESCE($5::timestamptz,NOW()))
+       ON CONFLICT (event_key) DO NOTHING`,
+      [
+        eventKey, attributionId || null, installId,
+        JSON.stringify({
+          package_name: limitarTexto(body.package_name, 180),
+          install_version: limitarTexto(body.install_version, 80),
+          has_referrer: !!rawReferrer,
+          has_gclid: !!ads.gclid,
+          has_gbraid: !!ads.gbraid,
+          has_wbraid: !!ads.wbraid
+        }),
+        capturedAt
+      ]
+    );
+    return res.json({ ok: true });
+  } catch (e) {
+    console.warn("[APP-ATTR] Falha ao registrar instalação:", e.message);
+    return res.status(400).json({ ok: false, error: "tracking_payload_invalido" });
+  }
+});
 
 app.post("/api/tracking/confirmado-view", rlGeral, (req, res) => {
   const body = req.body || {};
@@ -212,6 +381,32 @@ function limitarTexto(valor, max = 500) {
   return String(valor || "").trim().slice(0, max);
 }
 
+function trackingBody(value) {
+  if (value && typeof value === "object" && !Array.isArray(value)) return value;
+  if (typeof value === "string" && value.length <= 8192) {
+    const parsed = JSON.parse(value);
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) return parsed;
+  }
+  return {};
+}
+
+function trackingId(value) {
+  const id = limitarTexto(value, 160);
+  return /^[A-Za-z0-9._~-]{8,160}$/.test(id) ? id : "";
+}
+
+function trackingEpochSeconds(value) {
+  const seconds = Number(value);
+  return Number.isSafeInteger(seconds) && seconds > 0 ? seconds : 0;
+}
+
+function trackingIsoDate(value) {
+  const raw = limitarTexto(value, 60);
+  if (!raw) return null;
+  const parsed = new Date(raw);
+  return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+}
+
 function normalizarAdsAttribution(input = {}, req) {
   const src = input && typeof input === "object" ? input : {};
   const gclid = limitarTexto(src.gclid, 220);
@@ -226,6 +421,8 @@ function normalizarAdsAttribution(input = {}, req) {
   const landingUrl = limitarTexto(src.landing_url || src.landingUrl, 700);
   const referrer = limitarTexto(src.referrer, 700);
   const checkoutSessionId = limitarTexto(src.checkout_session_id || src.checkoutSessionId, 120);
+  const installId = trackingId(src.install_id || src.installId);
+  const attributionId = trackingId(src.attribution_id || src.attributionId || src.cjaid);
   const userAgent = limitarTexto(src.user_agent || src.userAgent || req?.get?.("user-agent"), 300);
   const stage = limitarTexto(src.attribution_stage || src.stage || "touch", 40) || "touch";
 
@@ -249,11 +446,11 @@ function normalizarAdsAttribution(input = {}, req) {
 
   const hasAny = !!(
     gclid || gbraid || wbraid || fbclid || Object.keys(utm).length || landingUrl || referrer ||
-    checkoutSessionId || Object.keys(firstTouch).length || Object.keys(lastTouch).length
+    checkoutSessionId || installId || attributionId || Object.keys(firstTouch).length || Object.keys(lastTouch).length
   );
   return {
     gclid, gbraid, wbraid, fbclid, utm, landingUrl, referrer,
-    checkoutSessionId, userAgent, firstTouch, lastTouch, stage, hasAny
+    checkoutSessionId, installId, attributionId, userAgent, firstTouch, lastTouch, stage, hasAny
   };
 }
 
@@ -330,6 +527,32 @@ async function salvarAdsAttribution(atendimentoId, attribution, req) {
       ads.checkoutSessionId, ads.lastTouch?.captured_at || ads.firstTouch?.captured_at || ""
     ]
   ).catch(e => console.warn("[ADS-TOUCHPOINT] Falha ao registrar touchpoint:", e.message));
+
+  if (ads.installId || ads.attributionId) {
+    await pool.query(
+      `UPDATE fila_atendimentos
+          SET app_install_id=COALESCE(app_install_id,NULLIF($2,'')),
+              app_attribution_id=COALESCE(app_attribution_id,NULLIF($3,''))
+        WHERE id=$1`,
+      [id, ads.installId, ads.attributionId]
+    ).catch(e => console.warn("[APP-ATTR] Falha ao vincular atendimento:", e.message));
+    if (ads.installId) {
+      await pool.query(
+        `UPDATE app_attributions
+            SET atendimento_id=COALESCE(atendimento_id,$2),updated_at=NOW()
+          WHERE install_id=$1`,
+        [ads.installId, id]
+      ).catch(e => console.warn("[APP-ATTR] Falha ao vincular instalação:", e.message));
+    }
+    const appEventKey = sha256Hex(`attendance_started:${id}:${ads.installId || ads.attributionId}`);
+    await pool.query(
+      `INSERT INTO app_attribution_events (
+         event_key,event_name,attribution_id,install_id,atendimento_id,metadata
+       ) VALUES ($1,'attendance_started',$2,$3,$4,'{}'::jsonb)
+       ON CONFLICT (event_key) DO NOTHING`,
+      [appEventKey, ads.attributionId || null, ads.installId || null, id]
+    ).catch(e => console.warn("[APP-ATTR] Falha ao registrar início de atendimento:", e.message));
+  }
 }
 
 function envBool(name, fallback = false) {
