@@ -8,7 +8,7 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
-const BETA_TEST_PHONE = '98991344646';
+const BETA_TEST_PHONE = '98900000000';
 const REVIEW_PATIENT_NAME = 'Apple Review Patient';
 const REVIEW_PROFESSIONAL_NAME = 'Equipe de demonstração';
 const JSON_BODY = express.json({ limit: '32kb' });

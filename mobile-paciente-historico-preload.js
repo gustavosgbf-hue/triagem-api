@@ -9,7 +9,7 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
-const BETA_TEST_PHONE = '98991344646';
+const BETA_TEST_PHONE = '98900000000';
 
 function digits(value) {
   return String(value || '').replace(/\D/g, '');

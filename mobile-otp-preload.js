@@ -13,7 +13,9 @@ const pool = new Pool({
 const OTP_TTL_MINUTES = 5;
 const OTP_MAX_ATTEMPTS = 6;
 const OTP_MAX_SENDS_10_MIN = 4;
-const APP_REVIEW_PHONE = '98991344646';
+// Use a synthetic phone for store review so a real patient's number is never reserved.
+const APP_REVIEW_PHONE = process.env.APP_REVIEW_PHONE || '98900000000';
+const LEGACY_APP_REVIEW_PHONE = '98991344646';
 const APP_REVIEW_CODE = '246810';
 const APP_REVIEW_NAME = 'Apple Review Patient';
 const JSON_BODY = express.json({ limit: '32kb' });
@@ -61,7 +63,36 @@ function safeHashEquals(a, b) {
   }
 }
 
+async function migrateLegacyReviewIdentity() {
+  if (APP_REVIEW_PHONE === LEGACY_APP_REVIEW_PHONE) return;
+
+  // The old review credential reused a real person's phone. Move only the
+  // unmistakable App Review/demo records to the synthetic review identity.
+  await pool.query(
+    `UPDATE pacientes
+        SET tel=$2
+      WHERE RIGHT(regexp_replace(COALESCE(tel,''), '\\D', '', 'g'), 11)=$1
+        AND (
+          LOWER(COALESCE(nome,'')) IN ('review patient','apple review patient')
+          OR LOWER(COALESCE(email,''))='promosyuri@gmail.com'
+        )`,
+    [LEGACY_APP_REVIEW_PHONE, APP_REVIEW_PHONE],
+  ).catch((error) => console.warn('[PACIENTE-OTP] Falha ao migrar conta antiga de review:', error.message));
+
+  await pool.query(
+    `UPDATE fila_atendimentos f
+        SET tel=$2
+      WHERE RIGHT(regexp_replace(COALESCE(to_jsonb(f)->>'tel',''), '\\D', '', 'g'), 11)=$1
+        AND (
+          COALESCE(LOWER(to_jsonb(f)->>'pagamento_metodo'),'') IN ('beta_test','admin_manual')
+          OR LOWER(COALESCE(to_jsonb(f)->>'nome','')) IN ('review patient','app review patient')
+        )`,
+    [LEGACY_APP_REVIEW_PHONE, APP_REVIEW_PHONE],
+  ).catch((error) => console.warn('[PACIENTE-OTP] Falha ao migrar histórico antigo de review:', error.message));
+}
+
 async function ensureOtpTable() {
+  await migrateLegacyReviewIdentity();
   await pool.query(`
     CREATE TABLE IF NOT EXISTS paciente_otp_desafios (
       id UUID PRIMARY KEY,
@@ -121,6 +152,14 @@ async function findPatientByPhone(phone) {
   return result.rows[0] || null;
 }
 
+function linkableHistoryFilter(alias = 'f') {
+  return `
+    AND COALESCE(LOWER(to_jsonb(${alias})->>'pagamento_metodo'),'') NOT IN ('beta_test','admin_manual')
+    AND COALESCE(LOWER(to_jsonb(${alias})->>'status'),'') NOT IN ('pagamento_pendente','triagem','cancelado','expirado','arquivado')
+    AND COALESCE(LOWER(to_jsonb(${alias})->>'pagamento_status'),'') <> 'pendente'
+  `;
+}
+
 async function findHistoryIdentity(phone) {
   const result = await pool.query(
     `SELECT
@@ -128,6 +167,7 @@ async function findHistoryIdentity(phone) {
        NULLIF(regexp_replace(COALESCE(to_jsonb(f)->>'cpf',''), '\\D', '', 'g'), '') AS cpf
        FROM fila_atendimentos f
       WHERE RIGHT(regexp_replace(COALESCE(to_jsonb(f)->>'tel',''), '\\D', '', 'g'), 11) = $1
+        ${linkableHistoryFilter('f')}
       ORDER BY COALESCE(NULLIF(to_jsonb(f)->>'criado_em','')::timestamptz, NOW()) DESC
       LIMIT 1`,
     [phone],
@@ -141,6 +181,7 @@ async function historyHasCpf(phone, cpf) {
     `SELECT 1
        FROM fila_atendimentos f
       WHERE RIGHT(regexp_replace(COALESCE(to_jsonb(f)->>'tel',''), '\\D', '', 'g'), 11) = $1
+        ${linkableHistoryFilter('f')}
         AND (
           regexp_replace(COALESCE(to_jsonb(f)->>'cpf',''), '\\D', '', 'g') = $2
           OR regexp_replace(COALESCE(to_jsonb(f)->>'pagador_cpf',''), '\\D', '', 'g') = $2
@@ -156,6 +197,7 @@ async function phoneHasHistory(phone) {
     `SELECT 1
        FROM fila_atendimentos f
       WHERE RIGHT(regexp_replace(COALESCE(to_jsonb(f)->>'tel',''), '\\D', '', 'g'), 11) = $1
+        ${linkableHistoryFilter('f')}
       LIMIT 1`,
     [phone],
   );
@@ -280,6 +322,7 @@ function installMobileOtpRoutes(app) {
 
   app.post('/api/paciente/otp/solicitar', JSON_BODY, async (req, res) => {
     try {
+      await otpTableReady();
       const phone = normalizePhone(req.body?.telefone);
       const suppliedEmail = normalizeEmail(req.body?.email);
       const suppliedCpf = normalizeCpf(req.body?.cpf);

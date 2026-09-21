@@ -41,7 +41,7 @@ if (process.env.DATABASE_URL) {
     await pool.query(`
       UPDATE pacientes
          SET nome='Review Patient'
-       WHERE RIGHT(regexp_replace(COALESCE(tel,''), '\\D', '', 'g'), 11)='98991344646'
+       WHERE RIGHT(regexp_replace(COALESCE(tel,''), '\\D', '', 'g'), 11)='98900000000'
     `);
     console.log('[REVIEW-COPY] mensagens existentes e nome da conta de revisão normalizados.');
   } catch (error) {

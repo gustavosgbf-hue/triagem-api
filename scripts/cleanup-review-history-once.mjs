@@ -6,7 +6,7 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
-const REVIEW_PHONE = '98991344646';
+const REVIEW_PHONE = '98900000000';
 const KEEP_ATTENDANCE_ID = 3432;
 const CLEANUP_THROUGH_ID = 3624;
 

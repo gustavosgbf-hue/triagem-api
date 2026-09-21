@@ -9,8 +9,8 @@ if (src.includes('BETA_TEST_PHONES')) {
 }
 
 src = src.replace(
-  "const BETA_TEST_PHONE = '98991344646';",
-  "const BETA_TEST_PHONES = new Set(['98991344646', '98900000000']);",
+  "const BETA_TEST_PHONE = '98900000000';",
+  "const BETA_TEST_PHONES = new Set(['98900000000']);",
 );
 src = src.replace(
   "return normalizePhone(paciente.tel) === BETA_TEST_PHONE ? paciente : null;",

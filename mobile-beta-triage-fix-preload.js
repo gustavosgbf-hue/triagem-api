@@ -7,7 +7,7 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false },
 });
 
-const REVIEW_PHONE = '98991344646';
+const REVIEW_PHONE = '98900000000';
 
 function normalizePhone(value) {
   let n = String(value || '').replace(/\D/g, '');
