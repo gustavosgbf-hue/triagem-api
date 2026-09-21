@@ -4461,7 +4461,7 @@ app.get("/api/atendimento/status/:id", async (req, res) => {
     const result = await pool.query(
       `SELECT id, status, tipo, medico_nome, meet_link, criado_em, assumido_em, encerrado_em,
               nome, tel, cpf, data_nascimento, idade, sexo, alergias, cronicas, medicacoes,
-              queixa, triagem, solicita, email,
+              queixa, triagem, solicita, email, prontuario, prontuario AS prontuario_salvo,
               pagamento_status, pagbank_order_id, efi_charge_id, categoria_atendimento,
               especialidade_solicitada, valor_cobrado_centavos, fallback_disponivel_em,
               fallback_decisao, fallback_decidido_em, reembolso_status, mostrar_avaliacao_google,
@@ -8571,7 +8571,7 @@ app.get("/api/admin/historico", checkAdmin, async (req, res) => {
     const result = await pool.query(
       `SELECT id,origem_plataforma,nome,tel,tel_documentos,cpf,email,tipo,triagem,queixa,status,pagamento_status,
               pagbank_order_id,efi_charge_id,pagamento_confirmado_em,ads_checkout_session_id,
-              medico_id,medico_nome,prontuario,
+              medico_id,medico_nome,prontuario,prontuario AS prontuario_salvo,
               criado_em,assumido_em,encerrado_em,data_nascimento,idade,sexo,alergias,cronicas,medicacoes,
               solicita,status_atendimento,documentos_emitidos,questionario,anexos_urls,endereco_envio,
               frete_modalidade,frete_valor
