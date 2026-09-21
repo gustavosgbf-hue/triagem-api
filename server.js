@@ -8358,6 +8358,79 @@ app.get("/api/atendimento/:id/memed-context", checkMedico, async (req, res) => {
   }
 });
 
+// Dados regulatórios do próprio prescritor — usados pela integração Memed.
+// O profissional pode consultar e completar os próprios dados sem depender do admin.
+app.get("/api/prescritor/dados-regulatorios", checkMedicoOuEspecialista, async (req, res) => {
+  try {
+    const tabela = req._isEspecialista ? "especialistas" : "medicos";
+    const { rows } = await pool.query(
+      `SELECT id,nome,nome_exibicao,email,crm,uf,cpf_medico,data_nascimento_medico
+         FROM ${tabela} WHERE id=$1 LIMIT 1`,
+      [req.medicoId]
+    );
+    if (!rows.length) return res.status(404).json({ ok:false, error:"Profissional não encontrado" });
+    const p = rows[0];
+    const dados = validarDadosPrescritor(p);
+    return res.json({
+      ok:true,
+      prescritor:{
+        id:p.id,
+        nome:p.nome_exibicao || p.nome || "",
+        email:p.email || "",
+        crm:p.crm || "",
+        uf:(p.uf || "").toUpperCase(),
+        cpf_medico:p.cpf_medico || "",
+        data_nascimento_medico:normalizarDataNascimentoMedico(p.data_nascimento_medico) || ""
+      },
+      faltantes:dados.faltantes
+    });
+  } catch (err) {
+    console.error("[MEMED] Erro ao carregar dados regulatórios do prescritor:", err.message);
+    return res.status(500).json({ ok:false, error:"Erro ao carregar dados do prescritor" });
+  }
+});
+
+app.put("/api/prescritor/dados-regulatorios", checkMedicoOuEspecialista, async (req, res) => {
+  try {
+    const crm = String(req.body?.crm || "").replace(/\D/g, "");
+    const uf = String(req.body?.uf || "").trim().toUpperCase();
+    const cpf = String(req.body?.cpf_medico || "").replace(/\D/g, "");
+    const nascimento = normalizarDataNascimentoMedico(req.body?.data_nascimento_medico);
+
+    if (crm.length < 3) return res.status(400).json({ ok:false, error:"Informe um CRM válido." });
+    if (!/^[A-Z]{2}$/.test(uf)) return res.status(400).json({ ok:false, error:"Informe a UF do CRM com 2 letras." });
+    if (cpf.length !== 11) return res.status(400).json({ ok:false, error:"Informe o CPF com 11 dígitos." });
+    if (!nascimento) return res.status(400).json({ ok:false, error:"Informe uma data de nascimento válida." });
+
+    const tabela = req._isEspecialista ? "especialistas" : "medicos";
+    const { rows } = await pool.query(
+      `UPDATE ${tabela}
+          SET crm=$1, uf=$2, cpf_medico=$3, data_nascimento_medico=$4
+        WHERE id=$5
+        RETURNING id,nome,nome_exibicao,email,crm,uf,cpf_medico,data_nascimento_medico`,
+      [crm, uf, cpf, nascimento, req.medicoId]
+    );
+    if (!rows.length) return res.status(404).json({ ok:false, error:"Profissional não encontrado" });
+
+    // Se já existe cadastro Memed, a próxima solicitação de token sincroniza os dados.
+    return res.json({
+      ok:true,
+      prescritor:{
+        id:rows[0].id,
+        nome:rows[0].nome_exibicao || rows[0].nome || "",
+        email:rows[0].email || "",
+        crm:rows[0].crm,
+        uf:rows[0].uf,
+        cpf_medico:rows[0].cpf_medico,
+        data_nascimento_medico:normalizarDataNascimentoMedico(rows[0].data_nascimento_medico) || ""
+      }
+    });
+  } catch (err) {
+    console.error("[MEMED] Erro ao salvar dados regulatórios do prescritor:", err.message);
+    return res.status(500).json({ ok:false, error:"Erro ao salvar dados do prescritor" });
+  }
+});
+
 app.get("/api/memed/token", checkMedicoOuEspecialista, async (req, res) => {
   try {
     if (!MEMED_API_KEY || !MEMED_SECRET_KEY) {
