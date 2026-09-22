@@ -237,6 +237,47 @@ app.post("/api/tracking/play-click", rlAttribution, trackingTextBody, async (req
   }
 });
 
+
+app.post("/api/tracking/app-store-click", rlAttribution, trackingTextBody, async (req, res) => {
+  try {
+    const body = trackingBody(req.body);
+    const attributionId = trackingId(body.attribution_id || body.cjaid);
+    if (!attributionId) return res.status(400).json({ ok: false, error: "attribution_id_invalido" });
+    const ads = normalizarAdsAttribution(body, req);
+    const capturedAt = trackingIsoDate(body.captured_at);
+    const eventKey = sha256Hex(JSON.stringify({
+      event: "app_store_click",
+      attributionId,
+      capturedAt,
+      placement: limitarTexto(body.placement, 120)
+    }));
+    await adsAttributionSchemaReady;
+    await pool.query(
+      `INSERT INTO app_attribution_events (
+         event_key,event_name,attribution_id,metadata,captured_at
+       ) VALUES ($1,'app_store_click',$2,$3::jsonb,COALESCE($4::timestamptz,NOW()))
+       ON CONFLICT (event_key) DO NOTHING`,
+      [
+        eventKey,
+        attributionId,
+        JSON.stringify({
+          placement: limitarTexto(body.placement, 120),
+          landing_url: limitarTexto(body.landing_url, 700),
+          gclid: ads.gclid,
+          gbraid: ads.gbraid,
+          wbraid: ads.wbraid,
+          ...ads.utm
+        }),
+        capturedAt
+      ]
+    );
+    return res.json({ ok: true });
+  } catch (e) {
+    console.warn("[APP-ATTR] Falha ao registrar clique na App Store:", e.message);
+    return res.status(400).json({ ok: false, error: "tracking_payload_invalido" });
+  }
+});
+
 app.post("/api/tracking/app-install", rlAttribution, async (req, res) => {
   try {
     const body = trackingBody(req.body);
