@@ -278,6 +278,58 @@ app.post("/api/tracking/app-store-click", rlAttribution, trackingTextBody, async
   }
 });
 
+
+const APP_TELEMETRY_EVENTS = new Set([
+  "ios_first_open",
+  "ios_login",
+  "ios_consulta_started",
+  "ios_payment_confirmed",
+]);
+
+app.post("/api/tracking/app-event", rlAttribution, async (req, res) => {
+  try {
+    const body = trackingBody(req.body);
+    const eventName = limitarTexto(body.event_name, 80);
+    const installId = trackingId(body.install_id);
+    const atendimentoId = Number.parseInt(String(body.atendimento_id || ""), 10) || null;
+
+    if (!APP_TELEMETRY_EVENTS.has(eventName)) {
+      return res.status(400).json({ ok: false, error: "evento_invalido" });
+    }
+    if (!installId) {
+      return res.status(400).json({ ok: false, error: "install_id_invalido" });
+    }
+    if ((eventName === "ios_consulta_started" || eventName === "ios_payment_confirmed") && !atendimentoId) {
+      return res.status(400).json({ ok: false, error: "atendimento_id_invalido" });
+    }
+
+    const capturedAt = trackingIsoDate(body.captured_at);
+    const eventKey = sha256Hex(eventName + ":" + installId + ":" + (atendimentoId || ""));
+    await adsAttributionSchemaReady;
+    await pool.query(
+      `INSERT INTO app_attribution_events (
+         event_key,event_name,install_id,atendimento_id,metadata,captured_at
+       ) VALUES ($1,$2,$3,$4,$5::jsonb,COALESCE($6::timestamptz,NOW()))
+       ON CONFLICT (event_key) DO NOTHING`,
+      [
+        eventKey,
+        eventName,
+        installId,
+        atendimentoId,
+        JSON.stringify({
+          platform: "ios",
+          user_agent: limitarTexto(req.get("user-agent"), 300),
+        }),
+        capturedAt,
+      ]
+    );
+    return res.json({ ok: true });
+  } catch (e) {
+    console.warn("[APP-TELEMETRY] Falha ao registrar evento iOS:", e.message);
+    return res.status(400).json({ ok: false, error: "tracking_payload_invalido" });
+  }
+});
+
 app.post("/api/tracking/app-install", rlAttribution, async (req, res) => {
   try {
     const body = trackingBody(req.body);
