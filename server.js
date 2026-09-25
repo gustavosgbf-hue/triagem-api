@@ -10094,6 +10094,94 @@ app.post("/api/efi/cartao/cobrar", rlGeral, async (req, res) => {
     const headers   = { Authorization: `Bearer ${efiToken}`, "Content-Type": "application/json" };
     const httpsAgent = getEfiAgent();
 
+    // ── Proteção contra cobrança duplicada ────────────────────────────────────
+    // Se este atendimento já tem uma cobrança Efí associada, primeiro consulta
+    // o status real dela. Enquanto estiver "waiting", NÃO cria uma nova charge.
+    // Se já estiver paga, confirma o atendimento e reutiliza a cobrança.
+    if (atendimentoIdNum) {
+      const { rows: pagamentoRows } = await pool.query(
+        `SELECT pagamento_status, efi_charge_id
+           FROM fila_atendimentos
+          WHERE id = $1
+          LIMIT 1`,
+        [atendimentoIdNum]
+      );
+      const pagamentoAtual = pagamentoRows[0];
+
+      if (pagamentoAtual?.pagamento_status === "confirmado") {
+        return res.status(409).json({
+          ok: false,
+          already_paid: true,
+          status: "paid",
+          charge_id: pagamentoAtual.efi_charge_id || null,
+          error: "Este atendimento já possui pagamento confirmado."
+        });
+      }
+
+      const chargeExistente = String(pagamentoAtual?.efi_charge_id || "").trim();
+      if (chargeExistente) {
+        try {
+          const existenteRes = await axios.get(
+            `${EFI_BASE_URL}/v1/charge/${chargeExistente}`,
+            { httpsAgent, headers }
+          );
+          const statusExistente = String(existenteRes.data?.data?.status || "").toLowerCase();
+
+          if (statusExistente === "paid" || statusExistente === "approved") {
+            await pool.query(
+              `UPDATE fila_atendimentos
+                  SET pagamento_status = 'confirmado',
+                      pagamento_confirmado_em = COALESCE(pagamento_confirmado_em, NOW()),
+                      pagamento_metodo = 'cartao',
+                      status = CASE
+                        WHEN status = 'pagamento_pendente' THEN 'triagem'
+                        ELSE status
+                      END
+                WHERE id = $1`,
+              [atendimentoIdNum]
+            );
+            console.log(`[EFI-CARTAO] Atendimento #${atendimentoIdNum} — cobrança existente ${chargeExistente} já paga; reutilizando.`);
+            return res.json({ ok: true, charge_id: chargeExistente, status: "paid", reused: true });
+          }
+
+          if (statusExistente === "waiting") {
+            console.log(`[EFI-CARTAO] Atendimento #${atendimentoIdNum} — cobrança ${chargeExistente} ainda em análise; nova cobrança bloqueada.`);
+            return res.json({ ok: true, charge_id: chargeExistente, status: "waiting", reused: true });
+          }
+
+          // Cobrança anterior terminou sem pagamento. Libera uma nova tentativa
+          // removendo o vínculo antigo antes de criar outra charge.
+          if (["unpaid","canceled","cancelled","expired","refunded"].includes(statusExistente)) {
+            await pool.query(
+              `UPDATE fila_atendimentos
+                  SET efi_charge_id = NULL
+                WHERE id = $1 AND efi_charge_id = $2 AND pagamento_status = 'pendente'`,
+              [atendimentoIdNum, chargeExistente]
+            );
+            console.log(`[EFI-CARTAO] Atendimento #${atendimentoIdNum} — cobrança anterior ${chargeExistente} status ${statusExistente}; nova tentativa liberada.`);
+          } else {
+            // Status desconhecido: comportamento conservador para não duplicar cobrança.
+            return res.status(409).json({
+              ok: false,
+              pending_charge: true,
+              charge_id: chargeExistente,
+              status: statusExistente || "unknown",
+              error: "Já existe uma cobrança em processamento para este atendimento. Aguarde a confirmação antes de tentar novamente."
+            });
+          }
+        } catch (e) {
+          console.warn("[EFI-CARTAO] Não foi possível validar cobrança existente:", e.response?.data || e.message);
+          return res.status(409).json({
+            ok: false,
+            pending_charge: true,
+            charge_id: chargeExistente,
+            status: "unknown",
+            error: "Já existe uma cobrança em processamento para este atendimento. Aguarde alguns instantes antes de tentar novamente."
+          });
+        }
+      }
+    }
+
     // ── PASSO 1: Criar a transação ────────────────────────────────────────────
     // Endpoint: POST /v1/charge
     // Retorna charge_id que será usado no passo 2
@@ -10166,11 +10254,10 @@ app.post("/api/efi/cartao/cobrar", rlGeral, async (req, res) => {
 
     console.log(`[EFI-CARTAO] Passo 2 — charge_id: ${chargeId} status: ${status} reason: ${reason}`);
 
-    // ── Pagamento aprovado imediatamente (raro) OU aguardando análise (esperado) ──
-    // A doc Efí mostra que /pay responde "waiting" na maioria dos casos aprovados.
-    // "paid" pode ocorrer em sandbox ou pagamentos pré-aprovados.
-    // Em ambos os casos: salva o charge_id e retorna ok:true ao frontend.
-    // A confirmação final (pagamento_status='confirmado') sempre vem via webhook.
+    // ── Pagamento aprovado imediatamente OU aguardando análise ────────────────
+    // "waiting" significa apenas que a cobrança foi recebida e está em análise.
+    // O frontend deve manter o paciente aguardando e só liberar a triagem quando
+    // o backend estiver com pagamento_status='confirmado' (paid/approved ou webhook).
     if (status === "paid" || status === "waiting" || status === "approved") {
       // Sempre salva o efi_charge_id para o webhook conseguir achar o atendimento depois
       if (atendimentoId) {
