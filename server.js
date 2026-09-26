@@ -4555,7 +4555,7 @@ app.get("/api/atendimento/status/:id", async (req, res) => {
       `SELECT id, status, tipo, medico_nome, meet_link, criado_em, assumido_em, encerrado_em,
               nome, tel, cpf, data_nascimento, idade, sexo, alergias, cronicas, medicacoes,
               queixa, triagem, solicita, email, prontuario, prontuario AS prontuario_salvo,
-              pagamento_status, pagbank_order_id, efi_charge_id, categoria_atendimento,
+              pagamento_status, pagamento_confirmado_em, pagbank_order_id, efi_charge_id, categoria_atendimento,
               especialidade_solicitada, valor_cobrado_centavos, fallback_disponivel_em,
               fallback_decisao, fallback_decidido_em, reembolso_status, mostrar_avaliacao_google,
               reembolso_valor_centavos, reembolso_processado_em,
@@ -4595,6 +4595,41 @@ app.get("/api/atendimento/status/:id", async (req, res) => {
         }
       } catch (e) {
         console.warn('[STATUS-FALLBACK] Falha ao consultar PagBank:', e.message);
+      }
+    }
+
+    // Classifica aquisição para o Google Ads sem expor dados pessoais.
+    // "Novo" = nenhuma compra confirmada ANTERIOR do mesmo paciente,
+    // usando CPF, e-mail ou telefone como identificadores internos.
+    // O Google recomenda uma janela de 540 dias para new_customer.
+    if (at.pagamento_status === 'confirmado') {
+      try {
+        const cpfN = String(at.cpf || '').replace(/\D/g, '');
+        const emailN = String(at.email || '').trim().toLowerCase();
+        const telN = String(at.tel || '').replace(/\D/g, '');
+        const anterior = await pool.query(
+          `SELECT 1
+             FROM fila_atendimentos ant
+            WHERE ant.id <> $1
+              AND ant.pagamento_status = 'confirmado'
+              AND COALESCE(ant.pagamento_confirmado_em, ant.criado_em)
+                    < COALESCE($2::timestamptz, NOW())
+              AND COALESCE(ant.pagamento_confirmado_em, ant.criado_em)
+                    >= COALESCE($2::timestamptz, NOW()) - INTERVAL '540 days'
+              AND (
+                ($3::text <> '' AND regexp_replace(COALESCE(ant.cpf,''), '\D', '', 'g') = $3)
+                OR ($4::text <> '' AND LOWER(BTRIM(COALESCE(ant.email,''))) = $4)
+                OR ($5::text <> '' AND regexp_replace(COALESCE(ant.tel,''), '\D', '', 'g') = $5)
+              )
+            LIMIT 1`,
+          [at.id, at.pagamento_confirmado_em || at.criado_em, cpfN, emailN, telN]
+        );
+        at.cliente_novo = anterior.rowCount === 0;
+        at.customer_type = at.cliente_novo ? 'new' : 'returning';
+      } catch (e) {
+        console.warn('[CUSTOMER-TYPE] Falha ao classificar atendimento #' + at.id + ':', e.message);
+        at.cliente_novo = null;
+        at.customer_type = 'unknown';
       }
     }
 
