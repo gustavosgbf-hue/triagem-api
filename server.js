@@ -773,6 +773,22 @@ function montarGoogleAdsUserIdentifiers(at) {
   return ids.slice(0, 5);
 }
 
+function montarGoogleDataManagerUserData(at) {
+  const userIdentifiers = [];
+  const email = String(at?.email || "").trim().toLowerCase();
+  if (/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    userIdentifiers.push({ emailAddress: sha256Hex(email) });
+  }
+  const phone = normalizarTelefoneE164Brasil(at?.tel || "");
+  if (phone) userIdentifiers.push({ phoneNumber: sha256Hex(phone) });
+  return userIdentifiers.length ? { userIdentifiers: userIdentifiers.slice(0, 10) } : null;
+}
+
+function origemEventoGoogleDataManager(at) {
+  const origem = String(at?.origem_plataforma || "").trim().toLowerCase();
+  return origem === "ios" || origem === "android" ? "APP" : "WEB";
+}
+
 async function classificarClienteGoogleAds(at, opts = {}) {
   if (!at?.id) return { clienteNovo: null, customerType: "unknown" };
 
@@ -1003,18 +1019,20 @@ async function enviarConversaoDataManagerGoogleAds(at, valor, currency, opts = {
   if (at.ads_gclid) adIdentifiers.gclid = String(at.ads_gclid);
   else if (at.ads_wbraid) adIdentifiers.wbraid = String(at.ads_wbraid);
   else if (at.ads_gbraid) adIdentifiers.gbraid = String(at.ads_gbraid);
-  if (!Object.keys(adIdentifiers).length) return { ok: false, skipped: "no_click_id" };
+  const userData = montarGoogleDataManagerUserData(at);
+  if (!Object.keys(adIdentifiers).length && !userData) return { ok: false, skipped: "no_match_data" };
 
   const token = await obterGoogleDataManagerAccessToken(cfg);
   const classificacao = await classificarClienteGoogleAds(at);
   const event = {
-    adIdentifiers,
     conversionValue: Number(valor) || 49.90,
     currency: limitarTexto(currency || "BRL", 3).toUpperCase(),
     eventTimestamp: new Date(at.pagamento_confirmado_em || Date.now()).toISOString(),
     transactionId: String(at.id),
-    eventSource: "WEB"
+    eventSource: origemEventoGoogleDataManager(at)
   };
+  if (Object.keys(adIdentifiers).length) event.adIdentifiers = adIdentifiers;
+  if (userData) event.userData = userData;
   if (classificacao.customerType === "new" || classificacao.customerType === "returning") {
     event.userProperties = {
       customerType: classificacao.customerType === "new" ? "NEW" : "RETURNING"
@@ -1081,7 +1099,7 @@ async function enviarConversaoOfflineGoogleAds(at, metodo, origem, externalId, o
   }
   if (!click.field && userIdentifiers.length === 0) {
     console.log("GOOGLE_ADS_OFFLINE_SKIP_NO_MATCH_DATA", { consultaId: String(at.id) });
-    await marcarGoogleAdsOffline(at.id, "no_match_data", { error: "sem_gclid_gbraid_wbraid" });
+    await marcarGoogleAdsOffline(at.id, "no_match_data", { error: "sem_identificador_google_ou_user_data" });
     return { ok: false, skipped: "no_match_data" };
   }
 
@@ -8841,6 +8859,46 @@ app.get("/api/admin/atendimento/:id/chat", checkAdmin, async (req, res) => {
 
 // Diagnóstico administrativo de pagamentos e fila, inclusive registros ainda
 // pendentes/na triagem que não aparecem no histórico clínico.
+app.get("/api/admin/google-ads/metricas", checkAdmin, async (req, res) => {
+  try {
+    const dias = Math.min(90, Math.max(1, parseInt(req.query.dias || "30", 10) || 30));
+    const { rows } = await pool.query(`
+      WITH base AS (
+        SELECT
+          (pagamento_confirmado_em AT TIME ZONE 'America/Fortaleza')::date AS dia,
+          COALESCE(cliente_novo, false) AS cliente_novo,
+          COALESCE(customer_type,'unknown') AS customer_type,
+          COALESCE(valor_cobrado_centavos,0) AS valor_centavos,
+          COALESCE(google_ads_margem_valor_centavos,0) AS margem_centavos,
+          COALESCE(google_ads_offline_status,'') AS ads_status,
+          COALESCE(google_ads_margem_status,'') AS margem_status,
+          CASE WHEN COALESCE(ads_gclid,'')<>'' OR COALESCE(ads_wbraid,'')<>'' OR COALESCE(ads_gbraid,'')<>'' THEN 1 ELSE 0 END AS tem_click_id,
+          CASE WHEN COALESCE(NULLIF(BTRIM(email),''), NULLIF(regexp_replace(COALESCE(tel,''),'\D','','g'),'')) IS NOT NULL THEN 1 ELSE 0 END AS tem_user_data,
+          COALESCE(origem_plataforma,'unknown') AS origem
+        FROM fila_atendimentos
+        WHERE pagamento_status='confirmado'
+          AND pagamento_confirmado_em >= (NOW() AT TIME ZONE 'America/Fortaleza') - ($1::text || ' days')::interval
+      )
+      SELECT dia,
+             COUNT(*)::int AS pagos,
+             COUNT(*) FILTER (WHERE customer_type='new')::int AS novos,
+             COUNT(*) FILTER (WHERE customer_type='returning')::int AS recorrentes,
+             COUNT(*) FILTER (WHERE ads_status='sent')::int AS ads_enviados,
+             COUNT(*) FILTER (WHERE margem_status='sent')::int AS margem_enviada,
+             SUM(tem_click_id)::int AS com_click_id,
+             SUM(tem_user_data)::int AS com_user_data,
+             ROUND(SUM(valor_centavos)/100.0,2) AS faturamento,
+             ROUND(SUM(margem_centavos)/100.0,2) AS margem_reportada
+        FROM base
+       GROUP BY dia
+       ORDER BY dia DESC`, [dias]);
+    return res.json({ ok: true, dias, diario: rows });
+  } catch (e) {
+    console.error("[GOOGLE-ADS-METRICAS]", e.message);
+    return res.status(500).json({ ok: false, error: "Erro ao carregar métricas" });
+  }
+});
+
 app.get("/api/admin/atendimentos/auditoria", checkAdmin, async (req, res) => {
   try {
     const busca = String(req.query.busca || "").trim();
@@ -12253,6 +12311,21 @@ const PORT = process.env.PORT || 10000;
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log("Servidor rodando na porta", PORT);
+  const dmTesteId = parseInt(process.env.GOOGLE_DATA_MANAGER_STARTUP_VALIDATE_ID || "", 10);
+  if (dmTesteId) {
+    setTimeout(async () => {
+      try {
+        const { rows } = await pool.query(`SELECT * FROM fila_atendimentos WHERE id=$1 LIMIT 1`, [dmTesteId]);
+        const at = rows[0];
+        if (!at) return console.warn("GOOGLE_DATA_MANAGER_STARTUP_VALIDATE_NOT_FOUND", { consultaId: String(dmTesteId) });
+        const r = await enviarConversaoDataManagerGoogleAds(at, Number(process.env.GOOGLE_ADS_CONVERSION_VALUE || "49.90") || 49.90, "BRL", { validateOnly: true });
+        console.log("GOOGLE_DATA_MANAGER_STARTUP_VALIDATE_RESULT", { consultaId: String(dmTesteId), ok: !!r?.ok, validated: !!r?.validated, skipped: r?.skipped || "", error: String(r?.error || "").slice(0,500) });
+      } catch (e) {
+        console.warn("GOOGLE_DATA_MANAGER_STARTUP_VALIDATE_ERROR", { consultaId: String(dmTesteId), error: String(e?.message || e).slice(0,500) });
+      }
+    }, 12000);
+  }
+
   const testeId = parseInt(process.env.GOOGLE_ADS_STARTUP_VALIDATE_ID || "", 10);
   if (testeId && envBool("GOOGLE_ADS_VALIDATE_ONLY", false)) {
     setTimeout(async () => {
