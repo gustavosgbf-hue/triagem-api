@@ -12277,6 +12277,20 @@ const PORT = process.env.PORT || 10000;
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log("Servidor rodando na porta", PORT);
+  const testeId = parseInt(process.env.GOOGLE_ADS_STARTUP_VALIDATE_ID || "", 10);
+  if (testeId && envBool("GOOGLE_ADS_VALIDATE_ONLY", false)) {
+    setTimeout(async () => {
+      try {
+        const { rows } = await pool.query(`SELECT * FROM fila_atendimentos WHERE id=$1 LIMIT 1`, [testeId]);
+        const at = rows[0];
+        if (!at) return console.warn("GOOGLE_ADS_STARTUP_VALIDATE_NOT_FOUND", { consultaId: String(testeId) });
+        const r = await enviarConversaoOfflineGoogleAds(at, "startup_validate", "startup_validate", at.pagbank_order_id || at.efi_charge_id || "", { force: true });
+        console.log("GOOGLE_ADS_STARTUP_VALIDATE_RESULT", { consultaId: String(testeId), ok: !!r?.ok, status: r?.status || "", error: String(r?.error || "").slice(0,500) });
+      } catch (e) {
+        console.warn("GOOGLE_ADS_STARTUP_VALIDATE_ERROR", { consultaId: String(testeId), error: String(e?.message || e).slice(0,500) });
+      }
+    }, 15000);
+  }
 });
 
 app.get("/webhook", (req, res) => {
