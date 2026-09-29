@@ -895,81 +895,50 @@ async function enviarConversaoMargemGoogleAds(at, medicoEmail, opts = {}) {
 
   const valorCentavos = calcularMargemOperacionalCentavos(at, medicoEmail);
   if (valorCentavos <= 0) return { ok: false, skipped: "sem_margem" };
-  const cfg = googleAdsMarginConfig();
-  if (!cfg.configured) {
+
+  const dmCfg = googleDataManagerConfig();
+  if (!dmCfg.enabled || !dmCfg.configured) {
+    const missing = dmCfg.enabled ? dmCfg.missing : ["GOOGLE_DATA_MANAGER_ENABLED"];
     await marcarGoogleAdsMargem(at.id, "unconfigured", {
-      error: cfg.missing.join(","),
+      error: missing.join(","),
       valorCentavos
     });
-    return { ok: false, skipped: "unconfigured", missing: cfg.missing };
+    return { ok: false, skipped: "unconfigured", missing };
   }
 
-  const click = selecionarGoogleAdsClickIds(at);
-  const userIdentifiers = cfg.sendUserData ? montarGoogleAdsUserIdentifiers(at) : [];
-  if (!click.field && userIdentifiers.length === 0) {
-    await marcarGoogleAdsMargem(at.id, "no_match_data", {
-      error: "sem_gclid_gbraid_wbraid",
-      valorCentavos
-    });
-    return { ok: false, skipped: "no_match_data" };
-  }
+  // Data Manager deduplica/ajusta pela mesma transactionId CJ24H-{id}.
+  // Enviar o valor final após o atendimento substitui o valor original sem criar nova conversão.
+  const r = await enviarConversaoDataManagerGoogleAds(
+    at,
+    valorCentavos / 100,
+    "BRL",
+    { validateOnly: opts.validateOnly ?? dmCfg.validateOnly }
+  );
 
-  const orderId = limitarTexto(`CJ24H-MARGEM-${at.id}`, 64);
-  const classificacao = await classificarClienteGoogleAds(at);
-  const conversion = {
-    ...click.payload,
-    conversionAction: cfg.actionResource,
-    conversionDateTime: formatarGoogleAdsDateTime(at.encerrado_em || new Date()),
-    conversionValue: valorCentavos / 100,
-    currencyCode: cfg.currency,
-    orderId,
-    conversionEnvironment: "WEB"
-  };
-  if (classificacao.customerType === "new" || classificacao.customerType === "returning") {
-    conversion.customerType = classificacao.customerType === "new" ? "NEW" : "RETURNING";
-  }
-  if (userIdentifiers.length) conversion.userIdentifiers = userIdentifiers;
-
-  const token = await obterGoogleAdsAccessToken();
-  const headers = {
-    Authorization: `Bearer ${token}`,
-    "Content-Type": "application/json"
-  };
-  if (cfg.loginCustomerId) headers["login-customer-id"] = cfg.loginCustomerId;
-  const endpoint = `https://googleads.googleapis.com/${cfg.apiVersion}/customers/${cfg.customerId}:uploadClickConversions`;
-  const res = await fetch(endpoint, {
-    method: "POST",
-    headers,
-    body: JSON.stringify({ conversions: [conversion], partialFailure: true, validateOnly: cfg.validateOnly })
-  });
-  const text = await res.text();
-  let data = {};
-  try { data = text ? JSON.parse(text) : {}; } catch (_) { data = { raw: text }; }
-  const partialError = data.partialFailureError || data.partial_failure_error;
-  if (!res.ok || partialError) {
-    const msg = partialError?.message || data.error?.message || text || `HTTP ${res.status}`;
+  if (!r.ok) {
     await marcarGoogleAdsMargem(at.id, "failed", {
-      error: msg,
-      orderId,
-      jobId: data.jobId,
+      error: String(r.error || r.skipped || "data_manager_failed"),
+      orderId: `CJ24H-${at.id}`,
+      jobId: r.requestId || "",
       valorCentavos
     });
-    return { ok: false, error: msg };
+    return { ok: false, error: r.error || r.skipped || "data_manager_failed", valorCentavos };
   }
 
-  const status = cfg.validateOnly ? "validated" : "sent";
+  const status = r.validated ? "validated" : "sent";
   await marcarGoogleAdsMargem(at.id, status, {
-    jobId: data.jobId,
-    orderId,
+    jobId: r.requestId || "",
+    orderId: `CJ24H-${at.id}`,
     error: "",
     valorCentavos
   });
-  console.log("GOOGLE_ADS_MARGIN_UPLOAD_OK", {
+  console.log("GOOGLE_ADS_MARGIN_RESTATEMENT_OK", {
     consultaId: String(at.id),
     status,
-    valorCentavos
+    valorCentavos,
+    transactionId: `CJ24H-${at.id}`
   });
-  return { ok: true, status, valorCentavos };
+  return { ok: true, status, valorCentavos, provider: "data_manager" };
 }
 
 let googleDataManagerTokenCache = { token: "", expiresAt: 0 };
@@ -979,7 +948,7 @@ function googleDataManagerConfig() {
   const conversionActionId = limitarTexto(process.env.GOOGLE_DATA_MANAGER_CONVERSION_ACTION_ID || process.env.GOOGLE_ADS_CONVERSION_ACTION_ID, 80);
   const clientId = process.env.GOOGLE_DATA_MANAGER_CLIENT_ID || process.env.GOOGLE_ADS_CLIENT_ID || "";
   const clientSecret = process.env.GOOGLE_DATA_MANAGER_CLIENT_SECRET || process.env.GOOGLE_ADS_CLIENT_SECRET || "";
-  const refreshToken = process.env.GOOGLE_DATA_MANAGER_REFRESH_TOKEN || "";
+  const refreshToken = process.env.GOOGLE_DATA_MANAGER_REFRESH_TOKEN || process.env.GOOGLE_ADS_REFRESH_TOKEN || "";
   const enabled = envBool("GOOGLE_DATA_MANAGER_ENABLED", false);
   const missing = [];
   if (!customerId) missing.push("GOOGLE_DATA_MANAGER_CUSTOMER_ID");
