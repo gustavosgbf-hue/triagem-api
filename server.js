@@ -774,6 +774,52 @@ function montarGoogleAdsUserIdentifiers(at) {
   return ids.slice(0, 5);
 }
 
+async function classificarClienteGoogleAds(at, opts = {}) {
+  if (!at?.id) return { clienteNovo: null, customerType: "unknown" };
+
+  const cpfN = String(at.cpf || "").replace(/\D/g, "");
+  const emailN = String(at.email || "").trim().toLowerCase();
+  const telN = String(at.tel || "").replace(/\D/g, "");
+  if (!cpfN && !emailN && !telN) {
+    return { clienteNovo: null, customerType: "unknown" };
+  }
+
+  const referencia = at.pagamento_confirmado_em || at.criado_em || new Date();
+  const anterior = await pool.query(
+    `SELECT 1
+       FROM fila_atendimentos ant
+      WHERE ant.id <> $1
+        AND ant.pagamento_status = 'confirmado'
+        AND COALESCE(ant.pagamento_confirmado_em, ant.criado_em) < $2::timestamptz
+        AND COALESCE(ant.pagamento_confirmado_em, ant.criado_em) >= $2::timestamptz - INTERVAL '540 days'
+        AND (
+          ($3::text <> '' AND regexp_replace(COALESCE(ant.cpf,''), '\\D', '', 'g') = $3)
+          OR ($4::text <> '' AND LOWER(BTRIM(COALESCE(ant.email,''))) = $4)
+          OR ($5::text <> '' AND regexp_replace(COALESCE(ant.tel,''), '\\D', '', 'g') = $5)
+        )
+      LIMIT 1`,
+    [at.id, referencia, cpfN, emailN, telN]
+  );
+
+  const clienteNovo = anterior.rowCount === 0;
+  const customerType = clienteNovo ? "new" : "returning";
+  at.cliente_novo = clienteNovo;
+  at.customer_type = customerType;
+
+  if (opts.persist !== false) {
+    await pool.query(
+      `UPDATE fila_atendimentos
+          SET cliente_novo = $2,
+              customer_type = $3,
+              customer_type_classificado_em = NOW()
+        WHERE id = $1`,
+      [at.id, clienteNovo, customerType]
+    ).catch(e => console.warn("[CUSTOMER-TYPE] Falha ao persistir #" + at.id + ":", e.message));
+  }
+
+  return { clienteNovo, customerType };
+}
+
 function selecionarGoogleAdsClickIds(at) {
   if (at.ads_gclid) return { field: "gclid", value: String(at.ads_gclid), payload: { gclid: String(at.ads_gclid) } };
   if (at.ads_wbraid) return { field: "wbraid", value: String(at.ads_wbraid), payload: { wbraid: String(at.ads_wbraid) } };
@@ -870,6 +916,7 @@ async function enviarConversaoMargemGoogleAds(at, medicoEmail, opts = {}) {
   }
 
   const orderId = limitarTexto(`CJ24H-MARGEM-${at.id}`, 64);
+  const classificacao = await classificarClienteGoogleAds(at);
   const conversion = {
     ...click.payload,
     conversionAction: cfg.actionResource,
@@ -879,6 +926,9 @@ async function enviarConversaoMargemGoogleAds(at, medicoEmail, opts = {}) {
     orderId,
     conversionEnvironment: "WEB"
   };
+  if (classificacao.customerType === "new" || classificacao.customerType === "returning") {
+    conversion.customerType = classificacao.customerType === "new" ? "NEW" : "RETURNING";
+  }
   if (userIdentifiers.length) conversion.userIdentifiers = userIdentifiers;
 
   const token = await obterGoogleAdsAccessToken();
@@ -989,6 +1039,7 @@ async function enviarConversaoDataManagerGoogleAds(at, valor, currency, opts = {
   if (!Object.keys(adIdentifiers).length) return { ok: false, skipped: "no_click_id" };
 
   const token = await obterGoogleDataManagerAccessToken(cfg);
+  const classificacao = await classificarClienteGoogleAds(at);
   const event = {
     adIdentifiers,
     conversionValue: Number(valor) || 49.90,
@@ -997,6 +1048,11 @@ async function enviarConversaoDataManagerGoogleAds(at, valor, currency, opts = {
     transactionId: `CJ24H-${at.id}`,
     eventSource: "WEB"
   };
+  if (classificacao.customerType === "new" || classificacao.customerType === "returning") {
+    event.userProperties = {
+      customerType: classificacao.customerType === "new" ? "NEW" : "RETURNING"
+    };
+  }
   const body = {
     destinations: [{
       operatingAccount: { product: "GOOGLE_ADS", accountId: cfg.customerId },
@@ -1063,6 +1119,7 @@ async function enviarConversaoOfflineGoogleAds(at, metodo, origem, externalId, o
   }
 
   const orderId = limitarTexto(`CJ24H-${at.id}`, 64);
+  const classificacao = await classificarClienteGoogleAds(at);
   const conversion = {
     ...click.payload,
     conversionAction: cfg.actionResource,
@@ -1072,6 +1129,9 @@ async function enviarConversaoOfflineGoogleAds(at, metodo, origem, externalId, o
     orderId,
     conversionEnvironment: "WEB"
   };
+  if (classificacao.customerType === "new" || classificacao.customerType === "returning") {
+    conversion.customerType = classificacao.customerType === "new" ? "NEW" : "RETURNING";
+  }
   if (userIdentifiers.length) conversion.userIdentifiers = userIdentifiers;
 
   const consentUserData = limitarTexto(process.env.GOOGLE_ADS_AD_USER_DATA_CONSENT, 20).toUpperCase();
@@ -1561,6 +1621,9 @@ async function initDB() {
       ['google_ads_offline_job_id','TEXT'],
       ['google_ads_offline_erro','TEXT'],
       ['google_ads_offline_order_id','TEXT'],
+      ['cliente_novo','BOOLEAN'],
+      ['customer_type','TEXT'],
+      ['customer_type_classificado_em','TIMESTAMPTZ'],
       ['google_ads_margem_status','TEXT'],
       ['google_ads_margem_enviado_em','TIMESTAMPTZ'],
       ['google_ads_margem_tentativas','INTEGER DEFAULT 0'],
@@ -4598,34 +4661,11 @@ app.get("/api/atendimento/status/:id", async (req, res) => {
       }
     }
 
-    // Classifica aquisição para o Google Ads sem expor dados pessoais.
-    // "Novo" = nenhuma compra confirmada ANTERIOR do mesmo paciente,
-    // usando CPF, e-mail ou telefone como identificadores internos.
-    // O Google recomenda uma janela de 540 dias para new_customer.
+    // Classifica aquisição em janela de 540 dias e persiste para uso
+    // tanto no front quanto nos uploads server-side do Google.
     if (at.pagamento_status === 'confirmado') {
       try {
-        const cpfN = String(at.cpf || '').replace(/\D/g, '');
-        const emailN = String(at.email || '').trim().toLowerCase();
-        const telN = String(at.tel || '').replace(/\D/g, '');
-        const anterior = await pool.query(
-          `SELECT 1
-             FROM fila_atendimentos ant
-            WHERE ant.id <> $1
-              AND ant.pagamento_status = 'confirmado'
-              AND COALESCE(ant.pagamento_confirmado_em, ant.criado_em)
-                    < COALESCE($2::timestamptz, NOW())
-              AND COALESCE(ant.pagamento_confirmado_em, ant.criado_em)
-                    >= COALESCE($2::timestamptz, NOW()) - INTERVAL '540 days'
-              AND (
-                ($3::text <> '' AND regexp_replace(COALESCE(ant.cpf,''), '\D', '', 'g') = $3)
-                OR ($4::text <> '' AND LOWER(BTRIM(COALESCE(ant.email,''))) = $4)
-                OR ($5::text <> '' AND regexp_replace(COALESCE(ant.tel,''), '\D', '', 'g') = $5)
-              )
-            LIMIT 1`,
-          [at.id, at.pagamento_confirmado_em || at.criado_em, cpfN, emailN, telN]
-        );
-        at.cliente_novo = anterior.rowCount === 0;
-        at.customer_type = at.cliente_novo ? 'new' : 'returning';
+        await classificarClienteGoogleAds(at);
       } catch (e) {
         console.warn('[CUSTOMER-TYPE] Falha ao classificar atendimento #' + at.id + ':', e.message);
         at.cliente_novo = null;
