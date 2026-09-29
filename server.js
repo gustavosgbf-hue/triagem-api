@@ -906,7 +906,7 @@ async function enviarConversaoMargemGoogleAds(at, medicoEmail, opts = {}) {
     return { ok: false, skipped: "unconfigured", missing };
   }
 
-  // Data Manager deduplica/ajusta pela mesma transactionId CJ24H-{id}.
+  // Data Manager deduplica/ajusta pela mesma transactionId usada pela tag web: o atendimento_id puro.
   // Enviar o valor final após o atendimento substitui o valor original sem criar nova conversão.
   const r = await enviarConversaoDataManagerGoogleAds(
     at,
@@ -918,7 +918,7 @@ async function enviarConversaoMargemGoogleAds(at, medicoEmail, opts = {}) {
   if (!r.ok) {
     await marcarGoogleAdsMargem(at.id, "failed", {
       error: String(r.error || r.skipped || "data_manager_failed"),
-      orderId: `CJ24H-${at.id}`,
+      orderId: String(at.id),
       jobId: r.requestId || "",
       valorCentavos
     });
@@ -928,7 +928,7 @@ async function enviarConversaoMargemGoogleAds(at, medicoEmail, opts = {}) {
   const status = r.validated ? "validated" : "sent";
   await marcarGoogleAdsMargem(at.id, status, {
     jobId: r.requestId || "",
-    orderId: `CJ24H-${at.id}`,
+    orderId: String(at.id),
     error: "",
     valorCentavos
   });
@@ -936,7 +936,7 @@ async function enviarConversaoMargemGoogleAds(at, medicoEmail, opts = {}) {
     consultaId: String(at.id),
     status,
     valorCentavos,
-    transactionId: `CJ24H-${at.id}`
+    transactionId: String(at.id)
   });
   return { ok: true, status, valorCentavos, provider: "data_manager" };
 }
@@ -1012,7 +1012,7 @@ async function enviarConversaoDataManagerGoogleAds(at, valor, currency, opts = {
     conversionValue: Number(valor) || 49.90,
     currency: limitarTexto(currency || "BRL", 3).toUpperCase(),
     eventTimestamp: new Date(at.pagamento_confirmado_em || Date.now()).toISOString(),
-    transactionId: `CJ24H-${at.id}`,
+    transactionId: String(at.id),
     eventSource: "WEB"
   };
   if (classificacao.customerType === "new" || classificacao.customerType === "returning") {
@@ -1066,12 +1066,12 @@ async function enviarConversaoOfflineGoogleAds(at, metodo, origem, externalId, o
     try {
       const dm = await enviarConversaoDataManagerGoogleAds(at, cfg.value, cfg.currency, { validateOnly: dmCfg.validateOnly });
       if (dm.ok && !dm.validated) {
-        await marcarGoogleAdsOffline(at.id, "sent", { jobId: dm.requestId, orderId: `CJ24H-${at.id}`, error: "" });
+        await marcarGoogleAdsOffline(at.id, "sent", { jobId: dm.requestId, orderId: String(at.id), error: "" });
         console.log("GOOGLE_DATA_MANAGER_CONVERSION_OK", { consultaId: String(at.id), requestId: dm.requestId || "" });
         return { ok: true, status: "sent", provider: "data_manager", response: dm.response };
       }
       if (dm.ok && dm.validated) {
-        await marcarGoogleAdsOffline(at.id, "validated", { jobId: dm.requestId, orderId: `CJ24H-${at.id}`, error: "" });
+        await marcarGoogleAdsOffline(at.id, "validated", { jobId: dm.requestId, orderId: String(at.id), error: "" });
         return { ok: true, status: "validated", provider: "data_manager", response: dm.response };
       }
       if (!dm.skipped) console.warn("GOOGLE_DATA_MANAGER_CONVERSION_FAILED", { consultaId: String(at.id), error: String(dm.error || "").slice(0, 500) });
