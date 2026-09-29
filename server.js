@@ -1046,6 +1046,7 @@ async function enviarConversaoDataManagerGoogleAds(at, valor, currency, opts = {
     events: [event],
     validateOnly: opts.validateOnly ?? cfg.validateOnly
   };
+  if (userData) body.encoding = "HEX";
   const res = await fetch("https://datamanager.googleapis.com/v1/events:ingest", {
     method: "POST",
     headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
