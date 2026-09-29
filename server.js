@@ -5021,7 +5021,7 @@ app.get("/api/atendimento/assumir-email", async (req, res) => {
     // Tenta assumir com trava — só um médico consegue
     const result = await pool.query(
       `UPDATE fila_atendimentos SET status='assumido', medico_id=$1, medico_nome=$2, assumido_em=NOW()
-       WHERE id=$3 AND status='aguardando' RETURNING id,nome`,
+       WHERE id=$3 AND status='aguardando' RETURNING *`,
       [medicoId, medicoNome, atendimentoId]
     );
     if (result.rowCount === 0) {
@@ -5037,6 +5037,9 @@ app.get("/api/atendimento/assumir-email", async (req, res) => {
       return res.send(`<html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#060d0b;color:#fff"><h2 style="color:#ffbd2e">⚠️ Atendimento já assumido</h2><p>Este atendimento já foi assumido por outro médico.</p><a href="${PAINEL_URL}" style="color:#b4e05a">Ir para o painel</a></body></html>`);
     }
     const paciente = result.rows[0];
+    const medicoEmailMargem = medicoReserva?.email || (Number(medicoId) === 0 ? ADMIN_MEDICO_EMAIL : "");
+    enviarConversaoMargemGoogleAds(paciente, medicoEmailMargem, { force: true })
+      .catch(e => console.warn("[GOOGLE-ADS] Ajuste ao assumir por e-mail falhou:", e.message));
     console.log(`[ASSUMIR-EMAIL] ${medicoNome} assumiu atendimento #${atendimentoId} (${paciente.nome}) via e-mail`);
     // Redireciona para o painel com o atendimento já marcado
     return res.redirect(`${PAINEL_URL}?assumiu=${atendimentoId}`);
@@ -8982,6 +8985,8 @@ app.post("/api/admin/atendimentos/:id/transferir", checkAdmin, async (req, res) 
       return res.status(404).json({ ok: false, error: "Atendimento não encontrado." });
     }
     const atendimento = atualizado.rows[0];
+    enviarConversaoMargemGoogleAds(atendimento, medico.email, { force: true })
+      .catch(e => console.warn("[GOOGLE-ADS] Ajuste ao atribuir atendimento falhou:", e.message));
     const agora = new Date().toLocaleString("pt-BR", { timeZone: "America/Fortaleza" });
     await appendToSheet("Atendimentos", [
       agora, atendimento.nome || "", atendimento.tel || "", atendimento.cpf || "",
@@ -9444,6 +9449,8 @@ app.post("/api/atendimento/assumir", checkMedico, async (req, res) => {
     );
     if (result.rowCount===0) return res.status(409).json({ ok: false, error: "Paciente ja foi assumido" });
     const at2 = result.rows[0];
+    enviarConversaoMargemGoogleAds(at2, medico.email, { force: true })
+      .catch(e => console.warn("[GOOGLE-ADS] Ajuste ao assumir falhou:", e.message));
 
     // Da baixa no agendamento para sair do badge de agendamentos
     if (at2.agendamento_id) {
