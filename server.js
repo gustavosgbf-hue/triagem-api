@@ -665,7 +665,6 @@ function googleAdsOfflineConfig() {
   const conversionActionId = limitarTexto(process.env.GOOGLE_ADS_CONVERSION_ACTION_ID, 80);
   const missing = [];
 
-  if (!process.env.GOOGLE_ADS_DEVELOPER_TOKEN) missing.push("GOOGLE_ADS_DEVELOPER_TOKEN");
   if (!process.env.GOOGLE_ADS_CLIENT_ID) missing.push("GOOGLE_ADS_CLIENT_ID");
   if (!process.env.GOOGLE_ADS_CLIENT_SECRET) missing.push("GOOGLE_ADS_CLIENT_SECRET");
   if (!process.env.GOOGLE_ADS_REFRESH_TOKEN) missing.push("GOOGLE_ADS_REFRESH_TOKEN");
@@ -934,7 +933,6 @@ async function enviarConversaoMargemGoogleAds(at, medicoEmail, opts = {}) {
   const token = await obterGoogleAdsAccessToken();
   const headers = {
     Authorization: `Bearer ${token}`,
-    "developer-token": process.env.GOOGLE_ADS_DEVELOPER_TOKEN,
     "Content-Type": "application/json"
   };
   if (cfg.loginCustomerId) headers["login-customer-id"] = cfg.loginCustomerId;
@@ -1145,7 +1143,6 @@ async function enviarConversaoOfflineGoogleAds(at, metodo, origem, externalId, o
   const token = await obterGoogleAdsAccessToken();
   const headers = {
     Authorization: `Bearer ${token}`,
-    "developer-token": process.env.GOOGLE_ADS_DEVELOPER_TOKEN,
     "Content-Type": "application/json"
   };
   if (cfg.loginCustomerId) headers["login-customer-id"] = cfg.loginCustomerId;
