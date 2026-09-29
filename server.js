@@ -1019,7 +1019,8 @@ async function enviarConversaoDataManagerGoogleAds(at, valor, currency, opts = {
   if (at.ads_gclid) adIdentifiers.gclid = String(at.ads_gclid);
   else if (at.ads_wbraid) adIdentifiers.wbraid = String(at.ads_wbraid);
   else if (at.ads_gbraid) adIdentifiers.gbraid = String(at.ads_gbraid);
-  const userData = montarGoogleDataManagerUserData(at);
+  const sendUserData = opts.sendUserData ?? envBool("GOOGLE_DATA_MANAGER_SEND_USER_DATA", false);
+  const userData = sendUserData ? montarGoogleDataManagerUserData(at) : null;
   if (!Object.keys(adIdentifiers).length && !userData) return { ok: false, skipped: "no_match_data" };
 
   const token = await obterGoogleDataManagerAccessToken(cfg);
@@ -12319,7 +12320,7 @@ app.listen(PORT, '0.0.0.0', () => {
         const { rows } = await pool.query(`SELECT * FROM fila_atendimentos WHERE id=$1 LIMIT 1`, [dmTesteId]);
         const at = rows[0];
         if (!at) return console.warn("GOOGLE_DATA_MANAGER_STARTUP_VALIDATE_NOT_FOUND", { consultaId: String(dmTesteId) });
-        const r = await enviarConversaoDataManagerGoogleAds(at, Number(process.env.GOOGLE_ADS_CONVERSION_VALUE || "49.90") || 49.90, "BRL", { validateOnly: true });
+        const r = await enviarConversaoDataManagerGoogleAds(at, Number(process.env.GOOGLE_ADS_CONVERSION_VALUE || "49.90") || 49.90, "BRL", { validateOnly: true, sendUserData: true });
         console.log("GOOGLE_DATA_MANAGER_STARTUP_VALIDATE_RESULT", { consultaId: String(dmTesteId), ok: !!r?.ok, validated: !!r?.validated, skipped: r?.skipped || "", error: String(r?.error || "").slice(0,500), details: JSON.stringify(r?.response?.error?.details || r?.response?.fieldWarnings || []).slice(0,1800) });
       } catch (e) {
         console.warn("GOOGLE_DATA_MANAGER_STARTUP_VALIDATE_ERROR", { consultaId: String(dmTesteId), error: String(e?.message || e).slice(0,500) });
