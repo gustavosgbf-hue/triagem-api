@@ -743,7 +743,7 @@ async function listarCampanhasGoogleAdsAdmin() {
   if (process.env.GOOGLE_ADS_DEVELOPER_TOKEN) headers["developer-token"] = process.env.GOOGLE_ADS_DEVELOPER_TOKEN;
   if (cfg.loginCustomerId) headers["login-customer-id"] = cfg.loginCustomerId;
   const endpoint = `https://googleads.googleapis.com/${cfg.apiVersion}/customers/${cfg.customerId}/googleAds:searchStream`;
-  const query = `SELECT campaign.id, campaign.name, campaign.status, campaign.advertising_channel_type, campaign_budget.amount_micros FROM campaign WHERE campaign.status != 'REMOVED' ORDER BY campaign.name`;
+  const query = `SELECT campaign.id, campaign.name, campaign.status, campaign.advertising_channel_type, campaign.bidding_strategy_type, campaign.target_cpa.target_cpa_micros, campaign.maximize_conversions.target_cpa_micros, campaign_budget.amount_micros FROM campaign WHERE campaign.status != 'REMOVED' ORDER BY campaign.name`;
   const res = await fetch(endpoint, { method: "POST", headers, body: JSON.stringify({ query }) });
   const text = await res.text();
   let data = {};
@@ -755,6 +755,8 @@ async function listarCampanhasGoogleAdsAdmin() {
     name: r?.campaign?.name || "",
     status: r?.campaign?.status || "",
     channel: r?.campaign?.advertisingChannelType || r?.campaign?.advertising_channel_type || "",
+    biddingStrategyType: r?.campaign?.biddingStrategyType || r?.campaign?.bidding_strategy_type || "",
+    targetCpaMicros: Number(r?.campaign?.targetCpa?.targetCpaMicros || r?.campaign?.target_cpa?.target_cpa_micros || r?.campaign?.maximizeConversions?.targetCpaMicros || r?.campaign?.maximize_conversions?.target_cpa_micros || 0),
     budgetMicros: Number(r?.campaignBudget?.amountMicros || r?.campaign_budget?.amount_micros || 0)
   }));
 }
