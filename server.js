@@ -792,6 +792,32 @@ async function listarAdsGoogleAdsAdmin() {
   }));
 }
 
+async function criarResponsiveSearchAdGoogleAdsAdmin(adGroupId, spec = {}) {
+  const cfg = googleAdsOfflineConfig();
+  const token = await obterGoogleAdsAccessToken();
+  const headers = { Authorization: `Bearer ${token}`, "Content-Type": "application/json" };
+  if (process.env.GOOGLE_ADS_DEVELOPER_TOKEN) headers["developer-token"] = process.env.GOOGLE_ADS_DEVELOPER_TOKEN;
+  if (cfg.loginCustomerId) headers["login-customer-id"] = cfg.loginCustomerId;
+  const endpoint = `https://googleads.googleapis.com/${cfg.apiVersion}/customers/${cfg.customerId}/adGroupAds:mutate`;
+  const create = {
+    adGroup: `customers/${cfg.customerId}/adGroups/${adGroupId}`,
+    status: "ENABLED",
+    ad: {
+      finalUrls: [spec.finalUrl],
+      responsiveSearchAd: {
+        headlines: (spec.headlines || []).map(text => ({ text })),
+        descriptions: (spec.descriptions || []).map(text => ({ text }))
+      }
+    }
+  };
+  const res = await fetch(endpoint, { method: "POST", headers, body: JSON.stringify({ operations: [{ create }], partialFailure: false }) });
+  const text = await res.text();
+  let data = {};
+  try { data = text ? JSON.parse(text) : {}; } catch (_) { data = { raw: text }; }
+  if (!res.ok) throw new Error(data?.error?.message || text || `HTTP ${res.status}`);
+  return data;
+}
+
 async function atualizarCampanhaGoogleAdsAdmin(campaignId, patch = {}) {
   const cfg = googleAdsOfflineConfig();
   const token = await obterGoogleAdsAccessToken();
@@ -12405,6 +12431,23 @@ app.listen(PORT, '0.0.0.0', () => {
         console.warn("GOOGLE_ADS_CAMPAIGN_AUDIT_ERROR", String(e?.message || e).slice(0,1200));
       }
     }, 7000);
+  }
+
+  const adCreatesRaw = String(process.env.GOOGLE_ADS_AD_CREATES_ON_START || "").trim();
+  if (adCreatesRaw) {
+    setTimeout(async () => {
+      try {
+        const specs = JSON.parse(adCreatesRaw);
+        const results = [];
+        for (const spec of Array.isArray(specs) ? specs : []) {
+          const r = await criarResponsiveSearchAdGoogleAdsAdmin(String(spec.adGroupId || ''), spec);
+          results.push({ label: spec.label || '', ok: true, resource: r?.results?.[0]?.resourceName || '' });
+        }
+        console.log("GOOGLE_ADS_AD_CREATES_RESULT", JSON.stringify(results));
+      } catch (e) {
+        console.warn("GOOGLE_ADS_AD_CREATES_ERROR", String(e?.message || e).slice(0,1800));
+      }
+    }, 13000);
   }
 
   const campaignOpsRaw = String(process.env.GOOGLE_ADS_CAMPAIGN_OPS_ON_START || "").trim();
