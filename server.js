@@ -759,6 +759,32 @@ async function listarCampanhasGoogleAdsAdmin() {
   }));
 }
 
+async function listarAdsGoogleAdsAdmin() {
+  const cfg = googleAdsOfflineConfig();
+  const token = await obterGoogleAdsAccessToken();
+  const headers = { Authorization: `Bearer ${token}`, "Content-Type": "application/json" };
+  if (process.env.GOOGLE_ADS_DEVELOPER_TOKEN) headers["developer-token"] = process.env.GOOGLE_ADS_DEVELOPER_TOKEN;
+  if (cfg.loginCustomerId) headers["login-customer-id"] = cfg.loginCustomerId;
+  const endpoint = `https://googleads.googleapis.com/${cfg.apiVersion}/customers/${cfg.customerId}/googleAds:searchStream`;
+  const query = `SELECT campaign.id, campaign.name, ad_group.id, ad_group.name, ad_group_ad.status, ad_group_ad.ad.id, ad_group_ad.ad.name, ad_group_ad.ad.final_urls FROM ad_group_ad WHERE campaign.status != 'REMOVED' ORDER BY campaign.name`;
+  const res = await fetch(endpoint, { method: "POST", headers, body: JSON.stringify({ query }) });
+  const text = await res.text();
+  let data = {};
+  try { data = text ? JSON.parse(text) : {}; } catch (_) { data = { raw: text }; }
+  if (!res.ok) throw new Error(data?.error?.message || text || `HTTP ${res.status}`);
+  const rows = Array.isArray(data) ? data.flatMap(x => x?.results || []) : (data?.results || []);
+  return rows.map(r => ({
+    campaignId: r?.campaign?.id || "",
+    campaignName: r?.campaign?.name || "",
+    adGroupId: r?.adGroup?.id || r?.ad_group?.id || "",
+    adGroupName: r?.adGroup?.name || r?.ad_group?.name || "",
+    adStatus: r?.adGroupAd?.status || r?.ad_group_ad?.status || "",
+    adId: r?.adGroupAd?.ad?.id || r?.ad_group_ad?.ad?.id || "",
+    adName: r?.adGroupAd?.ad?.name || r?.ad_group_ad?.ad?.name || "",
+    finalUrls: r?.adGroupAd?.ad?.finalUrls || r?.ad_group_ad?.ad?.final_urls || []
+  }));
+}
+
 async function atualizarCampanhaGoogleAdsAdmin(campaignId, patch = {}) {
   const cfg = googleAdsOfflineConfig();
   const token = await obterGoogleAdsAccessToken();
@@ -12366,6 +12392,8 @@ app.listen(PORT, '0.0.0.0', () => {
       try {
         const campaigns = await listarCampanhasGoogleAdsAdmin();
         console.log("GOOGLE_ADS_CAMPAIGN_AUDIT_RESULT", JSON.stringify(campaigns));
+        const ads = await listarAdsGoogleAdsAdmin();
+        console.log("GOOGLE_ADS_AD_AUDIT_RESULT", JSON.stringify(ads));
       } catch (e) {
         console.warn("GOOGLE_ADS_CAMPAIGN_AUDIT_ERROR", String(e?.message || e).slice(0,1200));
       }
