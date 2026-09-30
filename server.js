@@ -766,7 +766,7 @@ async function listarAdsGoogleAdsAdmin() {
   if (process.env.GOOGLE_ADS_DEVELOPER_TOKEN) headers["developer-token"] = process.env.GOOGLE_ADS_DEVELOPER_TOKEN;
   if (cfg.loginCustomerId) headers["login-customer-id"] = cfg.loginCustomerId;
   const endpoint = `https://googleads.googleapis.com/${cfg.apiVersion}/customers/${cfg.customerId}/googleAds:searchStream`;
-  const query = `SELECT campaign.id, campaign.name, ad_group.id, ad_group.name, ad_group_ad.status, ad_group_ad.ad.id, ad_group_ad.ad.name, ad_group_ad.ad.final_urls FROM ad_group_ad WHERE campaign.status != 'REMOVED' ORDER BY campaign.name`;
+  const query = `SELECT campaign.id, campaign.name, ad_group.id, ad_group.name, ad_group_ad.status, ad_group_ad.ad.id, ad_group_ad.ad.name, ad_group_ad.ad.final_urls, ad_group_ad.ad.responsive_search_ad.headlines, ad_group_ad.ad.responsive_search_ad.descriptions FROM ad_group_ad WHERE campaign.status != 'REMOVED' ORDER BY campaign.name`;
   const res = await fetch(endpoint, { method: "POST", headers, body: JSON.stringify({ query }) });
   const text = await res.text();
   let data = {};
@@ -781,7 +781,9 @@ async function listarAdsGoogleAdsAdmin() {
     adStatus: r?.adGroupAd?.status || r?.ad_group_ad?.status || "",
     adId: r?.adGroupAd?.ad?.id || r?.ad_group_ad?.ad?.id || "",
     adName: r?.adGroupAd?.ad?.name || r?.ad_group_ad?.ad?.name || "",
-    finalUrls: r?.adGroupAd?.ad?.finalUrls || r?.ad_group_ad?.ad?.final_urls || []
+    finalUrls: r?.adGroupAd?.ad?.finalUrls || r?.ad_group_ad?.ad?.final_urls || [],
+    headlines: (r?.adGroupAd?.ad?.responsiveSearchAd?.headlines || r?.ad_group_ad?.ad?.responsive_search_ad?.headlines || []).map(x => x?.text || '').filter(Boolean),
+    descriptions: (r?.adGroupAd?.ad?.responsiveSearchAd?.descriptions || r?.ad_group_ad?.ad?.responsive_search_ad?.descriptions || []).map(x => x?.text || '').filter(Boolean)
   }));
 }
 
