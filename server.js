@@ -733,6 +733,54 @@ async function obterGoogleAdsAccessToken() {
   return googleAdsTokenCache.token;
 }
 
+async function listarCampanhasGoogleAdsAdmin() {
+  const cfg = googleAdsOfflineConfig();
+  const token = await obterGoogleAdsAccessToken();
+  const headers = {
+    Authorization: `Bearer ${token}`,
+    "Content-Type": "application/json"
+  };
+  if (process.env.GOOGLE_ADS_DEVELOPER_TOKEN) headers["developer-token"] = process.env.GOOGLE_ADS_DEVELOPER_TOKEN;
+  if (cfg.loginCustomerId) headers["login-customer-id"] = cfg.loginCustomerId;
+  const endpoint = `https://googleads.googleapis.com/${cfg.apiVersion}/customers/${cfg.customerId}/googleAds:searchStream`;
+  const query = `SELECT campaign.id, campaign.name, campaign.status, campaign.advertising_channel_type, campaign_budget.amount_micros FROM campaign WHERE campaign.status != 'REMOVED' ORDER BY campaign.name`;
+  const res = await fetch(endpoint, { method: "POST", headers, body: JSON.stringify({ query }) });
+  const text = await res.text();
+  let data = {};
+  try { data = text ? JSON.parse(text) : {}; } catch (_) { data = { raw: text }; }
+  if (!res.ok) throw new Error(data?.error?.message || text || `HTTP ${res.status}`);
+  const rows = Array.isArray(data) ? data.flatMap(x => x?.results || []) : (data?.results || []);
+  return rows.map(r => ({
+    id: r?.campaign?.id || "",
+    name: r?.campaign?.name || "",
+    status: r?.campaign?.status || "",
+    channel: r?.campaign?.advertisingChannelType || r?.campaign?.advertising_channel_type || "",
+    budgetMicros: Number(r?.campaignBudget?.amountMicros || r?.campaign_budget?.amount_micros || 0)
+  }));
+}
+
+async function atualizarCampanhaGoogleAdsAdmin(campaignId, patch = {}) {
+  const cfg = googleAdsOfflineConfig();
+  const token = await obterGoogleAdsAccessToken();
+  const headers = {
+    Authorization: `Bearer ${token}`,
+    "Content-Type": "application/json"
+  };
+  if (process.env.GOOGLE_ADS_DEVELOPER_TOKEN) headers["developer-token"] = process.env.GOOGLE_ADS_DEVELOPER_TOKEN;
+  if (cfg.loginCustomerId) headers["login-customer-id"] = cfg.loginCustomerId;
+  const update = { resourceName: `customers/${cfg.customerId}/campaigns/${campaignId}` };
+  const fields = [];
+  if (patch.status) { update.status = patch.status; fields.push("status"); }
+  if (!fields.length) throw new Error("campaign_patch_empty");
+  const endpoint = `https://googleads.googleapis.com/${cfg.apiVersion}/customers/${cfg.customerId}/campaigns:mutate`;
+  const res = await fetch(endpoint, { method: "POST", headers, body: JSON.stringify({ operations: [{ update, updateMask: fields.join(",") }], partialFailure: false }) });
+  const text = await res.text();
+  let data = {};
+  try { data = text ? JSON.parse(text) : {}; } catch (_) { data = { raw: text }; }
+  if (!res.ok) throw new Error(data?.error?.message || text || `HTTP ${res.status}`);
+  return data;
+}
+
 function formatarGoogleAdsDateTime(value) {
   const d = value instanceof Date ? value : new Date(value || Date.now());
   const pad = n => String(n).padStart(2, "0");
@@ -12313,6 +12361,39 @@ const PORT = process.env.PORT || 10000;
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log("Servidor rodando na porta", PORT);
+  if (envBool("GOOGLE_ADS_CAMPAIGN_AUDIT_ON_START", false)) {
+    setTimeout(async () => {
+      try {
+        const campaigns = await listarCampanhasGoogleAdsAdmin();
+        console.log("GOOGLE_ADS_CAMPAIGN_AUDIT_RESULT", JSON.stringify(campaigns));
+      } catch (e) {
+        console.warn("GOOGLE_ADS_CAMPAIGN_AUDIT_ERROR", String(e?.message || e).slice(0,1200));
+      }
+    }, 7000);
+  }
+
+  const campaignOpsRaw = String(process.env.GOOGLE_ADS_CAMPAIGN_OPS_ON_START || "").trim();
+  if (campaignOpsRaw) {
+    setTimeout(async () => {
+      try {
+        const ops = JSON.parse(campaignOpsRaw);
+        const campaigns = await listarCampanhasGoogleAdsAdmin();
+        const results = [];
+        for (const op of Array.isArray(ops) ? ops : []) {
+          const c = campaigns.find(x => x.name === op.name);
+          if (!c) { results.push({ name: op.name, ok: false, error: "not_found" }); continue; }
+          const patch = {};
+          if (op.status) patch.status = String(op.status).toUpperCase();
+          const r = await atualizarCampanhaGoogleAdsAdmin(c.id, patch);
+          results.push({ name: c.name, id: c.id, ok: true, status: patch.status || c.status, response: r?.results?.[0]?.resourceName || "" });
+        }
+        console.log("GOOGLE_ADS_CAMPAIGN_OPS_RESULT", JSON.stringify(results));
+      } catch (e) {
+        console.warn("GOOGLE_ADS_CAMPAIGN_OPS_ERROR", String(e?.message || e).slice(0,1200));
+      }
+    }, 10000);
+  }
+
   const dmTesteId = parseInt(process.env.GOOGLE_DATA_MANAGER_STARTUP_VALIDATE_ID || "", 10);
   if (dmTesteId) {
     setTimeout(async () => {
