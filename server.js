@@ -762,6 +762,34 @@ async function listarCampanhasGoogleAdsAdmin() {
   }));
 }
 
+async function metricasDiariasGoogleAdsAdmin() {
+  const cfg = googleAdsOfflineConfig();
+  const token = await obterGoogleAdsAccessToken();
+  const headers = { Authorization: `Bearer ${token}`, "Content-Type": "application/json" };
+  if (process.env.GOOGLE_ADS_DEVELOPER_TOKEN) headers["developer-token"] = process.env.GOOGLE_ADS_DEVELOPER_TOKEN;
+  if (cfg.loginCustomerId) headers["login-customer-id"] = cfg.loginCustomerId;
+  const endpoint = `https://googleads.googleapis.com/${cfg.apiVersion}/customers/${cfg.customerId}/googleAds:searchStream`;
+  const query = `SELECT segments.date, campaign.id, campaign.name, campaign.status, metrics.impressions, metrics.clicks, metrics.cost_micros, metrics.conversions, metrics.all_conversions, metrics.conversions_value FROM campaign WHERE segments.date DURING LAST_30_DAYS ORDER BY segments.date, campaign.name`;
+  const res = await fetch(endpoint, { method: "POST", headers, body: JSON.stringify({ query }) });
+  const text = await res.text();
+  let data = {};
+  try { data = text ? JSON.parse(text) : {}; } catch (_) { data = { raw: text }; }
+  if (!res.ok) throw new Error(data?.error?.message || text || `HTTP ${res.status}`);
+  const rows = Array.isArray(data) ? data.flatMap(x => x?.results || []) : (data?.results || []);
+  return rows.map(r => ({
+    date: r?.segments?.date || '',
+    id: r?.campaign?.id || '',
+    name: r?.campaign?.name || '',
+    status: r?.campaign?.status || '',
+    impressions: Number(r?.metrics?.impressions || 0),
+    clicks: Number(r?.metrics?.clicks || 0),
+    costMicros: Number(r?.metrics?.costMicros || r?.metrics?.cost_micros || 0),
+    conversions: Number(r?.metrics?.conversions || 0),
+    allConversions: Number(r?.metrics?.allConversions || r?.metrics?.all_conversions || 0),
+    conversionValue: Number(r?.metrics?.conversionsValue || r?.metrics?.conversions_value || 0)
+  }));
+}
+
 async function listarAdsGoogleAdsAdmin() {
   const cfg = googleAdsOfflineConfig();
   const token = await obterGoogleAdsAccessToken();
@@ -12471,6 +12499,17 @@ app.listen(PORT, '0.0.0.0', () => {
         console.warn("GOOGLE_ADS_CAMPAIGN_OPS_ERROR", String(e?.message || e).slice(0,1200));
       }
     }, 10000);
+  }
+
+  if (envBool("GOOGLE_ADS_METRICS_AUDIT_ON_START", false)) {
+    setTimeout(async () => {
+      try {
+        const rows = await metricasDiariasGoogleAdsAdmin();
+        console.log("GOOGLE_ADS_METRICS_AUDIT_RESULT", JSON.stringify(rows));
+      } catch (e) {
+        console.warn("GOOGLE_ADS_METRICS_AUDIT_ERROR", String(e?.message || e).slice(0,1800));
+      }
+    }, 9000);
   }
 
   const dmTesteId = parseInt(process.env.GOOGLE_DATA_MANAGER_STARTUP_VALIDATE_ID || "", 10);
