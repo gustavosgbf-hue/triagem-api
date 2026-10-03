@@ -9835,10 +9835,12 @@ app.post("/api/atendimento/reabrir", autenticarMedico, async (req, res) => {
 
 app.post("/api/atendimento/atualizar-paciente", autenticarMedico, async (req, res) => {
   try {
-    const { filaId, nome, cpf } = req.body || {};
+    const { filaId, nome, cpf, data_nascimento } = req.body || {};
     const atendimentoId = Number(filaId);
     const nomeLimpo = String(nome || "").trim().replace(/\s+/g, " ");
     const cpfLimpo = String(cpf || "").replace(/\D/g, "");
+    const dataNascimentoLimpa = normalizarTexto(data_nascimento);
+    const idadeCalculada = calcularIdadePorNascimento(dataNascimentoLimpa);
 
     if (!Number.isInteger(atendimentoId) || atendimentoId <= 0) {
       return res.status(400).json({ ok: false, error: "Atendimento inválido." });
@@ -9848,6 +9850,9 @@ app.post("/api/atendimento/atualizar-paciente", autenticarMedico, async (req, re
     }
     if (!julieValidarCPF(cpfLimpo)) {
       return res.status(400).json({ ok: false, error: "CPF inválido." });
+    }
+    if (!dataNascimentoLimpa || idadeCalculada === null) {
+      return res.status(400).json({ ok: false, error: "Data de nascimento inválida." });
     }
 
     const atual = await pool.query(
@@ -9869,12 +9874,12 @@ app.post("/api/atendimento/atualizar-paciente", autenticarMedico, async (req, re
 
     const result = await pool.query(
       `UPDATE fila_atendimentos
-          SET nome=$2, cpf=$3
+          SET nome=$2, cpf=$3, data_nascimento=$4, idade=$5
         WHERE id=$1
         RETURNING id,nome,cpf,tel,tel_documentos,email,data_nascimento,idade,sexo,
                   alergias,cronicas,medicacoes,queixa,solicita,tipo,triagem,status,
                   medico_id,medico_nome,criado_em,assumido_em,encerrado_em`,
-      [atendimentoId, nomeLimpo, cpfLimpo]
+      [atendimentoId, nomeLimpo, cpfLimpo, dataNascimentoLimpa, idadeCalculada]
     );
 
     console.log(`[PACIENTE-UPDATE] Atendimento #${atendimentoId} atualizado por ${req.medico.email}: ${nomeLimpo}`);
