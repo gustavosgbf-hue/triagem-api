@@ -29,6 +29,18 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
+// Ajuste pontual de preço do Dr. Paulo Almeida (especialista #10).
+// Condicionado ao valor antigo para não sobrescrever alterações futuras.
+pool.query(
+  `UPDATE especialistas
+      SET valor_consulta = 230
+    WHERE id = 10
+      AND LOWER(COALESCE(nome_exibicao, nome, '')) LIKE '%paulo%almeida%'
+      AND valor_consulta = 350`
+).then(({ rowCount }) => {
+  if (rowCount) console.log('[ESP-MIGRATION] Dr. Paulo Almeida: valor atualizado para R$ 230');
+}).catch(e => console.warn('[ESP-MIGRATION] Falha ao atualizar valor do Dr. Paulo Almeida:', e.message));
+
 // Attribution schema is intentionally additive/backward-compatible.
 // It gives us immutable first-touch, mutable last-touch and conversion-touch
 // without changing the legacy ads_* fields consumed by existing reports.
@@ -7223,15 +7235,40 @@ app.get('/api/especialistas/horarios-ocupados/:especialistaId', rlGeral, async (
   } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
 });
 
-function normalizarDisponibilidadeEspecialista(disponibilidadeBruta) {
+function normalizarDisponibilidadeEspecialista(disponibilidadeBruta, { recorrenteSemanal = false } = {}) {
   const arr = Array.isArray(disponibilidadeBruta) ? disponibilidadeBruta : [];
   const agoraTs = Date.now();
-  const futuros = arr
-    .map((item) => new Date(item))
-    .filter((d) => !isNaN(d.getTime()) && d.getTime() > agoraTs)
-    .sort((a, b) => a.getTime() - b.getTime())
-    .map((d) => d.toISOString());
-  return futuros;
+
+  const datas = arr
+    .map((item) => {
+      const valor = item && typeof item === 'object' ? (item.iso || item.data || item.datetime) : item;
+      const d = new Date(valor);
+      return isNaN(d.getTime()) ? null : d;
+    })
+    .filter(Boolean);
+
+  if (!recorrenteSemanal) {
+    return datas
+      .filter((d) => d.getTime() > agoraTs)
+      .sort((a, b) => a.getTime() - b.getTime())
+      .map((d) => d.toISOString());
+  }
+
+  const limiteTs = agoraTs + 60 * 24 * 60 * 60 * 1000;
+  const slots = new Set();
+
+  for (const original of datas) {
+    let d = new Date(original);
+    while (d.getTime() <= agoraTs) {
+      d = new Date(d.getTime() + 7 * 24 * 60 * 60 * 1000);
+    }
+    while (d.getTime() <= limiteTs) {
+      slots.add(d.toISOString());
+      d = new Date(d.getTime() + 7 * 24 * 60 * 60 * 1000);
+    }
+  }
+
+  return [...slots].sort();
 }
 
 // ── ESPECIALISTAS: listar por especialidade ───────────────────────────────────
@@ -7247,7 +7284,7 @@ const { rows } = await pool.query(
     );
     const especialistas = rows.map((esp) => ({
       ...esp,
-      disponibilidade: normalizarDisponibilidadeEspecialista(esp.disponibilidade),
+      disponibilidade: normalizarDisponibilidadeEspecialista(esp.disponibilidade, { recorrenteSemanal: esp.id === 10 }),
     }));
     return res.json({ ok: true, especialistas });
   } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
@@ -7263,7 +7300,7 @@ app.get('/api/especialistas/:especialistaId/horarios', rlGeral, async (req, res)
       [espId]
     );
     if (!rows.length) return res.status(404).json({ ok: false, error: 'Especialista não encontrado' });
-    return res.json({ ok: true, disponibilidade: normalizarDisponibilidadeEspecialista(rows[0].disponibilidade) });
+    return res.json({ ok: true, disponibilidade: normalizarDisponibilidadeEspecialista(rows[0].disponibilidade, { recorrenteSemanal: espId === 10 }) });
   } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
 });
 
@@ -7362,7 +7399,7 @@ app.post('/api/especialistas/agendamento/criar', rlGeral, async (req, res) => {
     const modalidadeFinal = String(modalidade || 'video').toLowerCase() === 'chat' ? 'chat' : 'video';
     const slotStart = new Date(horario_agendado);
     if (isNaN(slotStart.getTime())) return res.status(400).json({ ok: false, error: 'Horário inválido' });
-    const disponibilidade = normalizarDisponibilidadeEspecialista(esp.disponibilidade);
+    const disponibilidade = normalizarDisponibilidadeEspecialista(esp.disponibilidade, { recorrenteSemanal: esp.id === 10 });
     const slotAutorizado = disponibilidade.some(slot => new Date(slot).getTime() === slotStart.getTime());
     if (!slotAutorizado) {
       return res.status(409).json({ ok: false, error: 'Este horário não está mais disponível. Escolha outro.' });
