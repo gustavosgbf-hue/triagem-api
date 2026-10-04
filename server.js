@@ -29,6 +29,47 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
+// Garante acesso da Dra. Ana Valéria (CRM-MA 14909) ao painel de especialistas
+// como Geriatria, preservando também o cadastro dela na fila geral.
+pool.query(`
+  INSERT INTO especialistas
+    (nome,nome_exibicao,especialidade,crm,uf,valor_consulta,foto_url,bio,ativo,email,visivel,
+     senha_hash,precisa_trocar_senha,cpf_medico,data_nascimento_medico)
+  SELECT
+    m.nome,
+    COALESCE(NULLIF(m.nome_exibicao,''),m.nome),
+    'geriatria',
+    m.crm,
+    m.uf,
+    230,
+    'https://pub-93eb63c110d047c681aab7a5b30d2c2b.r2.dev/anaval.jpg',
+    COALESCE(e.bio,''),
+    true,
+    LOWER(m.email),
+    false,
+    m.senha_hash,
+    COALESCE(m.precisa_trocar_senha,false),
+    m.cpf_medico,
+    m.data_nascimento_medico
+  FROM medicos m
+  LEFT JOIN especialistas e ON LOWER(e.email)=LOWER(m.email)
+  WHERE m.crm='14909' AND UPPER(COALESCE(m.uf,''))='MA'
+  ON CONFLICT DO NOTHING
+`).then(async () => {
+  await pool.query(`
+    UPDATE especialistas e
+       SET especialidade='geriatria',
+           ativo=true,
+           senha_hash=COALESCE(e.senha_hash,m.senha_hash),
+           foto_url=COALESCE(e.foto_url,'https://pub-93eb63c110d047c681aab7a5b30d2c2b.r2.dev/anaval.jpg')
+      FROM medicos m
+     WHERE LOWER(e.email)=LOWER(m.email)
+       AND m.crm='14909'
+       AND UPPER(COALESCE(m.uf,''))='MA'
+  `);
+  console.log('[ESP-MIGRATION] Dra. Ana Valéria habilitada em Geriatria');
+}).catch(e => console.warn('[ESP-MIGRATION] Falha ao habilitar Ana Valéria em Geriatria:', e.message));
+
 // Ajuste pontual de preço do Dr. Paulo Almeida (especialista #10).
 // Condicionado ao valor antigo para não sobrescrever alterações futuras.
 pool.query(
