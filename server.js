@@ -2532,6 +2532,13 @@ function cadastroMedicoSuspeito(dados = {}) {
 const MEDICOS_FLUXO_NORMAL_BLOQUEADOS = [
   "magali",
   "danielle lourdes",
+  "halseycr27@gmail.com",
+  "giovanna.bottezini@gmail.com",
+  "cetardelli@hotmail.com",
+  "brunaheluy@hotmail.com",
+  "claradepcosta@gmail.com",
+  "drasarahpaulinodefreitas@gmail.com",
+  "dra.gabrielaluiza@gmail.com",
   ...(process.env.MEDICOS_FLUXO_NORMAL_BLOQUEADOS || "")
     .split(",")
     .map(normalizarBloqueioMedico)
@@ -7727,8 +7734,9 @@ const authEspecialista = async (req, res, next) => {
   try {
     const dec = jwt.verify(tok, JWT_SECRET);
     if (dec.tipo !== 'especialista') return res.status(403).json({ ok: false, error: 'Acesso negado' });
-    const { rows } = await pool.query('SELECT id, nome_exibicao, especialidade, ativo FROM especialistas WHERE id = $1 AND ativo = true', [dec.id]);
+    const { rows } = await pool.query('SELECT id, nome_exibicao, especialidade, email, ativo FROM especialistas WHERE id = $1 AND ativo = true', [dec.id]);
     if (!rows.length) return res.status(403).json({ ok: false, error: 'Especialista inativo ou não encontrado' });
+    if (medicoBloqueado(rows[0])) return res.status(403).json({ ok: false, error: 'Acesso desativado.' });
     req.especialistaId = rows[0].id;
     req.especialista = rows[0];
     next();
@@ -7749,6 +7757,7 @@ app.post('/api/especialista/login', rlLogin, async (req, res) => {
     if (!rows.length) return res.status(401).json({ ok: false, error: 'Credenciais inválidas' });
     const esp = rows[0];
     if (!esp.ativo) return res.status(403).json({ ok: false, error: 'Seu cadastro está inativo' });
+    if (medicoBloqueado(esp)) return res.status(403).json({ ok: false, error: 'Acesso desativado.' });
     if (!esp.senha_hash) return res.status(401).json({ ok: false, error: 'Senha não configurada. Use "Esqueci minha senha".' });
     const match = await bcrypt.compare(senha, esp.senha_hash);
     if (!match) return res.status(401).json({ ok: false, error: 'Credenciais inválidas' });
@@ -7784,6 +7793,7 @@ app.post('/api/especialista/esqueci-senha', rlLogin, async (req, res) => {
       return res.json({ ok: true });
     }
     const esp = rows[0];
+    if (medicoBloqueado(esp)) return res.json({ ok: true });
     const chars = 'abcdefghjkmnpqrstuvwxyz23456789';
     let senhaTemp = '';
     for (let i = 0; i < 8; i++) senhaTemp += chars[Math.floor(Math.random() * chars.length)];
@@ -9338,6 +9348,7 @@ app.post("/api/medico/esqueci-senha", rlLogin, async (req, res) => {
     const result = await pool.query("SELECT id,nome,email FROM medicos WHERE email=$1 AND ativo=true LIMIT 1",[emailNorm]);
     if (result.rowCount === 0) return res.json(MSG_GENERICA);
     const med = result.rows[0];
+    if (medicoBloqueado(med)) return res.json(MSG_GENERICA);
     // Gera senha temporária aleatória
     const { randomBytes } = await import("crypto");
     const tempSenha = randomBytes(12).toString("base64url"); // 16 chars base64url
@@ -10095,10 +10106,10 @@ app.get("/api/disponibilidade", async (req, res) => {
     const hora = parseInt(new Intl.DateTimeFormat("en-US",{timeZone:"America/Fortaleza",hour:"2-digit",hour12:false}).formatToParts(agora).find(p=>p.type==="hour").value);
     const dentroDoHorario = hora>=HORA_INICIO && hora<HORA_FIM;
     const [medRes,filaRes] = await Promise.all([
-      pool.query("SELECT COUNT(*) FROM medicos WHERE status_online=true AND ativo=true"),
+      pool.query("SELECT id,nome,nome_exibicao,email,status_online,ativo FROM medicos WHERE status_online=true AND ativo=true"),
       pool.query("SELECT COUNT(*) FROM fila_atendimentos WHERE status='aguardando'")
     ]);
-    const medicosOnline=parseInt(medRes.rows[0].count)||0;
+    const medicosOnline=filtrarMedicosAtivos(medRes.rows).length;
     const pacientesAguardando=parseInt(filaRes.rows[0].count)||0;
     const disponivel=dentroDoHorario;
     let tempoEstimado=5;
