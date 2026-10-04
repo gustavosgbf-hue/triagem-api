@@ -7284,7 +7284,7 @@ const { rows } = await pool.query(
     );
     const especialistas = rows.map((esp) => ({
       ...esp,
-      disponibilidade: normalizarDisponibilidadeEspecialista(esp.disponibilidade, { recorrenteSemanal: esp.id === 10 }),
+      disponibilidade: normalizarDisponibilidadeEspecialista(esp.disponibilidade, { recorrenteSemanal: esp.id === 10 || String(esp.especialidade || '').toLowerCase() === 'endocrinologia' }),
     }));
     return res.json({ ok: true, especialistas });
   } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
@@ -7296,11 +7296,11 @@ app.get('/api/especialistas/:especialistaId/horarios', rlGeral, async (req, res)
     const espId = parseInt(req.params.especialistaId, 10);
     if (!espId) return res.status(400).json({ ok: false, error: 'ID inválido' });
     const { rows } = await pool.query(
-      `SELECT disponibilidade FROM especialistas WHERE id = $1 AND ativo = true`,
+      `SELECT disponibilidade, especialidade FROM especialistas WHERE id = $1 AND ativo = true`,
       [espId]
     );
     if (!rows.length) return res.status(404).json({ ok: false, error: 'Especialista não encontrado' });
-    return res.json({ ok: true, disponibilidade: normalizarDisponibilidadeEspecialista(rows[0].disponibilidade, { recorrenteSemanal: espId === 10 }) });
+    return res.json({ ok: true, disponibilidade: normalizarDisponibilidadeEspecialista(rows[0].disponibilidade, { recorrenteSemanal: espId === 10 || String(rows[0].especialidade || '').toLowerCase() === 'endocrinologia' }) });
   } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
 });
 
@@ -7399,7 +7399,7 @@ app.post('/api/especialistas/agendamento/criar', rlGeral, async (req, res) => {
     const modalidadeFinal = String(modalidade || 'video').toLowerCase() === 'chat' ? 'chat' : 'video';
     const slotStart = new Date(horario_agendado);
     if (isNaN(slotStart.getTime())) return res.status(400).json({ ok: false, error: 'Horário inválido' });
-    const disponibilidade = normalizarDisponibilidadeEspecialista(esp.disponibilidade, { recorrenteSemanal: esp.id === 10 });
+    const disponibilidade = normalizarDisponibilidadeEspecialista(esp.disponibilidade, { recorrenteSemanal: esp.id === 10 || String(esp.especialidade || '').toLowerCase() === 'endocrinologia' });
     const slotAutorizado = disponibilidade.some(slot => new Date(slot).getTime() === slotStart.getTime());
     if (!slotAutorizado) {
       return res.status(409).json({ ok: false, error: 'Este horário não está mais disponível. Escolha outro.' });
