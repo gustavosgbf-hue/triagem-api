@@ -458,7 +458,58 @@ function installRoutes(app) {
   });
 }
 
-await ensureSchema();
+async function ensureSchemaAtStartup() {
+  const retryableCodes = new Set(['40P01', '55P03', '57P01', '57P03', '53300']);
+  let lastError = null;
+
+  for (let attempt = 1; attempt <= 4; attempt += 1) {
+    try {
+      await ensureSchema();
+      return true;
+    } catch (error) {
+      lastError = error;
+      const message = String(error?.message || '');
+      const retryable =
+        retryableCodes.has(error?.code) ||
+        /deadlock|shutting down|terminating connection|ECONNREFUSED|ECONNRESET|timeout/i.test(message);
+
+      if (!retryable) {
+        console.error('[PUSH] Falha não transitória ao preparar schema:', error);
+        return false;
+      }
+
+      if (attempt < 4) {
+        const delayMs = attempt * 1500;
+        console.warn(`[PUSH] Banco temporariamente indisponível/deadlock; nova tentativa em ${delayMs}ms (tentativa ${attempt}/4).`);
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+      }
+    }
+  }
+
+  console.error('[PUSH] Schema não ficou pronto no startup; servidor seguirá ativo e tentará novamente em background.', lastError);
+  return false;
+}
+
+const schemaStarted = await ensureSchemaAtStartup();
+if (!schemaStarted) {
+  const retryTimer = setInterval(async () => {
+    if (schemaReady) {
+      clearInterval(retryTimer);
+      return;
+    }
+    try {
+      await ensureSchema();
+      if (schemaReady) {
+        console.log('[PUSH] Schema recuperado em background.');
+        clearInterval(retryTimer);
+      }
+    } catch (error) {
+      console.warn('[PUSH] Nova tentativa de schema em background falhou:', error?.code || error?.message || error);
+    }
+  }, 15000);
+  retryTimer.unref?.();
+}
+
 setInterval(runWorker, 3500).unref?.();
 
 const originalInit = express.application.init;
