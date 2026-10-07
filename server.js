@@ -7111,7 +7111,7 @@ app.post('/api/lead/registrar', rlGeral, async (req, res) => {
   }
 });
 
-const FUNIL_MODULOS = new Set(['especialistas', 'psicologia']);
+const FUNIL_MODULOS = new Set(['especialistas', 'psicologia', 'consulta']);
 const FUNIL_EVENTOS = new Set([
   'page_view',
   'profile_opened',
@@ -7120,7 +7120,26 @@ const FUNIL_EVENTOS = new Set([
   'booking_created',
   'payment_started',
   'payment_failed',
-  'payment_confirmed'
+  'payment_confirmed',
+  'modal_open',
+  'lead_pre_pagamento',
+  'checkout_step_view',
+  'payment_method_selected',
+  'pix_generate_click',
+  'gerou_pix',
+  'pix_qr_visible',
+  'pix_error',
+  'card_attempt',
+  'card_waiting',
+  'card_approved',
+  'card_error',
+  'payment_eligibility_blocked',
+  'checkout_close',
+  'checkout_payment_detected',
+  'manual_payment_check',
+  'manual_payment_check_result',
+  'pagamento_confirmado_redirect_confirmado',
+  'triage_redirect_start'
 ]);
 
 function limitarTextoFunil(valor, limite) {
