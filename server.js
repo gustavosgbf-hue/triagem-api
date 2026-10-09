@@ -10399,7 +10399,6 @@ app.post("/api/stripe/checkout-session", rlGeral, async (req, res) => {
     const session = await stripe.checkout.sessions.create({
       ui_mode: "elements",
       mode: "payment",
-      payment_method_types: ["card"],
       line_items: [{ price_data: { currency: "brl", product_data: { name: nomeCobranca }, unit_amount: valorCentavos }, quantity: 1 }],
       ...(email && /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(email) ? { customer_email: email } : {}),
       return_url: returnUrl,
