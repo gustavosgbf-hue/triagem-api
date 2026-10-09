@@ -3,6 +3,7 @@ import https from "https";
 import os from "os";
 import path from "path";
 import axios from "axios";
+import Stripe from "stripe";
 import express from "express";
 import cors from "cors";
 import { google } from "googleapis";
@@ -29,6 +30,8 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
+const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
+
 // Migração temporariamente desativada: a rotina anterior de Ana Valéria fazia
 // INSERT ... LEFT JOIN especialistas sem chave UNIQUE de e-mail/CRM. Em reinícios,
 // isso podia duplicar exponencialmente os registros de especialistas. O cadastro
@@ -51,6 +54,10 @@ pool.query(
 // It gives us immutable first-touch, mutable last-touch and conversion-touch
 // without changing the legacy ads_* fields consumed by existing reports.
 const adsAttributionSchemaReady = pool.query(`
+  ALTER TABLE fila_atendimentos
+    ADD COLUMN IF NOT EXISTS stripe_checkout_session_id TEXT,
+    ADD COLUMN IF NOT EXISTS stripe_payment_intent_id TEXT;
+
   ALTER TABLE fila_atendimentos
     ADD COLUMN IF NOT EXISTS ads_fbclid TEXT,
     ADD COLUMN IF NOT EXISTS ads_first_touch JSONB,
@@ -149,6 +156,49 @@ app.use(cors({
   ],
   credentials: true,
 }));
+// Stripe webhook precisa do corpo bruto para validar a assinatura.
+app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async (req, res) => {
+  if (!stripe || !process.env.STRIPE_WEBHOOK_SECRET) return res.status(503).send("stripe_webhook_unavailable");
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(req.body, req.get("stripe-signature"), process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (e) {
+    console.warn("[STRIPE-WEBHOOK] Assinatura inválida:", e.message);
+    return res.status(400).send("invalid_signature");
+  }
+  try {
+    if (["checkout.session.completed", "checkout.session.async_payment_succeeded"].includes(event.type)) {
+      const session = event.data.object;
+      if (session.payment_status === "paid") {
+        const atendimentoId = Number.parseInt(String(session.metadata?.atendimento_id || ""), 10) || null;
+        if (atendimentoId) {
+          const paymentIntentId = typeof session.payment_intent === "string" ? session.payment_intent : session.payment_intent?.id;
+          const { rows } = await pool.query(
+            `UPDATE fila_atendimentos
+                SET pagamento_status='confirmado',
+                    pagamento_confirmado_em=COALESCE(pagamento_confirmado_em,NOW()),
+                    pagamento_metodo='cartao',
+                    stripe_checkout_session_id=$2,
+                    stripe_payment_intent_id=COALESCE($3,stripe_payment_intent_id),
+                    status=CASE WHEN status='pagamento_pendente' THEN 'triagem' ELSE status END
+              WHERE id=$1 AND pagamento_status='pendente'
+              RETURNING id`,
+            [atendimentoId, session.id, paymentIntentId || null]
+          );
+          if (rows.length) {
+            console.log(`[STRIPE-WEBHOOK] Atendimento #${atendimentoId} confirmado.`);
+            await logarCandidatoConversaoOffline(atendimentoId, "cartao", "stripe_webhook", session.id);
+          }
+        }
+      }
+    }
+    return res.json({ received: true });
+  } catch (e) {
+    console.error("[STRIPE-WEBHOOK] Erro:", e.message);
+    return res.status(500).send("webhook_error");
+  }
+});
+
 app.use(express.json({ limit: "1mb" }));
 
 app.get("/api/build-info", (_req, res) => {
@@ -10297,6 +10347,102 @@ async function efiGetToken() {
 }
 
 // ── EFÍ: rota de teste (admin) ────────────────────────────────────────────────
+// ── STRIPE: cartão via Checkout Sessions + Payment Element ───────────────────
+app.get("/api/stripe/config", (_req, res) => {
+  const publishableKey = String(process.env.STRIPE_PUBLISHABLE_KEY || "").trim();
+  res.json({ ok: true, enabled: !!(stripe && publishableKey), publishableKey: publishableKey || null, mode: publishableKey.startsWith("pk_live_") ? "live" : "test" });
+});
+
+app.post("/api/stripe/checkout-session", rlGeral, async (req, res) => {
+  try {
+    if (!stripe) return res.status(503).json({ ok: false, error: "Stripe indisponível" });
+    const atendimentoId = Number.parseInt(String(req.body?.atendimentoId || ""), 10) || null;
+    if (!atendimentoId) return res.status(400).json({ ok: false, error: "atendimentoId obrigatório" });
+
+    const configuracao = await buscarConfiguracaoAtendimento(atendimentoId);
+    if (!configuracao) return res.status(404).json({ ok: false, error: "Atendimento não encontrado para cobrar" });
+    const limite = await buscarLimiteAtendimentos(atendimentoId);
+    if (limite) return responderLimiteAtendimentos(res, limite);
+
+    const { rows } = await pool.query(
+      `SELECT id,pagamento_status,stripe_checkout_session_id,email FROM fila_atendimentos WHERE id=$1 LIMIT 1`,
+      [atendimentoId]
+    );
+    const at = rows[0];
+    if (!at) return res.status(404).json({ ok: false, error: "Atendimento não encontrado" });
+    if (at.pagamento_status === "confirmado") return res.status(409).json({ ok: false, already_paid: true, error: "Pagamento já confirmado" });
+
+    const existingId = String(at.stripe_checkout_session_id || "").trim();
+    if (existingId) {
+      try {
+        const existing = await stripe.checkout.sessions.retrieve(existingId);
+        if (existing.status === "open" && existing.client_secret) {
+          return res.json({ ok: true, reused: true, sessionId: existing.id, clientSecret: existing.client_secret });
+        }
+        if (existing.payment_status === "paid") {
+          const paymentIntentId = typeof existing.payment_intent === "string" ? existing.payment_intent : existing.payment_intent?.id;
+          await pool.query(
+            `UPDATE fila_atendimentos SET pagamento_status='confirmado',pagamento_confirmado_em=COALESCE(pagamento_confirmado_em,NOW()),pagamento_metodo='cartao',stripe_payment_intent_id=COALESCE($2,stripe_payment_intent_id),status=CASE WHEN status='pagamento_pendente' THEN 'triagem' ELSE status END WHERE id=$1`,
+            [atendimentoId, paymentIntentId || null]
+          );
+          return res.status(409).json({ ok: false, already_paid: true, paid: true, error: "Pagamento já confirmado" });
+        }
+      } catch (e) {
+        console.warn("[STRIPE] Sessão anterior não reutilizável:", e.message);
+      }
+    }
+
+    const valorCentavos = configuracao?.valorCentavos || 4990;
+    const nomeCobranca = configuracao?.nomeCobranca || "Consulta médica online — ConsultaJá24h";
+    const email = String(req.body?.email || at.email || "").trim();
+    const returnUrl = `https://consultaja24h.com.br/consulta/?stripe_return=1&session_id={CHECKOUT_SESSION_ID}&consulta=${atendimentoId}`;
+    const session = await stripe.checkout.sessions.create({
+      ui_mode: "elements",
+      mode: "payment",
+      payment_method_types: ["card"],
+      line_items: [{ price_data: { currency: "brl", product_data: { name: nomeCobranca }, unit_amount: valorCentavos }, quantity: 1 }],
+      ...(email && /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(email) ? { customer_email: email } : {}),
+      return_url: returnUrl,
+      metadata: { atendimento_id: String(atendimentoId), origem: "consultaja24h_web" },
+      payment_intent_data: { metadata: { atendimento_id: String(atendimentoId), origem: "consultaja24h_web" } },
+    });
+
+    await pool.query(
+      `UPDATE fila_atendimentos SET stripe_checkout_session_id=$2,pagamento_metodo='cartao' WHERE id=$1 AND pagamento_status='pendente'`,
+      [atendimentoId, session.id]
+    );
+    return res.json({ ok: true, sessionId: session.id, clientSecret: session.client_secret });
+  } catch (e) {
+    console.error("[STRIPE] Criar Checkout Session:", e?.raw?.message || e.message);
+    return res.status(500).json({ ok: false, error: e?.raw?.message || "Não foi possível iniciar o pagamento com cartão" });
+  }
+});
+
+app.get("/api/stripe/session-status", rlGeral, async (req, res) => {
+  try {
+    if (!stripe) return res.status(503).json({ ok: false, error: "Stripe indisponível" });
+    const sessionId = String(req.query.session_id || "").trim();
+    if (!sessionId) return res.status(400).json({ ok: false, error: "session_id obrigatório" });
+    const session = await stripe.checkout.sessions.retrieve(sessionId, { expand: ["payment_intent"] });
+    const atendimentoId = Number.parseInt(String(session.metadata?.atendimento_id || ""), 10) || null;
+    const paid = session.payment_status === "paid";
+    if (paid && atendimentoId) {
+      const paymentIntentId = typeof session.payment_intent === "string" ? session.payment_intent : session.payment_intent?.id;
+      const { rows } = await pool.query(
+        `UPDATE fila_atendimentos
+            SET pagamento_status='confirmado',pagamento_confirmado_em=COALESCE(pagamento_confirmado_em,NOW()),pagamento_metodo='cartao',stripe_checkout_session_id=$2,stripe_payment_intent_id=COALESCE($3,stripe_payment_intent_id),status=CASE WHEN status='pagamento_pendente' THEN 'triagem' ELSE status END
+          WHERE id=$1 AND pagamento_status='pendente' RETURNING id`,
+        [atendimentoId, session.id, paymentIntentId || null]
+      );
+      if (rows.length) await logarCandidatoConversaoOffline(atendimentoId, "cartao", "stripe_session_status", session.id);
+    }
+    return res.json({ ok: true, sessionId: session.id, atendimentoId, status: session.status, payment_status: session.payment_status, paid });
+  } catch (e) {
+    console.error("[STRIPE] Consultar sessão:", e?.raw?.message || e.message);
+    return res.status(400).json({ ok: false, error: e?.raw?.message || "Sessão Stripe inválida" });
+  }
+});
+
 // GET /api/efi/test?senha=ADMIN_PASSWORD
 // Confirma que o certificado e as credenciais estão funcionando.
 app.get("/api/efi/test", checkAdmin, async (req, res) => {
