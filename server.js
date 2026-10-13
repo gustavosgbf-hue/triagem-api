@@ -9716,7 +9716,40 @@ app.get("/api/historico", checkMedico, async (req, res) => {
        ORDER BY encerrado_em DESC`,
       [medicoId]
     );
-    return res.json({ ok: true, historico: result.rows });
+    // Atendimentos recuperados após reset: leitura separada, sem criar pagamentos ou prontuários.
+    const idsMedicosRecuperados = {
+      54: 'Dra. Victória Lazera',
+      1: 'Dr. Gustavo Fonseca',
+      21: 'Dr. Everton Neres',
+      44: 'Ana Valéria Brandão',
+      62: 'Dr. Marcelo Reis',
+    };
+    const nomeRecuperado = idsMedicosRecuperados[medicoId];
+    let recuperados = [];
+    if (nomeRecuperado) {
+      const historicos = await pool.query(
+        `SELECT medico_nome, paciente_nome, periodo_inicio, periodo_fim
+           FROM atendimentos_historicos_recuperados
+          WHERE origem = 'reconstrucao_manual_pos_reset' AND medico_nome = $1
+          ORDER BY paciente_nome ASC`,
+        [nomeRecuperado]
+      );
+      recuperados = historicos.rows.map((r, index) => ({
+        id: -(medicoId * 1000 + index + 1),
+        historico_recuperado: true,
+        nome: r.paciente_nome,
+        medico_nome: r.medico_nome,
+        periodo_inicio: r.periodo_inicio,
+        periodo_fim: r.periodo_fim,
+        tipo: null,
+        status: 'encerrado',
+        cpf: null,
+        tel: null,
+        encerrado_em: null,
+        prontuario_salvo: null,
+      }));
+    }
+    return res.json({ ok: true, historico: [...result.rows, ...recuperados] });
   } catch (err) {
     console.error("Erro em /api/historico:", err);
     return res.status(500).json({ ok: false, error: "Erro ao carregar historico" });
