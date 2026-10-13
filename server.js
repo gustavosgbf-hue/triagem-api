@@ -9072,7 +9072,30 @@ app.get("/api/admin/historico", checkAdmin, async (req, res) => {
       ...atendimento,
       link_consulta: `${siteUrl}/triagem.html?consulta=${encodeURIComponent(String(atendimento.id))}`
     }));
-    return res.json({ ok: true, historico, medicos: medicos.rows });
+    const recovered = await pool.query(
+      `SELECT h.medico_nome, h.paciente_nome, h.periodo_inicio, h.periodo_fim, m.id AS medico_id
+       FROM atendimentos_historicos_recuperados h
+       JOIN medicos m ON m.id = CASE h.medico_nome
+         WHEN 'Dra. Victória Lazera' THEN 54
+         WHEN 'Dr. Gustavo Fonseca' THEN 1
+         WHEN 'Dr. Everton Neres' THEN 21
+         WHEN 'Ana Valéria Brandão' THEN 44
+         WHEN 'Dr. Marcelo Reis' THEN 62 END
+       WHERE h.origem = 'reconstrucao_manual_pos_reset'
+         AND ($1::integer IS NULL OR m.id=$1)
+         AND ($2::date IS NULL OR h.periodo_fim >= $2)
+         AND ($3::date IS NULL OR h.periodo_inicio <= $3)
+         AND ($4::text IS NULL OR h.paciente_nome ILIKE '%' || $4 || '%')`,
+       [medico_id ? Number(medico_id) : null, data_inicio || null, data_fim || null, busca || null]
+    );
+    const historicoRecuperado = recovered.rows.map((h, i) => ({
+      id: -(h.medico_id * 1000 + i + 1), historico_recuperado: true,
+      nome: h.paciente_nome, medico_nome: h.medico_nome, medico_id: h.medico_id,
+      periodo_inicio: h.periodo_inicio, periodo_fim: h.periodo_fim,
+      status: 'encerrado', pagamento_status: null, criado_em: null,
+      encerrado_em: null, prontuario_salvo: null, link_consulta: null
+    }));
+    return res.json({ ok: true, historico: [...historico, ...historicoRecuperado], medicos: medicos.rows });
   } catch(e) {
     console.error("[ADMIN-HISTORICO]", e.message);
     return res.status(500).json({ ok: false, error: "Erro ao carregar histórico" });
