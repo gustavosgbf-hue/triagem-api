@@ -7161,7 +7161,7 @@ app.post('/api/lead/registrar', rlGeral, async (req, res) => {
   }
 });
 
-const FUNIL_MODULOS = new Set(['especialistas', 'psicologia', 'consulta']);
+const FUNIL_MODULOS = new Set(['especialistas', 'psicologia', 'consulta', 'renovacao']);
 const FUNIL_EVENTOS = new Set([
   'page_view',
   'profile_opened',
@@ -7189,7 +7189,11 @@ const FUNIL_EVENTOS = new Set([
   'manual_payment_check',
   'manual_payment_check_result',
   'pagamento_confirmado_redirect_confirmado',
-  'triage_redirect_start'
+  'triage_redirect_start',
+  'renovacao_cta_home_click',
+  'renovacao_page_view',
+  'renovacao_form_start',
+  'renovacao_checkout_start'
 ]);
 
 function limitarTextoFunil(valor, limite) {
