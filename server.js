@@ -5226,7 +5226,7 @@ app.get("/api/atendimento/assumir-email", async (req, res) => {
     if (payload.tipo !== "assumir") return res.status(400).send("<h2>Token inválido.</h2>");
     const { medicoId, medicoNome, atendimentoId } = payload;
     const reserva = await pool.query(
-      `SELECT categoria_atendimento,especialidade_solicitada,fallback_decisao,
+      `SELECT tipo,categoria_atendimento,especialidade_solicitada,fallback_decisao,
               prioridade_medico_id,prioridade_ate
          FROM fila_atendimentos
         WHERE id=$1`,
@@ -5236,6 +5236,10 @@ app.get("/api/atendimento/assumir-email", async (req, res) => {
       `SELECT email,especialidade FROM medicos WHERE id=$1 AND ativo=true AND status='aprovado'`,
       [medicoId]
     )).rows[0];
+    if (String(reserva.rows[0]?.tipo || "").toLowerCase().startsWith("renovacao") &&
+        String(medicoReserva?.email || "").trim().toLowerCase() !== ADMIN_MEDICO_EMAIL) {
+      return res.status(403).send("Renovacao reservada ao administrador");
+    }
     if (reserva.rows[0]?.categoria_atendimento === "especialista_imediato"
         && reserva.rows[0]?.fallback_decisao !== "clinico"
         && Number(medicoId) !== 0) {
@@ -9797,7 +9801,7 @@ app.post("/api/atendimento/assumir", checkMedico, async (req, res) => {
     if (!medicoResult.rows[0]) return res.status(403).json({ ok: false, error: "Medico nao autorizado" });
     const medico = medicoResult.rows[0];
     const atendimentoResult = await pool.query(
-      `SELECT id,categoria_atendimento,especialidade_solicitada,fallback_decisao,
+      `SELECT id,tipo,categoria_atendimento,especialidade_solicitada,fallback_decisao,
               prioridade_medico_id,prioridade_ate
          FROM fila_atendimentos
         WHERE id=$1`,
@@ -9805,7 +9809,10 @@ app.post("/api/atendimento/assumir", checkMedico, async (req, res) => {
     );
     const atendimento = atendimentoResult.rows[0];
     if (!atendimento) return res.status(404).json({ ok: false, error: "Atendimento nao encontrado" });
-    const isAdmin = medico.email === "gustavosgbf@gmail.com";
+    const isAdmin = String(medico.email || "").trim().toLowerCase() === ADMIN_MEDICO_EMAIL;
+    if (String(atendimento.tipo || "").toLowerCase().startsWith("renovacao") && !isAdmin) {
+      return res.status(403).json({ ok: false, error: "Renovacao reservada ao administrador" });
+    }
     const reservadoEspecialista = atendimento.categoria_atendimento === "especialista_imediato"
       && atendimento.fallback_decisao !== "clinico";
     if (
