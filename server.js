@@ -30,22 +30,6 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
-// Reparo pontual e idempotente: pedido de renovacao #5057 assumido/encerrado indevidamente.
-// Nao emite notificacoes, nao altera pagamento, documentos ou dados clinicos.
-pool.query(
-  `UPDATE fila_atendimentos
-      SET status='aguardando', medico_id=NULL, medico_nome=NULL,
-          assumido_em=NULL, encerrado_em=NULL, status_atendimento=NULL,
-          documentos_emitidos=NULL
-    WHERE id=5057 AND tipo='renovacao_digital'
-      AND medico_id=21 AND status='encerrado'
-      AND pagamento_status='confirmado'
-      AND renovacao_receita_pronta_em IS NULL
-      AND NOT EXISTS (SELECT 1 FROM mensagens WHERE atendimento_id=5057)
-    RETURNING id,status,medico_id`
-).then(r => console.log('[REPARO-RENOVACAO-5057]', r.rowCount === 1 ? 'restaurado' : 'nenhuma alteracao'))
- .catch(e => console.error('[REPARO-RENOVACAO-5057] falha:', e.message));
-
 const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SECRET_KEY) : null;
 
 // Migração temporariamente desativada: a rotina anterior de Ana Valéria fazia
