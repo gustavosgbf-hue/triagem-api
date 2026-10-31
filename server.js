@@ -10415,14 +10415,25 @@ async function efiGetToken() {
 
 // ── EFÍ: rota de teste (admin) ────────────────────────────────────────────────
 // ── STRIPE: cartão via Checkout Sessions + Payment Element ───────────────────
+function stripeCartaoProntoProducao() {
+  const publica = String(process.env.STRIPE_PUBLISHABLE_KEY || "").trim();
+  const secreta = String(process.env.STRIPE_SECRET_KEY || "").trim();
+  const webhook = String(process.env.STRIPE_WEBHOOK_SECRET || "").trim();
+  // Nunca liberar pagamentos com cartão em uma página de pacientes com chaves de teste.
+  return !!(stripe && publica.startsWith("pk_live_") &&
+    (secreta.startsWith("sk_live_") || secreta.startsWith("rk_live_")) &&
+    webhook.startsWith("whsec_"));
+}
+
 app.get("/api/stripe/config", (_req, res) => {
   const publishableKey = String(process.env.STRIPE_PUBLISHABLE_KEY || "").trim();
-  res.json({ ok: true, enabled: !!(stripe && publishableKey), publishableKey: publishableKey || null, mode: publishableKey.startsWith("pk_live_") ? "live" : "test" });
+  const enabled = stripeCartaoProntoProducao();
+  res.json({ ok: true, enabled, publishableKey: enabled ? publishableKey : null, mode: enabled ? "live" : "not_ready" });
 });
 
 app.post("/api/stripe/checkout-session", rlGeral, async (req, res) => {
   try {
-    if (!stripe) return res.status(503).json({ ok: false, error: "Stripe indisponível" });
+    if (!stripeCartaoProntoProducao()) return res.status(503).json({ ok: false, error: "Pagamento com cartão temporariamente indisponível" });
     const atendimentoId = Number.parseInt(String(req.body?.atendimentoId || ""), 10) || null;
     if (!atendimentoId) return res.status(400).json({ ok: false, error: "atendimentoId obrigatório" });
 
