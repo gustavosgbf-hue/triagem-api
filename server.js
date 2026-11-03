@@ -172,6 +172,19 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
       if (session.payment_status === "paid") {
         const atendimentoId = Number.parseInt(String(session.metadata?.atendimento_id || ""), 10) || null;
         if (atendimentoId) {
+          if (session.metadata?.origem === "renovacao_receita") {
+            const { rows: pedidos } = await pool.query(
+              "SELECT id,tipo,frete_valor,stripe_checkout_session_id FROM fila_atendimentos WHERE id=$1 AND tipo LIKE 'renovacao_%'",
+              [atendimentoId]
+            );
+            const pedido = pedidos[0];
+            if (pedido && pedido.stripe_checkout_session_id === session.id && session.currency === "brl" && session.amount_total === renovacaoValorCentavos(pedido)) {
+              await confirmarRenovacaoPorId(atendimentoId, "stripe_webhook");
+            } else {
+              console.warn("[RENOVACAO-STRIPE] Sessão inválida ou valor divergente", { atendimentoId, sessionId: session.id });
+            }
+            return res.json({ received: true });
+          }
           const paymentIntentId = typeof session.payment_intent === "string" ? session.payment_intent : session.payment_intent?.id;
           const { rows } = await pool.query(
             `UPDATE fila_atendimentos
@@ -12303,7 +12316,7 @@ async function enviarEmailRenovacaoAdmin(at) {
   const endereco = at.endereco_envio || {};
   const questionario = at.questionario || {};
   const esc = (v) => String(v || "").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-  const tipoLabel = at.tipo === "renovacao_fisica" ? "FÍSICA" : "DIGITAL";
+  const tipoLabel = at.questionario?.origem_pedido === "tratamento_peso_glp1" ? "GLP-1 / CONTROLE DO PESO" : at.tipo === "renovacao_fisica" ? "FÍSICA" : "DIGITAL";
   const labelsQuestionario = {
     condicao_diagnostico: "Condição/diagnóstico",
     tempo_uso: "Tempo de uso",
@@ -12312,11 +12325,18 @@ async function enviarEmailRenovacaoAdmin(at) {
     informacoes_importantes: "Informações importantes",
     medico_original: "Médico/especialidade original",
     acompanhamento: "Acompanhamento regular",
-    laudo_diagnostico: "Laudo/diagnóstico documentado"
+    laudo_diagnostico: "Laudo/diagnóstico documentado",
+    origem_pedido: "Categoria da solicitação",
+    medicamento_declarado: "Medicação de GLP-1/controle do peso informada",
+    peso_atual_kg: "Peso atual (kg)",
+    altura_cm: "Altura atual (cm)",
+    declara_uso_previo: "Declara uso prévio",
+    declara_receita_anterior: "Declara possuir receita anterior",
+    declara_avaliacao: "Ciente da avaliação médica"
   };
   const linhasQuestionario = Object.entries(labelsQuestionario)
     .filter(([key]) => questionario[key])
-    .map(([key, label]) => `<div style="margin:6px 0"><strong>${label}:</strong> ${esc(questionario[key])}</div>`)
+    .map(([key, label]) => `<div style="margin:6px 0"><strong>${label}:</strong> ${esc(typeof questionario[key] === "boolean" ? (questionario[key] ? "Sim" : "Não") : questionario[key])}</div>`)
     .join("");
   const html = `
     <div style="font-family:Arial,sans-serif;background:#f7f7f7;padding:24px">
@@ -12494,6 +12514,84 @@ app.post("/api/renovacao/upload-anexo", rlUpload, upload.single("arquivo"), asyn
   } catch (e) {
     console.error("[RENOVACAO-UPLOAD]", e.message);
     return res.status(500).json({ ok: false, error: "Erro ao fazer upload" });
+  }
+});
+
+
+// Checkout Stripe para renovação: valor e tipo SEMPRE calculados no servidor.
+// Separado do Checkout de consultas comuns (R$ 49,90).
+app.post("/api/renovacao/stripe/checkout-session", rlGeral, async (req, res) => {
+  try {
+    if (!stripeCartaoProntoProducao()) return res.status(503).json({ ok: false, error: "Pagamento com cartão temporariamente indisponível" });
+    const atendimentoId = Number.parseInt(String(req.body?.atendimentoId || ""), 10) || null;
+    if (!atendimentoId) return res.status(400).json({ ok: false, error: "Solicitação inválida" });
+    const { rows } = await pool.query(
+      `SELECT id,tipo,pagamento_status,frete_valor,email,anexos_urls,stripe_checkout_session_id
+       FROM fila_atendimentos WHERE id=$1 AND tipo='renovacao_digital' LIMIT 1`,
+      [atendimentoId]
+    );
+    const at = rows[0];
+    if (!at) return res.status(404).json({ ok: false, error: "Solicitação de renovação não encontrada" });
+    if (at.pagamento_status === "confirmado") return res.status(409).json({ ok: false, error: "Pagamento já confirmado", already_paid: true });
+    if (!at.anexos_urls?.receita_anterior) return res.status(400).json({ ok: false, error: "Anexe a receita anterior antes do pagamento" });
+
+    const expectedAmount = 5990;
+    if (renovacaoValorCentavos(at) !== expectedAmount) {
+      console.error("[RENOVACAO-STRIPE] Preço de renovação divergente da configuração", { atendimentoId });
+      return res.status(503).json({ ok: false, error: "Configuração do preço em manutenção" });
+    }
+    const oldId = String(at.stripe_checkout_session_id || "").trim();
+    if (oldId) {
+      try {
+        const previous = await stripe.checkout.sessions.retrieve(oldId);
+        if (previous.payment_status === "paid") {
+          // Confirmação idempotente também cobre a eventual chegada tardia do webhook.
+          await confirmarRenovacaoPorId(atendimentoId, "stripe_checkout_recovered");
+          return res.status(409).json({ ok: false, already_paid: true, error: "Pagamento já confirmado" });
+        }
+        if (previous.status === "open" && previous.amount_total === expectedAmount && previous.client_secret && previous.metadata?.origem === "renovacao_receita") {
+          return res.json({ ok: true, sessionId: previous.id, clientSecret: previous.client_secret });
+        }
+      } catch (err) {
+        console.warn("[RENOVACAO-STRIPE] Sessão anterior não reutilizável:", err.message);
+      }
+    }
+    const session = await stripe.checkout.sessions.create({
+      ui_mode: "embedded_page", mode: "payment",
+      payment_method_types: ["card"],
+      line_items: [{ price_data: { currency: "brl", product_data: { name: "Avaliação de renovação de receita — ConsultaJá24h" }, unit_amount: expectedAmount }, quantity: 1 }],
+      ...(at.email && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(at.email) ? { customer_email: at.email } : {}),
+      redirect_on_completion: "if_required",
+      return_url: `https://consultaja24h.com.br/renovacao-de-receita/?stripe_return=1&session_id={CHECKOUT_SESSION_ID}`,
+      metadata: { atendimento_id: String(atendimentoId), origem: "renovacao_receita" },
+      payment_intent_data: { metadata: { atendimento_id: String(atendimentoId), origem: "renovacao_receita" } },
+    });
+    await pool.query("UPDATE fila_atendimentos SET stripe_checkout_session_id=$2,pagamento_metodo='cartao' WHERE id=$1 AND pagamento_status='pendente'", [atendimentoId,session.id]);
+    return res.json({ ok: true, sessionId: session.id, clientSecret: session.client_secret });
+  } catch (e) {
+    console.error("[RENOVACAO-STRIPE] checkout:", e.message);
+    return res.status(500).json({ ok: false, error: "Não foi possível abrir o pagamento com cartão" });
+  }
+});
+
+app.get("/api/renovacao/stripe/session-status", rlGeral, async (req, res) => {
+  try {
+    if (!stripe) return res.status(503).json({ ok: false, error: "Stripe indisponível" });
+    const sessionId=String(req.query.session_id || "").trim();
+    if (!/^cs_/.test(sessionId)) return res.status(400).json({ ok: false, error: "Sessão inválida" });
+    const session=await stripe.checkout.sessions.retrieve(sessionId);
+    if (session.metadata?.origem!=="renovacao_receita") return res.status(404).json({ ok: false, error: "Sessão não encontrada" });
+    const id=Number.parseInt(session.metadata?.atendimento_id,10);
+    if (!id) return res.status(400).json({ ok: false, error: "Identificação inválida" });
+    const {rows}=await pool.query("SELECT id,tipo,stripe_checkout_session_id FROM fila_atendimentos WHERE id=$1 AND tipo LIKE 'renovacao_%' LIMIT 1",[id]);
+    const at=rows[0];
+    if (!at || at.stripe_checkout_session_id!==session.id) return res.status(404).json({ ok: false, error: "Sessão não corresponde à solicitação" });
+    const paid=session.payment_status==="paid" && session.currency==="brl" && session.amount_total===renovacaoValorCentavos(at);
+    if (paid) await confirmarRenovacaoPorId(id,"stripe_session_status");
+    return res.json({ ok:true, paid, status:session.status });
+  } catch(e){
+    console.error("[RENOVACAO-STRIPE] status:",e.message);
+    return res.status(400).json({ok:false,error:"Não foi possível verificar pagamento"});
   }
 });
 
