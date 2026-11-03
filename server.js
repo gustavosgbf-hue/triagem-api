@@ -12,7 +12,7 @@ import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import multer from "multer";
-import { createHash, randomUUID } from "crypto";
+import { createHash, randomUUID, timingSafeEqual } from "crypto";
 import rateLimit from "express-rate-limit";
 import {
   codigoErroMemed,
@@ -2400,6 +2400,58 @@ function checkAdmin(req, res, next) {
   if (!senha || senha !== senhaAdmin) return res.status(403).send("Acesso negado");
   next();
 }
+
+// Importação programada de conversões offline (Google Ads > Conversões > Uploads > Programar, fonte HTTPS).
+// Não depende de developer token: o Google baixa este CSV a cada X horas.
+// Autenticação HTTP Basic: usuário "consultaja", senha = ADMIN_PASSWORD. Só lista consultas pagas que têm gclid.
+app.get("/api/google-ads/conversoes.csv", rlGeral, async (req, res) => {
+  const senhaAdmin = process.env.ADMIN_PASSWORD;
+  const auth = String(req.headers.authorization || "");
+  let user = "", pass = "";
+  if (auth.startsWith("Basic ")) {
+    const dec = Buffer.from(auth.slice(6), "base64").toString("utf8");
+    const i = dec.indexOf(":");
+    user = dec.slice(0, i); pass = dec.slice(i + 1);
+  }
+  const passBuf = Buffer.from(String(pass)), adminBuf = Buffer.from(String(senhaAdmin || ""));
+  const ok = !!senhaAdmin && user === "consultaja" && passBuf.length === adminBuf.length && timingSafeEqual(passBuf, adminBuf);
+  if (!ok) {
+    res.set("WWW-Authenticate", 'Basic realm="conversoes"');
+    return res.status(401).send("Acesso negado");
+  }
+  try {
+    const dias = Math.min(60, Math.max(1, parseInt(req.query.dias || "14", 10) || 14));
+    const nome = limitarTexto(process.env.GOOGLE_ADS_CSV_CONVERSION_NAME || "Consulta paga (servidor)", 100);
+    const valorPadrao = Number(process.env.GOOGLE_ADS_CONVERSION_VALUE || "49.90") || 49.90;
+    const { rows } = await pool.query(
+      `SELECT id, tipo, frete_valor, ads_gclid,
+              to_char(pagamento_confirmado_em AT TIME ZONE 'America/Fortaleza', 'YYYY-MM-DD HH24:MI:SS') AS quando
+         FROM fila_atendimentos
+        WHERE pagamento_status = 'confirmado'
+          AND pagamento_confirmado_em IS NOT NULL
+          AND pagamento_confirmado_em > NOW() - ($1::int * INTERVAL '1 day')
+          AND COALESCE(ads_gclid, '') <> ''
+        ORDER BY pagamento_confirmado_em ASC`,
+      [dias]
+    );
+    const linhas = ["Parameters:TimeZone=America/Fortaleza", "Google Click ID,Conversion Name,Conversion Time,Conversion Value,Conversion Currency"];
+    for (const r of rows) {
+      const gclid = String(r.ads_gclid).replace(/[^A-Za-z0-9_\-]/g, "");
+      if (!gclid) continue;
+      let valor = valorPadrao;
+      if (String(r.tipo || "").startsWith("renovacao_")) {
+        try { valor = renovacaoValorCentavos(r) / 100; } catch (_e) { valor = 59.90; }
+      }
+      linhas.push([gclid, '"' + nome.replace(/"/g, "") + '"', r.quando, valor.toFixed(2), "BRL"].join(","));
+    }
+    res.set("Content-Type", "text/csv; charset=utf-8");
+    res.set("Cache-Control", "no-store");
+    return res.send(linhas.join("\n") + "\n");
+  } catch (e) {
+    console.error("[GADS-CSV]", e.message);
+    return res.status(500).send("Erro ao gerar CSV");
+  }
+});
 
 app.post("/api/admin/google-ads/offline/retry", checkAdmin, async (req, res) => {
   const limit = Math.min(100, Math.max(1, parseInt(req.body?.limit || req.query.limit || "25", 10) || 25));
