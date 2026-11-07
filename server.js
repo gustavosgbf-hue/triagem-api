@@ -2961,6 +2961,9 @@ app.post("/api/pagbank/order", async (req, res) => {
     } = req.body || {};
     const adsAttribution = normalizarAdsAttribution(req.body?.ads || req.body?.attribution || {}, req);
     if (!nome || !cpf) return res.status(400).json({ ok: false, error: "nome e cpf obrigatorios" });
+    if (!julieValidarCPF(String(cpf))) {
+      return res.status(422).json({ ok: false, code: "CPF_INVALIDO", error: "Confira os 11 digitos do CPF do pagador." });
+    }
     if (!PAGBANK_TOKEN) return res.status(503).json({ ok: false, error: "Gateway de pagamento indisponivel" });
     const atendimentoIdNum = parseInt(atendimentoId, 10) || null;
     const configuracao = await buscarConfiguracaoAtendimento(atendimentoIdNum);
@@ -3094,114 +3097,92 @@ app.post("/api/pagbank/webhook", async (req, res) => {
     return res.status(400).end();
   }
 
-  const orderId  = String(event?.data?.id || event?.id || "");
-  const orderRef = String(event?.data?.reference_id ?? event?.reference_id ?? "");
-  const charges  = event?.data?.charges || event?.charges || [];
-  const pago     = charges.some(c => c.status === "PAID");
-
-  console.log("[PAGBANK-WEBHOOK] Recebido — orderId:", orderId, "ref:", orderRef, "pago:", pago);
-
-  res.sendStatus(200);
-
-  if (!pago || !orderId) return;
+  // Eventos que não anunciam pagamento aprovado não precisam consultar o gateway.
+  if (!pagbankOrderPago(event.data || event)) return res.sendStatus(200);
+  const orderId = String(event?.data?.id || event?.id || "");
+  if (!orderId) {
+    // Alguns avisos não são notificações de uma order: não alteram atendimentos.
+    return res.sendStatus(200);
+  }
 
   try {
+    if (!PAGBANK_TOKEN) throw new Error("Gateway sem credencial para verificar pagamento");
+    // Não confiar no status recebido via webhook: consultar a order autenticada no PagBank.
+    const pbRes = await fetch(`${PAGBANK_URL}/orders/${encodeURIComponent(orderId)}`, {
+      headers: { "Authorization": `Bearer ${PAGBANK_TOKEN}`, "accept": "application/json" }
+    });
+    if (!pbRes.ok) {
+      throw new Error(`Falha na verificacao PagBank HTTP ${pbRes.status}`);
+    }
+    const verifiedOrder = await pbRes.json();
+    if (!pagbankOrderPago(verifiedOrder)) return res.sendStatus(200);
+    if (verifiedOrder.id && String(verifiedOrder.id) !== orderId) {
+      throw new Error("ID da order verificada nao corresponde ao webhook");
+    }
+
     const { rowCount, rows } = await pool.query(
       `UPDATE fila_atendimentos
-          SET pagamento_status        = 'confirmado',
-              pagamento_confirmado_em = NOW(),
+          SET pagamento_status = 'confirmado',
+              pagamento_confirmado_em = COALESCE(pagamento_confirmado_em, NOW()),
               status = CASE
                 WHEN status = 'pagamento_pendente' THEN 'triagem'
-                WHEN status = 'triagem' THEN
-                  CASE
-                    WHEN LOWER(TRIM(triagem)) NOT IN (
-                      '(aguardando pagamento)',
-                      '(pagamento confirmado — aguardando triagem)',
-                      '(triagem em andamento)',
-                      '(aguardando triagem de agendamento)',
-                      '(aguardando resposta)'
-                    )
-                    AND LOWER(TRIM(triagem)) NOT LIKE '(aguardando pagamento)%'
-                    AND LOWER(TRIM(triagem)) NOT LIKE '(pagamento confirmado%'
-                    AND LOWER(TRIM(triagem)) NOT LIKE '(triagem em andamento)%'
-                    AND LOWER(TRIM(triagem)) NOT LIKE '(aguardando triagem de agendamento)%'
-                    AND LOWER(TRIM(triagem)) NOT LIKE '(aguardando resposta)%'
-                    THEN 'aguardando'
-                    ELSE 'triagem'
-                  END
+                WHEN status = 'triagem' AND triagem IS NOT NULL
+                  AND LOWER(TRIM(triagem)) NOT LIKE '(aguardando pagamento)%'
+                  AND LOWER(TRIM(triagem)) NOT LIKE '(pagamento confirmado%'
+                  AND LOWER(TRIM(triagem)) NOT LIKE '(triagem em andamento)%'
+                  AND LOWER(TRIM(triagem)) NOT LIKE '(aguardando triagem de agendamento)%'
+                  AND LOWER(TRIM(triagem)) NOT LIKE '(aguardando resposta)%'
+                  THEN 'aguardando'
                 ELSE status
               END
-        WHERE pagbank_order_id = $1
-          AND pagamento_status  = 'pendente'
+        WHERE pagbank_order_id = $1 AND pagamento_status = 'pendente'
         RETURNING id, nome, tel, cpf, tipo, triagem, status`,
       [orderId]
     );
 
+    let atendimento = rows[0];
     if (rowCount === 0) {
-      console.log("[PAGBANK-WEBHOOK] Order " + orderId + " nao encontrado pelo pagbank_order_id — tentando fallback por fila_atendimentos.");
-
-      const fbFila = await pool.query(
-        `WITH candidato AS (
-           SELECT id
-             FROM fila_atendimentos
-            WHERE pagbank_order_id IS NULL
-              AND pagamento_status = 'pendente'
-              AND criado_em > NOW() - INTERVAL '2 hours'
-            ORDER BY criado_em DESC
-            LIMIT 1
-         )
-         UPDATE fila_atendimentos
-            SET pagamento_status        = 'confirmado',
-                pagamento_confirmado_em = NOW(),
-                pagbank_order_id        = $1,
-                status = CASE
-                  WHEN status = 'pagamento_pendente' THEN 'triagem'
-                  WHEN status = 'triagem' THEN
-                    CASE
-                      WHEN LOWER(TRIM(triagem)) NOT IN (
-                        '(aguardando pagamento)',
-                        '(pagamento confirmado — aguardando triagem)',
-                        '(triagem em andamento)',
-                        '(aguardando triagem de agendamento)',
-                        '(aguardando resposta)'
-                      )
-                      AND LOWER(TRIM(triagem)) NOT LIKE '(aguardando pagamento)%'
-                      AND LOWER(TRIM(triagem)) NOT LIKE '(pagamento confirmado%'
-                      AND LOWER(TRIM(triagem)) NOT LIKE '(triagem em andamento)%'
-                      AND LOWER(TRIM(triagem)) NOT LIKE '(aguardando triagem de agendamento)%'
-                      AND LOWER(TRIM(triagem)) NOT LIKE '(aguardando resposta)%'
-                      THEN 'aguardando'
-                      ELSE 'triagem'
-                    END
-                  ELSE status
-                END
-          FROM candidato
-         WHERE fila_atendimentos.id = candidato.id
-          RETURNING id, nome, tel, cpf, tipo, triagem, status`,
-        [orderId]
-      ).catch(e => { console.warn("[PAGBANK-WEBHOOK] Fallback fila_atendimentos:", e.message); return { rowCount: 0, rows: [] }; });
-
-      if (fbFila.rowCount > 0) {
-        const atFb = fbFila.rows[0];
-        console.log("[PAGBANK-WEBHOOK] Fallback fila_atendimentos: atendimento #" + atFb.id + " atualizado via race-condition recovery.");
-        console.log("PAGAMENTO_CONFIRMADO_REDIRECT_CONFIRMADO", { consultaId: String(atFb.id), tipo: atFb.tipo || "chat", metodo: "pix" });
-        await logarCandidatoConversaoOffline(atFb.id, "pix", "pagbank_webhook_fallback", orderId);
-        await juliePromoverAtendimento(atFb, orderId);
-        return;
+      // Corrige corrida de gravação de order APENAS por reference_id autenticado.
+      // Nunca creditar a cobrança ao último paciente pendente: isso pode vincular
+      // dinheiro e dados clínicos de pessoas diferentes.
+      const reference = String(verifiedOrder.reference_id || "");
+      const match = /^CJ-(\d+)-[A-Z0-9]{4}$/i.exec(reference);
+      if (match) {
+        const fallback = await pool.query(
+          `UPDATE fila_atendimentos
+              SET pagamento_status = 'confirmado',
+                  pagamento_confirmado_em = COALESCE(pagamento_confirmado_em, NOW()),
+                  pagbank_order_id = $2,
+                  status = CASE WHEN status = 'pagamento_pendente' THEN 'triagem' ELSE status END
+            WHERE id = $1 AND pagbank_order_id IS NULL AND pagamento_status = 'pendente'
+            RETURNING id, nome, tel, cpf, tipo, triagem, status`,
+          [Number(match[1]), orderId]
+        );
+        atendimento = fallback.rows[0];
+        if (atendimento) console.log(`[PAGBANK-WEBHOOK] Order recuperada pela reference_id no atendimento #${atendimento.id}`);
       }
-
-      console.warn("[PAGBANK-WEBHOOK] Order " + orderId + " nao encontrada em nenhum atendimento — ignorando.");
-      return;
     }
 
-    const at = rows[0];
-    console.log("[PAGBANK-WEBHOOK] Pagamento confirmado — atendimento #" + at.id + " status:" + at.status);
-    console.log("PAGAMENTO_CONFIRMADO_REDIRECT_CONFIRMADO", { consultaId: String(at.id), tipo: at.tipo || "chat", metodo: "pix" });
-    await logarCandidatoConversaoOffline(at.id, "pix", "pagbank_webhook", orderId);
-    await juliePromoverAtendimento(at, orderId);
+    if (!atendimento) {
+      const existente = await pool.query(
+        `SELECT id, pagamento_status FROM fila_atendimentos WHERE pagbank_order_id = $1 LIMIT 1`,
+        [orderId]
+      );
+      if (!existente.rowCount) console.warn(`[PAGBANK-WEBHOOK] Order autenticada ${orderId} sem atendimento correspondente; encaminhar para conciliacao`);
+      return res.sendStatus(200);
+    }
 
+    console.log(`[PAGBANK-WEBHOOK] Pagamento confirmado para atendimento #${atendimento.id}; status=${atendimento.status}`);
+    // Falhas de notificação/marketing não devem desfazer a confirmação financeira.
+    try { await logarCandidatoConversaoOffline(atendimento.id, "pix", "pagbank_webhook", orderId); }
+    catch (e) { console.warn("[PAGBANK-WEBHOOK] Conversao offline:", e.message); }
+    try { await juliePromoverAtendimento(atendimento, orderId); }
+    catch (e) { console.error("[PAGBANK-WEBHOOK] Notificacao do atendimento:", e.message); }
+    return res.sendStatus(200);
   } catch (e) {
-    console.error("[PAGBANK-WEBHOOK] Erro no processamento:", e.message);
+    console.error("[PAGBANK-WEBHOOK] Falha antes da conciliacao:", e.message);
+    // Indica falha à PagBank para permitir nova tentativa de entrega.
+    return res.sendStatus(500);
   }
 });
 
