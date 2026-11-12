@@ -1780,7 +1780,7 @@ async function initDB() {
       ['status_atendimento','TEXT'],['documentos_emitidos','TEXT'],['meet_link','TEXT'],
       ['tel_documentos','TEXT'],['idade','TEXT'],['sexo','TEXT'],['alergias','TEXT'],
       ['cronicas','TEXT'],['medicacoes','TEXT'],['queixa','TEXT'],
-      ['assumido_em','TIMESTAMP'],['encerrado_em','TIMESTAMP'],
+      ['assumido_em','TIMESTAMP'],['encerrado_em','TIMESTAMP'],['fila_entrada_em','TIMESTAMPTZ'],
       ['data_nascimento','TEXT'],
       ['prontuario','TEXT'],
       ['solicita','TEXT'],
@@ -3198,6 +3198,9 @@ app.post("/api/pagbank/webhook", async (req, res) => {
     console.log("[PAGBANK-WEBHOOK] Pagamento confirmado — atendimento #" + at.id + " status:" + at.status);
     console.log("PAGAMENTO_CONFIRMADO_REDIRECT_CONFIRMADO", { consultaId: String(at.id), tipo: at.tipo || "chat", metodo: "pix" });
     await logarCandidatoConversaoOffline(at.id, "pix", "pagbank_webhook", orderId);
+    if (at.status === 'aguardando') {
+      await pool.query('UPDATE fila_atendimentos SET fila_entrada_em=COALESCE(fila_entrada_em,NOW()) WHERE id=$1',[at.id]);
+    }
     await juliePromoverAtendimento(at, orderId);
 
   } catch (e) {
@@ -3911,6 +3914,10 @@ function isTriagemPlaceholder(triagem) {
   if (!triagem) return true;
   const t = triagem.trim().toLowerCase();
   if (TRIAGEM_PLACEHOLDERS.has(t)) return true;
+  // Apps antigos e retomadas podem gravar a frase sem parenteses ou dentro
+  // de um resumo da IA: isso nao e sintoma e nunca deve liberar a fila.
+  if (/^\(?\s*(?:aguardando|esperando|pendente|confirmando)\s+(?:o\s+)?pagamento\s*[.!?]*\)?$/.test(t)) return true;
+  if (/^queixa principal\s*:\s*(?:aguardando|esperando|pendente|confirmando)\s+(?:o\s+)?pagamento[.!?]?(?:\s|$)/.test(t)) return true;
   return t.startsWith('(aguardando pagamento)')
     || t.startsWith('(pagamento confirmado')
     || t.startsWith('(triagem em andamento)')
@@ -4215,7 +4222,7 @@ setInterval(() => {
 // ── Helper: libera atendimento para médicos (timer + endpoint de aprovação) ───
 async function liberarAtendimentoParaMedicos(atendimentoId) {
   const r = await pool.query(
-    `UPDATE fila_atendimentos SET status='aguardando', aprovacao_token=NULL
+    `UPDATE fila_atendimentos SET status='aguardando', aprovacao_token=NULL, fila_entrada_em=NOW()
      WHERE id=$1 AND status='aguardando_aprovacao' RETURNING id,nome,tel,cpf,tipo,triagem,tel_documentos`,
     [atendimentoId]
   );
@@ -4233,6 +4240,13 @@ app.post("/api/atendimento/atualizar-triagem", async (req, res) => {
     if (!atendimentoId || !triagem) return res.status(400).json({ ok: false, error: "atendimentoId e triagem sao obrigatorios" });
     const triagemCompacta = compactarTriagem(triagem);
     const campos = parsearTriagem(triagemCompacta);
+    // Nunca transformar um estado do pagamento em queixa medica.
+    // Impede que uma triagem LLM baseada em placeholder seja entregue como relatorio clinico.
+    const queixaNormalizada = String(campos.queixa || '').normalize('NFD').replace(/[\u0300-\u036f]/g,'').trim().replace(/[.!?]+$/g,'').toLowerCase();
+    if (/^\(?\s*(aguardando|esperando|pendente|confirmando)\s+(o\s+)?pagamento\s*\)?$/.test(queixaNormalizada)) {
+      console.warn('[TRIAGEM] Queixa operacional rejeitada no atendimento #'+atendimentoId);
+      return res.status(422).json({ ok:false, error:'queixa_clinica_invalida', message:'Descreva sua queixa medica para concluir a triagem. O pagamento permanece confirmado.' });
+    }
     const nomeLimpo = normalizarNomePaciente(nome);
     const telLimpo = normalizarTexto(tel);
     const cpfLimpo = normalizarCpf(cpf);
@@ -4243,7 +4257,7 @@ app.post("/api/atendimento/atualizar-triagem", async (req, res) => {
     // ── AGENDAMENTO: fluxo original sem interceptação ──────────────────────
     if (agendamentoId) {
       const result = await pool.query(
-        `UPDATE fila_atendimentos SET triagem=$2,queixa=$3,idade=$4,sexo=$5,alergias=$6,cronicas=$7,medicacoes=$8,solicita=$9,status='aguardando'
+        `UPDATE fila_atendimentos SET triagem=$2,queixa=$3,idade=$4,sexo=$5,alergias=$6,cronicas=$7,medicacoes=$8,solicita=$9,status='aguardando',fila_entrada_em=NOW()
          WHERE id=$1 AND status IN ('triagem','aguardando') RETURNING id,nome,tel,cpf,tipo,triagem,tel_documentos,medico_nome`,
         [atendimentoId,triagemCompacta,campos.queixa||triagemCompacta,idadeClinica,campos.sexo||"",campos.alergias||"",campos.cronicas||"",campos.medicacoes||"",campos.solicita||""]
       );
@@ -4317,6 +4331,7 @@ app.post("/api/atendimento/atualizar-triagem", async (req, res) => {
       `UPDATE fila_atendimentos
           SET triagem=$2, queixa=$3, idade=$4, sexo=$5, alergias=$6, cronicas=$7,
               medicacoes=$8, solicita=$9, status=$10, aprovacao_token=NULL,
+              fila_entrada_em=CASE WHEN $10='aguardando' AND status<>'aguardando' THEN NOW() ELSE fila_entrada_em END,
               nome=COALESCE($11,nome),
               tel=COALESCE($12,tel),
               cpf=COALESCE($13,cpf),
@@ -5321,7 +5336,7 @@ app.get("/api/atendimento/assumir-email", async (req, res) => {
     // Tenta assumir com trava — só um médico consegue
     const result = await pool.query(
       `UPDATE fila_atendimentos SET status='assumido', medico_id=$1, medico_nome=$2, assumido_em=NOW()
-       WHERE id=$3 AND status='aguardando' RETURNING *`,
+       WHERE id=$3 AND status='aguardando' AND pagamento_status IN ('confirmado','isento_admin') RETURNING *`,
       [medicoId, medicoNome, atendimentoId]
     );
     if (result.rowCount === 0) {
@@ -9568,7 +9583,7 @@ app.get("/api/fila", checkMedico, async (req, res) => {
     let query, params;
     if (isAdmin) {
       await reconciliarRenovacoesPendentes().catch(e => console.warn("[RENOVACAO-RECONCILIAR]", e.message));
-      query = `SELECT id,nome,tel,cpf,tipo,triagem,status,pagamento_status,medico_id,medico_nome,meet_link,criado_em,data_nascimento,idade,sexo,alergias,cronicas,medicacoes,queixa,solicita,horario_agendado,
+      query = `SELECT id,nome,tel,cpf,tipo,triagem,status,pagamento_status,medico_id,medico_nome,meet_link,criado_em,assumido_em,fila_entrada_em,pagamento_confirmado_em,prioridade_geral_notificada_em,data_nascimento,idade,sexo,alergias,cronicas,medicacoes,queixa,solicita,horario_agendado,
                       categoria_atendimento,especialidade_solicitada,valor_cobrado_centavos,fallback_decisao,
                       prioridade_medico_id,prioridade_ate
                  FROM fila_atendimentos
@@ -9581,7 +9596,7 @@ app.get("/api/fila", checkMedico, async (req, res) => {
                   AND LOWER(TRIM(COALESCE(triagem,''))) NOT LIKE '(aguardando triagem%'
                 ORDER BY criado_em ASC`;
     } else {
-      query = `SELECT id,nome,tel,cpf,tipo,triagem,status,pagamento_status,medico_id,medico_nome,meet_link,criado_em,data_nascimento,idade,sexo,alergias,cronicas,medicacoes,queixa,solicita,horario_agendado,
+      query = `SELECT id,nome,tel,cpf,tipo,triagem,status,pagamento_status,medico_id,medico_nome,meet_link,criado_em,assumido_em,fila_entrada_em,pagamento_confirmado_em,prioridade_geral_notificada_em,data_nascimento,idade,sexo,alergias,cronicas,medicacoes,queixa,solicita,horario_agendado,
                       categoria_atendimento,especialidade_solicitada,valor_cobrado_centavos,fallback_decisao,
                       prioridade_medico_id,prioridade_ate
                  FROM fila_atendimentos
@@ -9895,7 +9910,7 @@ app.post("/api/atendimento/assumir", checkMedico, async (req, res) => {
     }
     const medicoNome = medico.nome_exibicao || medico.nome;
     const result = await pool.query(
-      `UPDATE fila_atendimentos SET status='assumido',medico_id=$1,medico_nome=$2,assumido_em=NOW() WHERE id=$3 AND status='aguardando' RETURNING *`,
+      `UPDATE fila_atendimentos SET status='assumido',medico_id=$1,medico_nome=$2,assumido_em=NOW() WHERE id=$3 AND status='aguardando' AND pagamento_status IN ('confirmado','isento_admin') RETURNING *`,
       [medico.id,medicoNome,filaId]
     );
     if (result.rowCount===0) return res.status(409).json({ ok: false, error: "Paciente ja foi assumido" });
