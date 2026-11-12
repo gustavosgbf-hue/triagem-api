@@ -19,11 +19,13 @@ const schemaReady = pool.query(`
 function normalizarOrigem(req) {
   const header = String(req.get?.('x-consultaja-platform') || '').trim().toLowerCase();
   const bodyOrigem = String(req.body?.origem || '').trim().toLowerCase();
-  const valor = header || bodyOrigem;
-
-  if (valor.includes('android')) return 'android';
-  if (valor.includes('ios') || valor.includes('iphone') || valor.includes('ipad')) return 'ios';
-  if (valor.includes('app')) return 'app_desconhecido';
+  // Nao deixar um header generico 'web' esconder origem app_ios/app_android
+  // enviada no corpo pelos apps nativos (inclusive em retomadas de sessao).
+  for (const valor of [header, bodyOrigem]) {
+    if (valor.includes('android')) return 'android';
+    if (valor.includes('ios') || valor.includes('iphone') || valor.includes('ipad')) return 'ios';
+  }
+  if (header.includes('app') || bodyOrigem.includes('app')) return 'app_desconhecido';
   return 'web';
 }
 
