@@ -45,6 +45,18 @@ async function ensureSchema() {
     CREATE INDEX IF NOT EXISTS idx_paciente_push_tokens_paciente
       ON paciente_push_tokens(paciente_id) WHERE ativo = TRUE;
 
+    CREATE TABLE IF NOT EXISTS paciente_push_marketing (
+      paciente_id BIGINT PRIMARY KEY,
+      autorizado BOOLEAN NOT NULL,
+      versao TEXT NOT NULL,
+      atualizado_em TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS push_marketing_entregas (
+      campanha TEXT NOT NULL,
+      token_id BIGINT NOT NULL,
+      criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY(campanha,token_id)
+    );
     ALTER TABLE fila_atendimentos
       ADD COLUMN IF NOT EXISTS push_assumido_paciente_em TIMESTAMPTZ;
     ALTER TABLE fila_atendimentos
@@ -369,6 +381,23 @@ function installRoutes(app) {
   if (app.locals.__mobilePushInstalled) return;
   app.locals.__mobilePushInstalled = true;
 
+  app.get('/api/paciente/push-marketing', authPaciente, async (req,res) => {
+    try {
+      await ensureSchema();
+      const {rows} = await pool.query('SELECT autorizado FROM paciente_push_marketing WHERE paciente_id=$1',[req.pacienteId]);
+      res.json({ok:true, autorizado:rows[0]?.autorizado ?? null});
+    } catch { res.status(500).json({ok:false,error:'Não foi possível carregar a preferência.'}); }
+  });
+  app.post('/api/paciente/push-marketing', express.json({limit:'4kb'}), authPaciente, async (req,res) => {
+    if (typeof req.body?.autorizado !== 'boolean') return res.status(400).json({ok:false});
+    try {
+      await ensureSchema();
+      await pool.query(`INSERT INTO paciente_push_marketing(paciente_id,autorizado,versao)
+        VALUES($1,$2,'v1') ON CONFLICT(paciente_id) DO UPDATE SET autorizado=EXCLUDED.autorizado,versao=EXCLUDED.versao,atualizado_em=NOW()`,[req.pacienteId,req.body.autorizado]);
+      res.json({ok:true,autorizado:req.body.autorizado});
+    } catch { res.status(500).json({ok:false,error:'Não foi possível salvar a preferência.'}); }
+  });
+
   app.post('/api/paciente/push-token', express.json({ limit: '32kb' }), authPaciente, async (req, res) => {
     try {
       await ensureSchema();
@@ -511,6 +540,37 @@ if (!schemaStarted) {
 }
 
 setInterval(runWorker, 3500).unref?.();
+
+// Campanha única; nunca enviar sem opt-in explícito, nem fora da janela.
+let marketingBusy = false;
+async function campanhaPosFeriado() {
+  const now = Date.now();
+  if (marketingBusy || now < Date.parse('2026-11-16T11:00:00Z') || now >= Date.parse('2026-11-16T11:10:00Z')) return;
+  marketingBusy = true;
+  try {
+    await ensureSchema();
+    const campanha = 'pos-feriado-2026-11-16';
+    const {rows} = await pool.query(`SELECT t.id,t.expo_push_token FROM paciente_push_tokens t
+      JOIN paciente_push_marketing m ON m.paciente_id=t.paciente_id AND m.autorizado=TRUE
+      WHERE t.ativo=TRUE AND NOT EXISTS (SELECT 1 FROM push_marketing_entregas e WHERE e.campanha=$1 AND e.token_id=t.id)`,[campanha]);
+    for (const row of rows) {
+      const claim = await pool.query(`INSERT INTO push_marketing_entregas(campanha,token_id)
+        SELECT $1,t.id FROM paciente_push_tokens t JOIN paciente_push_marketing m ON m.paciente_id=t.paciente_id
+        WHERE t.id=$2 AND t.ativo=TRUE AND m.autorizado=TRUE ON CONFLICT DO NOTHING RETURNING token_id`,[campanha,row.id]);
+      if (!claim.rowCount) continue;
+      try {
+        const response = await fetch(EXPO_PUSH_URL,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify([{to:row.expo_push_token,title:'O feriado acabou, mas o cuidado continua! 💚',body:'Precisa renovar uma receita ou de avaliação médica para atestado? Consulte-se online, sem sair de casa.',data:{kind:'marketing'},sound:'default'}])});
+        const payload = await response.json();
+        const ticket = payload?.data?.[0];
+        if (ticket?.details?.error === 'DeviceNotRegistered') await pool.query('UPDATE paciente_push_tokens SET ativo=FALSE WHERE id=$1',[row.id]);
+        console.log('[PUSH-MARKETING]',campanha,ticket?.status || response.status);
+      } catch { console.warn('[PUSH-MARKETING] Falha no envio; sem reenvio automático para evitar duplicação.'); }
+    }
+  } catch(error) { console.warn('[PUSH-MARKETING]',error?.message); }
+  finally { marketingBusy=false; }
+}
+setInterval(campanhaPosFeriado, 15000).unref?.();
+
 
 const originalInit = express.application.init;
 express.application.init = function patchedMobilePushInit(...args) {
