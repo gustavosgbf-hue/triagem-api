@@ -60,13 +60,13 @@ async function atendimentoDoPaciente(pacienteId, atendimentoId) {
     `SELECT f.*
        FROM fila_atendimentos f
       WHERE f.id=$1
-        AND (
+        AND ((to_jsonb(f)->>'conta_paciente_id') = $4::text OR ((to_jsonb(f)->>'conta_paciente_id') IS NULL AND ((
           regexp_replace(COALESCE(to_jsonb(f)->>'cpf',''), '\\D', '', 'g') = $2
           OR regexp_replace(COALESCE(to_jsonb(f)->>'pagador_cpf',''), '\\D', '', 'g') = $2
         )
-        AND RIGHT(regexp_replace(COALESCE(to_jsonb(f)->>'tel',''), '\\D', '', 'g'), 11) = $3
+        AND RIGHT(regexp_replace(COALESCE(to_jsonb(f)->>'tel',''), '\\D', '', 'g'), 11) = $3)))
       LIMIT 1`,
-    [atendimentoId, cpf, phone],
+    [atendimentoId, cpf, phone, pacienteId],
   );
   return result.rows[0] || null;
 }
@@ -109,16 +109,16 @@ function installPatientHistoryRoutes(app) {
              NOW()
            ) AS data_atendimento
          FROM fila_atendimentos f
-        WHERE RIGHT(regexp_replace(COALESCE(to_jsonb(f)->>'tel',''), '\\D', '', 'g'), 11) = $1
+        WHERE ((to_jsonb(f)->>'conta_paciente_id') = $3::text OR ((to_jsonb(f)->>'conta_paciente_id') IS NULL AND (RIGHT(regexp_replace(COALESCE(to_jsonb(f)->>'tel',''), '\\D', '', 'g'), 11) = $1
           AND (
             $2 = '' OR
             regexp_replace(COALESCE(to_jsonb(f)->>'cpf',''), '\\D', '', 'g') = $2 OR
             regexp_replace(COALESCE(to_jsonb(f)->>'pagador_cpf',''), '\\D', '', 'g') = $2
-          )
+          ))))
           AND COALESCE(to_jsonb(f)->>'status','') NOT IN ('cancelado','expirado')
         ORDER BY data_atendimento DESC
         LIMIT 50`,
-        [phone, cpf],
+        [phone, cpf, req.pacienteId],
       );
 
       const atendimentos = result.rows.map((row) => ({
@@ -169,16 +169,16 @@ function installPatientHistoryRoutes(app) {
          JOIN fila_atendimentos f ON f.id = m.atendimento_id
         WHERE m.arquivo_url IS NOT NULL
           AND LOWER(COALESCE(m.arquivo_tipo,'')) = 'pdf'
-          AND RIGHT(regexp_replace(COALESCE(to_jsonb(f)->>'tel',''), '\\D', '', 'g'), 11) = $1
+          AND ((to_jsonb(f)->>'conta_paciente_id') = $3::text OR ((to_jsonb(f)->>'conta_paciente_id') IS NULL AND (RIGHT(regexp_replace(COALESCE(to_jsonb(f)->>'tel',''), '\\D', '', 'g'), 11) = $1
           AND (
             $2 = '' OR
             regexp_replace(COALESCE(to_jsonb(f)->>'cpf',''), '\\D', '', 'g') = $2 OR
             regexp_replace(COALESCE(to_jsonb(f)->>'pagador_cpf',''), '\\D', '', 'g') = $2
-          )
+          ))))
           AND COALESCE(to_jsonb(f)->>'status','') NOT IN ('cancelado','expirado')
         ORDER BY m.criado_em DESC, m.id DESC
         LIMIT 100`,
-        [phone, cpf],
+        [phone, cpf, req.pacienteId],
       );
 
       const documentos = result.rows.map((row) => ({
@@ -241,14 +241,14 @@ function installPatientHistoryRoutes(app) {
           AND NULLIF(to_jsonb(f)->>'encerrado_em','') IS NULL
           AND NULLIF(to_jsonb(f)->>'finalizado_em','') IS NULL
           AND ($3::boolean = false OR COALESCE(to_jsonb(f)->>'pagamento_metodo','') = 'beta_test')
-          AND (
+          AND ((to_jsonb(f)->>'conta_paciente_id') = $4::text OR ((to_jsonb(f)->>'conta_paciente_id') IS NULL AND ((
             regexp_replace(COALESCE(to_jsonb(f)->>'cpf',''), '\\D', '', 'g') = $1
             OR regexp_replace(COALESCE(to_jsonb(f)->>'pagador_cpf',''), '\\D', '', 'g') = $1
           )
-          AND RIGHT(regexp_replace(COALESCE(to_jsonb(f)->>'tel',''), '\\D', '', 'g'), 11) = $2
+          AND RIGHT(regexp_replace(COALESCE(to_jsonb(f)->>'tel',''), '\\D', '', 'g'), 11) = $2)))
         ORDER BY NULLIF(to_jsonb(f)->>'criado_em','')::timestamptz DESC NULLS LAST
         LIMIT 1`,
-        [cpf, phone, isBeta],
+        [cpf, phone, isBeta, req.pacienteId],
       );
 
       const row = result.rows[0];

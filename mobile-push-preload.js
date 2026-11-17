@@ -145,6 +145,10 @@ async function pacienteAtual(id) {
 }
 
 async function pacienteIdDoAtendimento(atendimento) {
+  if (atendimento?.conta_paciente_id) {
+    const { rows } = await pool.query('SELECT id FROM pacientes WHERE id=$1 LIMIT 1', [atendimento.conta_paciente_id]);
+    return rows[0]?.id ? Number(rows[0].id) : null;
+  }
   const phone = normalizePhone(atendimento?.tel);
   const cpf = normalizeCpf(atendimento?.cpf);
   const pagadorCpf = normalizeCpf(atendimento?.pagador_cpf);
@@ -250,7 +254,7 @@ async function detectarReceitasRenovacao() {
 
 async function processarAtendimentosAssumidos() {
   const { rows } = await pool.query(`
-    SELECT id,nome,tel,cpf,pagador_cpf,medico_nome,assumido_em
+    SELECT id,nome,tel,cpf,pagador_cpf,conta_paciente_id,medico_nome,assumido_em
       FROM fila_atendimentos
      WHERE status='assumido'
        AND assumido_em IS NOT NULL
@@ -279,7 +283,7 @@ async function processarAtendimentosAssumidos() {
 async function processarMensagensMedico() {
   const { rows } = await pool.query(`
     SELECT m.id AS mensagem_id,m.atendimento_id,m.arquivo_tipo,
-           f.nome,f.tel,f.cpf,f.pagador_cpf
+           f.nome,f.tel,f.cpf,f.pagador_cpf,f.conta_paciente_id
       FROM mensagens m
       JOIN fila_atendimentos f ON f.id=m.atendimento_id
      WHERE m.autor='medico'

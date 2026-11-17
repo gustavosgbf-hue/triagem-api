@@ -56,7 +56,8 @@ pool.query(
 const adsAttributionSchemaReady = pool.query(`
   ALTER TABLE fila_atendimentos
     ADD COLUMN IF NOT EXISTS stripe_checkout_session_id TEXT,
-    ADD COLUMN IF NOT EXISTS stripe_payment_intent_id TEXT;
+    ADD COLUMN IF NOT EXISTS stripe_payment_intent_id TEXT,
+    ADD COLUMN IF NOT EXISTS conta_paciente_id INTEGER;
 
   ALTER TABLE fila_atendimentos
     ADD COLUMN IF NOT EXISTS ads_fbclid TEXT,
@@ -2868,7 +2869,8 @@ async function buscarAtendimentoPagoAtivoPorIdentidade({ cpf, tel, especialidade
   const { rows } = await pool.query(
     `SELECT id,nome,tel,cpf,email,tipo,status,pagamento_status,
             pagbank_order_id,efi_charge_id,pagamento_metodo,
-            categoria_atendimento,especialidade_solicitada,valor_cobrado_centavos
+            categoria_atendimento,especialidade_solicitada,valor_cobrado_centavos,
+            to_jsonb(fila_atendimentos)->>'conta_paciente_id' AS conta_paciente_id,pagador_cpf
        FROM fila_atendimentos
       WHERE pagamento_status='confirmado'
         AND status IN ('triagem','aguardando','assumido')
@@ -4558,6 +4560,33 @@ app.post("/api/notify", rlTriagem, async (req, res) => {
     const pagadorNomeLimpo = normalizarNomePaciente(pagador_nome);
     const pagadorCpfLimpo = normalizarCpf(pagador_cpf);
     const pagadorEmailLimpo = normalizarEmail(pagador_email);
+    let contaPacienteId = null;
+    let contaPacienteCpf = null;
+    // Mobile third-party checkout: the authenticated account is the responsible
+    // party, not the clinical patient. Preserve the existing mobile access
+    // contract before Stripe creates a session (which does not send payer CPF).
+    const mobileOrigin = String(req.body?.origem || "");
+    const bearer = String(req.headers.authorization || "").match(/^Bearer\s+(.+)$/i);
+    if (!atendimentoId && ["app_ios", "app_android"].includes(mobileOrigin) && bearer) {
+      let decoded;
+      try { decoded = jwt.verify(bearer[1], JWT_SECRET); }
+      catch { return res.status(401).json({ ok: false, error: "Sessão expirada" }); }
+      if (decoded?.tipo !== "paciente" || !decoded?.id) {
+        return res.status(401).json({ ok: false, error: "Sessão inválida" });
+      }
+      const { rows: accounts } = await pool.query("SELECT nome,cpf,tel,email FROM pacientes WHERE id=$1 LIMIT 1", [decoded.id]);
+      const conta = accounts[0];
+      const accountCpf = normalizarCpf(conta?.cpf);
+      const phone = value => String(value || "").replace(/\D/g, "").slice(-11);
+      if (!accountCpf || phone(conta?.tel).length < 10 || phone(conta.tel) !== phone(telLimpo)) {
+        return res.status(403).json({ ok: false, error: "Confira os dados da sua conta" });
+      }
+      if (!atendimentoTerceiro && accountCpf !== cpfLimpo) {
+        return res.status(403).json({ ok: false, error: "CPF não corresponde à conta" });
+      }
+      contaPacienteId = Number(decoded.id);
+      contaPacienteCpf = accountCpf;
+    }
     const checkoutSessionId = adsAttribution.checkoutSessionId || null;
     const especialidadeImediata = normalizarEspecialidadeImediata(especialidade_solicitada);
     const configuracao = configuracaoAtendimentoImediato(especialidadeImediata);
@@ -4571,6 +4600,13 @@ app.post("/api/notify", rlTriagem, async (req, res) => {
         especialidade: especialidadeImediata
       });
       if (atendimentoPago) {
+        if (contaPacienteId) {
+          const ownerId = atendimentoPago.conta_paciente_id;
+          const sameContact = String(atendimentoPago.tel || "").replace(/\D/g, "").slice(-11) === String(telLimpo || "").replace(/\D/g, "").slice(-11);
+          const sameAccount = ownerId ? Number(ownerId) === contaPacienteId :
+            sameContact && [normalizarCpf(atendimentoPago.cpf), normalizarCpf(atendimentoPago.pagador_cpf)].includes(contaPacienteCpf);
+          if (!sameAccount) return res.status(409).json({ ok: false, error: "Já há uma consulta paga para este paciente. Fale com o suporte para recuperá-la sem novo pagamento." });
+        }
         await pool.query(
           `UPDATE fila_atendimentos
               SET nome=CASE
@@ -4670,12 +4706,13 @@ app.post("/api/notify", rlTriagem, async (req, res) => {
       return res.status(400).json({ ok: false, error: "nome_paciente_obrigatorio" });
     }
     const statusInicial = triagemPlaceholder ? 'pagamento_pendente' : 'aguardando';
+    await adsAttributionSchemaReady;
     const insertParams = [
       nomeLimpo||"Paciente",telLimpo||"-",telDocLimpo||telLimpo||"-",cpfLimpo||"",tipoConsulta,triagemTexto,statusInicial,
       campos.queixa||triagemTexto||"",idadeClinica,campos.sexo||"",campos.alergias||"",campos.cronicas||"",
       campos.medicacoes||"",dataNascLimpa||"",emailLimpo,atendimentoTerceiro,pagadorNomeLimpo,pagadorCpfLimpo,
       pagadorEmailLimpo,checkoutSessionId,configuracao.categoria,configuracao.especialidade,
-      configuracao.valorCentavos
+      configuracao.valorCentavos,contaPacienteId
     ];
     const insertResult = checkoutSessionId
       ? await pool.query(
@@ -4687,6 +4724,7 @@ app.post("/api/notify", rlTriagem, async (req, res) => {
                FROM fila_atendimentos f, trava
               WHERE f.ads_checkout_session_id = $20
                 AND f.criado_em > NOW() - INTERVAL '12 hours'
+                AND f.conta_paciente_id IS NOT DISTINCT FROM $24::integer
                 AND f.status NOT IN ('encerrado','cancelado','expirado','arquivado')
               ORDER BY f.criado_em DESC
               LIMIT 1
@@ -4696,9 +4734,9 @@ app.post("/api/notify", rlTriagem, async (req, res) => {
                nome,tel,tel_documentos,cpf,tipo,triagem,status,queixa,idade,sexo,alergias,cronicas,
                medicacoes,data_nascimento,email,atendimento_para_terceiro,pagador_nome,pagador_cpf,
                pagador_email,ads_checkout_session_id,categoria_atendimento,especialidade_solicitada,
-               valor_cobrado_centavos
+               valor_cobrado_centavos,conta_paciente_id
              )
-             SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23
+             SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24
                FROM trava
               WHERE NOT EXISTS (SELECT 1 FROM existente)
              RETURNING id
@@ -4714,9 +4752,9 @@ app.post("/api/notify", rlTriagem, async (req, res) => {
              nome,tel,tel_documentos,cpf,tipo,triagem,status,queixa,idade,sexo,alergias,cronicas,
              medicacoes,data_nascimento,email,atendimento_para_terceiro,pagador_nome,pagador_cpf,
              pagador_email,ads_checkout_session_id,categoria_atendimento,especialidade_solicitada,
-             valor_cobrado_centavos
+             valor_cobrado_centavos,conta_paciente_id
            )
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
            RETURNING id, false AS reutilizado`,
           insertParams
         );
