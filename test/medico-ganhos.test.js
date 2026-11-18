@@ -90,11 +90,11 @@ test('resumo agregado: totais, dia, quinzena e sem dados sensíveis', () => {
   assert.deepEqual(r.hoje, { data: '2026-11-17', atendimentos: 1, valor_centavos: 2745 });
   assert.deepEqual(r.por_dia.map((d) => d.data), ['2026-12-01', '2026-11-17', '2026-11-16']);
   assert.deepEqual(r.quinzenas.map((q) => [q.id, q.atendimentos, q.data_pagamento, q.data_pagamento_status]),
-    [['2026-12-Q1', 1, null, 'a_definir'], ['2026-11-Q2', 3, null, 'a_definir']]);
+    [['2026-12-Q1', 1, '2026-12-16', 'previsao_provisoria'], ['2026-11-Q2', 3, '2026-12-01', 'previsao_provisoria']]);
   assert.equal(r.quinzenas.reduce((s, q) => s + q.valor_centavos, 0), r.total.valor_centavos);
   assert.equal(r.por_dia.reduce((s, d) => s + d.valor_centavos, 0), r.total.valor_centavos);
   assert.deepEqual(r.nao_contabilizados, { total: 1, motivos: { sem_resposta: 1 } });
-  assert.deepEqual(r.pagamento, { regra_definida: false, data_prevista: null, status: 'a_definir' });
+  assert.deepEqual(r.pagamento, { regra_definida: true, criterio: 'primeiro_dia_util_apos_fechamento', data_prevista: null, status: 'previsao_provisoria' });
   const json = JSON.stringify(r);
   assert.doesNotMatch(json, /%|percent|faixa|reduzida|padrao|medico_id|kivia|example\.test/i);
   for (const v of [r.total.valor_centavos, r.hoje.valor_centavos, ...r.por_dia.map((d) => d.valor_centavos)]) {

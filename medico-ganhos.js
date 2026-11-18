@@ -111,14 +111,28 @@ export function quinzenaDe(dataIso) {
 // Previsão para o primeiro dia útil após fechamento. Feriados locais/móveis
 // dependem de conferência no financeiro; a data nunca é garantia de pagamento.
 const FERIADOS_FIXOS_NACIONAIS = new Set(['01-01','04-21','05-01','09-07','10-12','11-02','11-15','11-20','12-25']);
+// Feriados bancários móveis: Carnaval, Sexta-feira Santa e Corpus Christi.
+function pascoaUTC(ano) {
+  const a=ano%19,b=Math.floor(ano/100),c=ano%100,d=Math.floor(b/4),e=b%4;
+  const f=Math.floor((b+8)/25),g=Math.floor((b-f+1)/3);
+  const h=(19*a+b-d-g+15)%30,i=Math.floor(c/4),k=c%4;
+  const l=(32+2*e+2*i-h-k+7)%7,m=Math.floor((a+11*h+22*l)/451);
+  const mes=Math.floor((h+l-7*m+114)/31),dia=(h+l-7*m+114)%31+1;
+  return new Date(Date.UTC(ano,mes-1,dia,12));
+}
+function ehFeriadoBancarioMovel(data) {
+  const ano=data.getUTCFullYear(), pascoa=pascoaUTC(ano);
+  const diff=Math.round((data.getTime()-pascoa.getTime())/86400000);
+  return diff===-48||diff===-47||diff===-46||diff===-2||diff===60;
+}
 export function preverDiaUtilRepasse(fim) {
   const data=new Date(fim+'T12:00:00Z');
   if (!Number.isFinite(data.getTime())) return { data:null,provisorio:true };
   for (let i=0;i<20;i++) {
     data.setUTCDate(data.getUTCDate()+1);
     const dia=data.getUTCDay(),iso=data.toISOString().slice(0,10);
-    if (dia!==0 && dia!==6 && !FERIADOS_FIXOS_NACIONAIS.has(iso.slice(5)))
-      return {data:iso,provisorio:true,observacao:'Sujeito a feriados móveis e locais'};
+    if (dia!==0 && dia!==6 && !FERIADOS_FIXOS_NACIONAIS.has(iso.slice(5)) && !ehFeriadoBancarioMovel(data))
+      return {data:iso,provisorio:true,observacao:'Sujeito à conferência de feriados estaduais e municipais'};
   }
   return {data:null,provisorio:true};
 }
@@ -249,9 +263,13 @@ export function registrarRotaGanhosMedico(app, { pool, checkMedico, adminEmail }
           divergencia:!!pago&&(Number(pago.valor_centavos)!==q.valor_centavos||Number(pago.atendimentos)!==q.atendimentos)};
       });
       resumo.total_pendente_centavos=resumo.quinzenas.filter(q=>!q.registrado_pago).reduce((sum,q)=>sum+q.valor_centavos,0);
-      const atual=resumo.quinzenas.find(q=>q.id===quinzenaDe(dataIsoNoFuso()).id);
-      resumo.quinzena_atual=atual||null;
-      resumo.pagamento.data_prevista=atual?.data_pagamento||null;
+      const periodoAtual=quinzenaDe(dataIsoNoFuso());
+      const atual=resumo.quinzenas.find(q=>q.id===periodoAtual.id);
+      resumo.quinzena_atual=atual||{...periodoAtual,atendimentos:0,valor_centavos:0,
+        data_pagamento:preverDiaUtilRepasse(periodoAtual.fim).data,
+        data_pagamento_status:"previsao_provisoria",
+        situacao:"pendente_estimado",registrado_pago:false};
+      resumo.pagamento.data_prevista=resumo.quinzena_atual.data_pagamento;
       return res.json(resumo);
     } catch (e) {
       console.error("[MEDICO-GANHOS] Erro:", e.message);
