@@ -24,6 +24,7 @@ import {
   validarDadosPrescritor,
 } from "./memed-utils.js";
 import { registrarRotaGanhosMedico } from "./medico-ganhos.js";
+import { registrarRotasRepasses } from "./medico-repasses-admin.js";
 const { Pool } = pg;
 
 const pool = new Pool({
@@ -9446,6 +9447,7 @@ app.post("/api/medico/esqueci-senha", rlLogin, async (req, res) => {
 
 // Ganhos médicos: somente leitura, agregados da própria pessoa (ver medico-ganhos.js).
 registrarRotaGanhosMedico(app, { pool, checkMedico, adminEmail: ADMIN_MEDICO_EMAIL });
+registrarRotasRepasses(app, { pool, checkMedico, adminEmail: ADMIN_MEDICO_EMAIL });
 
 app.post("/api/medico/trocar-senha", checkMedico, async (req, res) => {
   try {
