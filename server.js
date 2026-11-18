@@ -9758,7 +9758,7 @@ app.get("/api/fila", checkMedico, async (req, res) => {
     let query, params;
     if (isAdmin) {
       await reconciliarRenovacoesPendentes().catch(e => console.warn("[RENOVACAO-RECONCILIAR]", e.message));
-      query = `SELECT id,nome,tel,cpf,tipo,triagem,status,pagamento_status,medico_id,medico_nome,meet_link,criado_em,data_nascimento,idade,sexo,alergias,cronicas,medicacoes,queixa,solicita,horario_agendado,
+      query = `SELECT id,nome,tel,cpf,tipo,triagem,status,pagamento_status,medico_id,medico_nome,meet_link,criado_em,pagamento_confirmado_em,assumido_em,data_nascimento,idade,sexo,alergias,cronicas,medicacoes,queixa,solicita,horario_agendado,
                       categoria_atendimento,especialidade_solicitada,valor_cobrado_centavos,fallback_decisao,
                       prioridade_medico_id,prioridade_ate
                  FROM fila_atendimentos
@@ -9771,7 +9771,7 @@ app.get("/api/fila", checkMedico, async (req, res) => {
                   AND LOWER(TRIM(COALESCE(triagem,''))) NOT LIKE '(aguardando triagem%'
                 ORDER BY criado_em ASC`;
     } else {
-      query = `SELECT id,nome,tel,cpf,tipo,triagem,status,pagamento_status,medico_id,medico_nome,meet_link,criado_em,data_nascimento,idade,sexo,alergias,cronicas,medicacoes,queixa,solicita,horario_agendado,
+      query = `SELECT id,nome,tel,cpf,tipo,triagem,status,pagamento_status,medico_id,medico_nome,meet_link,criado_em,pagamento_confirmado_em,assumido_em,data_nascimento,idade,sexo,alergias,cronicas,medicacoes,queixa,solicita,horario_agendado,
                       categoria_atendimento,especialidade_solicitada,valor_cobrado_centavos,fallback_decisao,
                       prioridade_medico_id,prioridade_ate
                  FROM fila_atendimentos
@@ -9947,7 +9947,7 @@ app.get("/api/renovacoes/fila", checkMedico, async (req, res) => {
     if (!isAdmin) return res.status(403).json({ ok: false, error: "Acesso restrito" });
     await reconciliarRenovacoesPendentes().catch(e => console.warn("[RENOVACAO-RECONCILIAR]", e.message));
     const result = await pool.query(
-      `SELECT id,nome,tel,cpf,tipo,triagem,status,pagamento_status,medico_id,medico_nome,meet_link,criado_em,
+      `SELECT id,nome,tel,cpf,tipo,triagem,status,pagamento_status,medico_id,medico_nome,meet_link,criado_em,pagamento_confirmado_em,assumido_em,
               data_nascimento,idade,sexo,alergias,cronicas,medicacoes,queixa,solicita,horario_agendado,
               questionario,anexos_urls,endereco_envio,frete_modalidade,frete_valor,email
          FROM fila_atendimentos
