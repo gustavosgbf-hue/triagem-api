@@ -2404,6 +2404,127 @@ function checkAdmin(req, res, next) {
   next();
 }
 
+
+// Disparador administrativo de push do aplicativo. A autorização para push
+// transacional NÃO substitui o opt-in explícito de marketing.
+async function pushAdminSchema() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS admin_push_campanhas (
+      id UUID PRIMARY KEY,
+      titulo TEXT NOT NULL,
+      mensagem TEXT NOT NULL,
+      publico TEXT NOT NULL DEFAULT 'marketing_autorizado',
+      status TEXT NOT NULL DEFAULT 'preparando',
+      elegiveis INTEGER NOT NULL DEFAULT 0,
+      aceitos INTEGER NOT NULL DEFAULT 0,
+      falhas INTEGER NOT NULL DEFAULT 0,
+      criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      finalizado_em TIMESTAMPTZ
+    )
+  `);
+}
+app.get('/api/admin/push/publico', checkAdmin, async (req,res) => {
+  try {
+    await pushAdminSchema();
+    const {rows} = await pool.query(`
+      SELECT
+       (SELECT COUNT(*) FROM paciente_push_tokens WHERE ativo=TRUE) AS push_ativos,
+       (SELECT COUNT(*) FROM paciente_push_tokens t
+         JOIN paciente_push_marketing m ON m.paciente_id=t.paciente_id
+         WHERE t.ativo=TRUE AND m.autorizado=TRUE) AS promocionais,
+       (SELECT COUNT(*) FROM paciente_push_tokens t
+         LEFT JOIN paciente_push_marketing m ON m.paciente_id=t.paciente_id
+         WHERE t.ativo=TRUE AND m.paciente_id IS NULL) AS sem_preferencia,
+       (SELECT COUNT(*) FROM paciente_push_tokens t
+         JOIN paciente_push_marketing m ON m.paciente_id=t.paciente_id
+         WHERE t.ativo=TRUE AND m.autorizado=FALSE) AS recusados
+    `);
+    res.json({ok:true,...rows[0],publico_disponivel:'marketing_autorizado'});
+  } catch(e) {
+    console.error('[ADMIN-PUSH] publico',e?.message);
+    res.status(500).json({ok:false,error:'Não foi possível consultar o público'});
+  }
+});
+app.get('/api/admin/push/campanhas', checkAdmin, async (req,res) => {
+  try {
+    await pushAdminSchema();
+    const {rows}=await pool.query(`
+      SELECT id,titulo,mensagem,publico,status,elegiveis,aceitos,falhas,criado_em,finalizado_em
+      FROM admin_push_campanhas ORDER BY criado_em DESC LIMIT 20`);
+    res.json({ok:true,campanhas:rows});
+  } catch(e) {
+    console.error('[ADMIN-PUSH] historico',e?.message);
+    res.status(500).json({ok:false,error:'Não foi possível consultar campanhas'});
+  }
+});
+app.post('/api/admin/push/campanhas', checkAdmin, express.json({limit:'8kb'}), async (req,res) => {
+  const titulo=String(req.body?.titulo||'').trim();
+  const mensagem=String(req.body?.mensagem||'').trim();
+  const id=String(req.body?.id||'').trim().toLowerCase();
+  const publico=String(req.body?.publico||'');
+  if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(id)
+      || !titulo || titulo.length>90 || !mensagem || mensagem.length>230
+      || publico!=='marketing_autorizado')
+    return res.status(400).json({ok:false,error:'Informe campanha, título e mensagem válidos'});
+  try {
+    await pushAdminSchema();
+    const {rows:created}=await pool.query(`
+      INSERT INTO admin_push_campanhas(id,titulo,mensagem,publico)
+      VALUES($1,$2,$3,$4) ON CONFLICT(id) DO NOTHING RETURNING id`,
+      [id,titulo,mensagem,publico]);
+    if(!created.length)
+      return res.status(409).json({ok:false,error:'Esta campanha já foi iniciada. Consulte o histórico para evitar reenvio.'});
+    const {rows:tokens}=await pool.query(`
+      SELECT t.id,t.expo_push_token FROM paciente_push_tokens t
+      JOIN paciente_push_marketing m ON m.paciente_id=t.paciente_id AND m.autorizado=TRUE
+      WHERE t.ativo=TRUE ORDER BY t.id LIMIT 5000`);
+    await pool.query('UPDATE admin_push_campanhas SET elegiveis=$2,status=$3 WHERE id=$1',
+      [id,tokens.length,'enviando']);
+    let aceitos=0,falhas=0;
+    // A Expo aceita até 100 mensagens por solicitação.
+    for(let i=0;i<tokens.length;i+=100) {
+      const lote=tokens.slice(i,i+100);
+      try {
+        const response=await fetch('https://exp.host/--/api/v2/push/send',{
+          method:'POST',
+          headers:{'Content-Type':'application/json','Accept':'application/json'},
+          body:JSON.stringify(lote.map(t=>({
+            to:t.expo_push_token,title:titulo,body:mensagem,
+            data:{kind:'marketing',destination:'consulta',campaign:id},
+            sound:'default',priority:'high'
+          }))),
+          signal:AbortSignal.timeout(15000)
+        });
+        const data=await response.json().catch(()=>({}));
+        const tickets=Array.isArray(data.data)?data.data:[];
+        for(let j=0;j<lote.length;j++) {
+          const ticket=response.ok?tickets[j]:null;
+          if(ticket?.status==='ok') aceitos++;
+          else {
+            falhas++;
+            if(ticket?.details?.error==='DeviceNotRegistered')
+              await pool.query('UPDATE paciente_push_tokens SET ativo=FALSE WHERE id=$1',[lote[j].id]);
+          }
+        }
+      } catch(e) {
+        falhas+=lote.length;
+        console.warn('[ADMIN-PUSH] lote falhou',id,e?.message);
+      }
+      await pool.query('UPDATE admin_push_campanhas SET aceitos=$2,falhas=$3 WHERE id=$1',
+        [id,aceitos,falhas]);
+    }
+    await pool.query(`UPDATE admin_push_campanhas SET status='concluida',finalizado_em=NOW(),
+      aceitos=$2,falhas=$3 WHERE id=$1`,[id,aceitos,falhas]);
+    console.log('[ADMIN-PUSH]',id,'elegiveis',tokens.length,'aceitos_expo',aceitos,'falhas',falhas);
+    res.json({ok:true,id,elegiveis:tokens.length,aceitos,falhas,
+      observacao:'Aceite da Expo não comprova entrega no aparelho'});
+  } catch(e) {
+    console.error('[ADMIN-PUSH] envio',id,e?.message);
+    await pool.query(`UPDATE admin_push_campanhas SET status='erro',finalizado_em=NOW() WHERE id=$1`,[id]).catch(()=>{});
+    res.status(500).json({ok:false,error:'Falha ao executar a campanha. Consulte o histórico antes de tentar novamente.'});
+  }
+});
+
 // Importação programada de conversões offline (Google Ads > Conversões > Uploads > Programar, fonte HTTPS).
 // Não depende de developer token: o Google baixa este CSV a cada X horas.
 // Autenticação HTTP Basic: usuário "consultaja", senha = ADMIN_PASSWORD. Só lista consultas pagas que têm gclid.
