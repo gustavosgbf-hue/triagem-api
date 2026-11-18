@@ -575,6 +575,73 @@ async function campanhaPosFeriado() {
 }
 setInterval(campanhaPosFeriado, 15000).unref?.();
 
+// Campanha aprovada pelo administrador em 18/11/2026, destinada SOMENTE
+// a usuários com consentimento promocional explícito e token ativo no app.
+// Cada dispositivo recebe no máximo uma tentativa, inclusive com múltiplas réplicas.
+let consultaMarketingBusy = false;
+async function campanhaConsultaApp1811() {
+  const now = Date.now();
+  if (consultaMarketingBusy ||
+      now < Date.parse('2026-11-18T13:00:00Z') ||
+      now >= Date.parse('2026-11-19T03:00:00Z')) return;
+  consultaMarketingBusy = true;
+  const campanha = 'convite-consulta-app-2026-11-18';
+  try {
+    await ensureSchema();
+    const { rows } = await pool.query(`
+      SELECT t.id,t.expo_push_token FROM paciente_push_tokens t
+      JOIN paciente_push_marketing m
+        ON m.paciente_id=t.paciente_id AND m.autorizado=TRUE
+      WHERE t.ativo=TRUE
+        AND NOT EXISTS(SELECT 1 FROM push_marketing_entregas e
+                       WHERE e.campanha=$1 AND e.token_id=t.id)
+      ORDER BY t.id LIMIT 500`,[campanha]);
+    let enviados=0, falhas=0;
+    for (const row of rows) {
+      const claim = await pool.query(`
+        INSERT INTO push_marketing_entregas(campanha,token_id)
+        SELECT $1,t.id FROM paciente_push_tokens t
+        JOIN paciente_push_marketing m
+          ON m.paciente_id=t.paciente_id AND m.autorizado=TRUE
+        WHERE t.id=$2 AND t.ativo=TRUE
+        ON CONFLICT DO NOTHING RETURNING token_id`,[campanha,row.id]);
+      if (!claim.rowCount) continue;
+      try {
+        const response = await fetch(EXPO_PUSH_URL,{
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body:JSON.stringify([{
+            to:row.expo_push_token,
+            title:'🩺 Precisa falar com um médico?',
+            body:'Consulta médica online por R$ 49,90, sem sair de casa. Consulte-se agora!',
+            data:{kind:'marketing',destination:'consulta',campaign:campanha},
+            sound:'default',
+            priority:'high'
+          }])
+        });
+        const json=await response.json().catch(()=>({}));
+        const ticket=json?.data?.[0];
+        if (response.ok && ticket?.status==='ok') enviados++;
+        else {
+          falhas++;
+          if(ticket?.details?.error==='DeviceNotRegistered') {
+            await pool.query('UPDATE paciente_push_tokens SET ativo=FALSE,atualizado_em=NOW() WHERE id=$1',[row.id]);
+          }
+          console.warn('[PUSH-APP-CONSULTA]',campanha,'falha',ticket?.details?.error||response.status);
+        }
+      } catch(e) {
+        falhas++;
+        console.warn('[PUSH-APP-CONSULTA]',campanha,'envio_falhou',e?.message);
+      }
+    }
+    if (rows.length) console.log('[PUSH-APP-CONSULTA]',campanha,
+      'aceitos_expo=',enviados,'falhas=',falhas,'elegiveis=',rows.length);
+  } catch(e) {
+    console.warn('[PUSH-APP-CONSULTA]',campanha,'erro',e?.message);
+  } finally { consultaMarketingBusy=false; }
+}
+setInterval(campanhaConsultaApp1811, 15000).unref?.();
+
 
 const originalInit = express.application.init;
 express.application.init = function patchedMobilePushInit(...args) {
