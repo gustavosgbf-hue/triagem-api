@@ -2458,7 +2458,7 @@ app.get('/api/admin/push/campanhas', checkAdmin, async (req,res) => {
   }
 });
 // Avisos estritamente operacionais para todos os dispositivos com push ativo.
-// Títulos e textos fixados no servidor: não podem ser usados como atalho para marketing.
+// Modelos são sugestões editáveis. Validação de finalidade técnica é feita no servidor.
 const PUSH_TECNICO_MODELOS = Object.freeze({
   manutencao: {
     titulo:'Aviso de manutenção · ConsultaJá24h',
@@ -2486,10 +2486,14 @@ app.post('/api/admin/push/campanhas', checkAdmin, express.json({limit:'8kb'}), a
   const modelo=String(req.body?.modelo_tecnico||'');
   if (!['marketing_autorizado','tecnico_todos_ativos'].includes(publico))
     return res.status(400).json({ok:false,error:'Público inválido'});
+  // Mensagens técnicas podem ser personalizadas; não podem conter chamadas
+  // comerciais, preços, links externos ou incentivos a contratar atendimento.
+  const textoTecnico = (titulo+' '+mensagem).normalize('NFD').replace(/[\u0300-\u036f]/g,'').toLowerCase();
+  const padraoComercial = /(?:r\s*\$|\b(?:preco|valor|desconto|promocao|oferta|cupom|agende|agendar|contrate|contratar|compre|comprar|pague|pagamento|pix|economize|consulte-se|consultese|fale com (?:um |o )?medico|atendimento online|consulta medica online|sem sair de casa)\b|https?:\/\/|www\.)/i;
   if(tecnico && (!Object.hasOwn(PUSH_TECNICO_MODELOS,modelo)
-    || titulo!==PUSH_TECNICO_MODELOS[modelo].titulo
-    || mensagem!==PUSH_TECNICO_MODELOS[modelo].mensagem))
-    return res.status(400).json({ok:false,error:'Para todos os dispositivos, utilize um dos modelos operacionais sem alterações'});
+      || req.body?.confirmacao_tecnica !== true
+      || padraoComercial.test(textoTecnico)))
+    return res.status(400).json({ok:false,error:'Para o público geral, use somente conteúdo técnico, sem preços, ofertas, links ou convite para consulta'});
   if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(id)
       || !titulo || titulo.length>90 || !mensagem || mensagem.length>230)
     return res.status(400).json({ok:false,error:'Informe campanha, título e mensagem válidos'});

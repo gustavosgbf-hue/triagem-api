@@ -26,8 +26,8 @@ test('Expo limita lotes a cem e rejeições são contabilizadas',()=>{
 test('envio técnico a todos exige modelo operacional fixado no servidor',()=>{
   assert.match(section,/tecnico_todos_ativos/);
   assert.match(section,/PUSH_TECNICO_MODELOS/);
-  assert.match(section,/titulo!==PUSH_TECNICO_MODELOS\[modelo\]\.titulo/);
-  assert.match(section,/mensagem!==PUSH_TECNICO_MODELOS\[modelo\]\.mensagem/);
+  assert.match(section,/req.body\?\.confirmacao_tecnica !== true/);
+  assert.match(section,/padraoComercial\.test\(textoTecnico\)/);
   assert.match(section,/SELECT t\.id,t\.expo_push_token FROM paciente_push_tokens t\s+WHERE t\.ativo=TRUE ORDER BY t\.id LIMIT 5000/);
   assert.match(section,/data:tecnico\?\{kind:'technical'/);
 });
