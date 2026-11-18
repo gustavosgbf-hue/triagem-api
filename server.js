@@ -23,6 +23,7 @@ import {
   normalizarDataIso,
   validarDadosPrescritor,
 } from "./memed-utils.js";
+import { registrarRotaGanhosMedico } from "./medico-ganhos.js";
 const { Pool } = pg;
 
 const pool = new Pool({
@@ -9442,6 +9443,9 @@ app.post("/api/medico/esqueci-senha", rlLogin, async (req, res) => {
     return res.json({ ok: true, message: "Se o e-mail existir na plataforma, enviamos as instruções de acesso." });
   }
 });
+
+// Ganhos médicos: somente leitura, agregados da própria pessoa (ver medico-ganhos.js).
+registrarRotaGanhosMedico(app, { pool, checkMedico, adminEmail: ADMIN_MEDICO_EMAIL });
 
 app.post("/api/medico/trocar-senha", checkMedico, async (req, res) => {
   try {
