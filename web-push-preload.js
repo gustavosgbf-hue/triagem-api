@@ -87,6 +87,17 @@ async function ensureSchema() {
       ON web_push_chat_subscriptions(atendimento_id) WHERE ativo=TRUE AND papel='paciente';
     CREATE INDEX IF NOT EXISTS idx_web_push_chat_medico
       ON web_push_chat_subscriptions(medico_id) WHERE ativo=TRUE AND papel='medico';
+    ALTER TABLE web_push_chat_subscriptions
+      ADD COLUMN IF NOT EXISTS medico_avisar_mensagens BOOLEAN NOT NULL DEFAULT FALSE;
+    ALTER TABLE web_push_chat_subscriptions
+      ADD COLUMN IF NOT EXISTS medico_avisar_fila BOOLEAN NOT NULL DEFAULT FALSE;
+    CREATE TABLE IF NOT EXISTS web_push_medico_fila_entregas (
+      atendimento_id BIGINT NOT NULL,
+      subscription_id BIGINT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'tentativa',
+      criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (atendimento_id,subscription_id)
+    );
 
     ALTER TABLE mensagens ADD COLUMN IF NOT EXISTS web_push_paciente_em TIMESTAMPTZ;
     ALTER TABLE mensagens ADD COLUMN IF NOT EXISTS web_push_medico_em TIMESTAMPTZ;
@@ -116,7 +127,9 @@ function decodeMedico(req) {
     const token = String(req.headers.authorization || '').replace(/^Bearer\s+/i, '').trim();
     if (!token) return null;
     const decoded = jwt.verify(token, process.env.JWT_SECRET || '');
-    if (!decoded?.id || decoded?.tipo === 'paciente') return null;
+    // O JWT do painel médico contém email+crm e não possui tipo.
+    // Impede usar tokens de paciente, psicólogo, especialista ou links de assumir.
+    if (!decoded?.id || decoded?.tipo || !decoded?.email || !Object.prototype.hasOwnProperty.call(decoded, 'crm')) return null;
     return decoded;
   } catch {
     return null;
@@ -192,6 +205,69 @@ function installRoutes(app) {
     } catch (error) {
       console.error('[WEB-PUSH-SUBSCRIBE]', error);
       return res.status(500).json({ ok: false, error: 'Não foi possível ativar o lembrete.' });
+    }
+  });
+
+  // Preferências por dispositivo, nunca globalmente entre médicos. Somente o titular do JWT.
+  app.post('/api/web-push/medico/preferencias', express.json({ limit: '32kb' }), async (req, res) => {
+    const medico = decodeMedico(req);
+    if (!medico) return res.status(401).json({ ok: false, error: 'Sessão inválida' });
+    if (!chatPushEnabled()) return res.status(503).json({ ok: false, error: 'Notificações indisponíveis' });
+    const mensagens = req.body?.mensagens, fila = req.body?.fila;
+    if (typeof mensagens !== 'boolean' || typeof fila !== 'boolean')
+      return res.status(400).json({ ok: false, error: 'Preferências inválidas' });
+    const subscription = req.body?.subscription || {};
+    const { endpoint, p256dh, auth } = subscriptionParts(subscription);
+    if (!endpoint.startsWith('https://') || endpoint.length > 2048 || !p256dh || !auth)
+      return res.status(400).json({ ok: false, error: 'Dispositivo inválido' });
+    try {
+      await ensureSchema();
+      const ativo = await pool.query('SELECT id FROM medicos WHERE id=$1 AND ativo=TRUE AND lower(email)=lower($2) LIMIT 1',
+        [Number(medico.id), String(medico.email)]);
+      if (!ativo.rowCount) return res.status(403).json({ ok: false, error: 'Médico não autorizado' });
+      // Vínculo e preferências atômicos, sem janela de permissões antigas.
+      await pool.query(`
+        INSERT INTO web_push_chat_subscriptions
+          (papel,atendimento_id,medico_id,telefone,endpoint,p256dh,auth,ativo,
+           medico_avisar_mensagens,medico_avisar_fila,atualizado_em)
+        VALUES('medico',NULL,$1,NULL,$2,$3,$4,$5,$6,$7,NOW())
+        ON CONFLICT(endpoint) DO UPDATE SET
+          papel='medico', atendimento_id=NULL, medico_id=EXCLUDED.medico_id,
+          telefone=NULL, p256dh=EXCLUDED.p256dh, auth=EXCLUDED.auth,
+          ativo=EXCLUDED.ativo,
+          medico_avisar_mensagens=EXCLUDED.medico_avisar_mensagens,
+          medico_avisar_fila=EXCLUDED.medico_avisar_fila,
+          criado_em=CASE WHEN web_push_chat_subscriptions.medico_id IS DISTINCT FROM EXCLUDED.medico_id
+                     THEN NOW() ELSE web_push_chat_subscriptions.criado_em END,
+          atualizado_em=NOW()`,
+        [Number(medico.id), endpoint, p256dh, auth, mensagens || fila, mensagens, fila]);
+      return res.json({ ok: true, mensagens, fila, ativo: mensagens || fila });
+    } catch(e) {
+      console.warn('[MEDICO-WEB-PUSH-CONFIG]', e?.message || e);
+      return res.status(500).json({ ok: false, error: 'Não foi possível salvar suas preferências.' });
+    }
+  });
+
+  app.post('/api/web-push/medico/estado', express.json({ limit: '8kb' }), async (req, res) => {
+    const medico = decodeMedico(req);
+    if (!medico) return res.status(401).json({ ok: false, error: 'Sessão inválida' });
+    const endpoint = String(req.body?.endpoint || '').trim();
+    if (!endpoint || endpoint.length > 2048)
+      return res.json({ ok: true, ativo: false, mensagens: false, fila: false });
+    try {
+      await ensureSchema();
+      const ativo = await pool.query('SELECT id FROM medicos WHERE id=$1 AND ativo=TRUE AND lower(email)=lower($2) LIMIT 1',
+        [Number(medico.id), String(medico.email)]);
+      if (!ativo.rowCount) return res.status(403).json({ ok: false, error: 'Médico não autorizado' });
+      const { rows } = await pool.query(`SELECT ativo,medico_avisar_mensagens,medico_avisar_fila
+        FROM web_push_chat_subscriptions WHERE endpoint=$1 AND medico_id=$2 AND papel='medico' LIMIT 1`,
+        [endpoint, Number(medico.id)]);
+      const r = rows[0];
+      return res.json({ ok: true, ativo: !!r?.ativo,
+        mensagens: !!(r?.ativo && r?.medico_avisar_mensagens),
+        fila: !!(r?.ativo && r?.medico_avisar_fila) });
+    } catch(e) {
+      return res.status(500).json({ ok: false, error: 'Estado indisponível.' });
     }
   });
 
@@ -352,7 +428,8 @@ async function processarMensagensParaMedicoWeb() {
       FROM mensagens m
       JOIN fila_atendimentos f ON f.id=m.atendimento_id
       JOIN web_push_chat_subscriptions s
-        ON s.medico_id=f.medico_id AND s.papel='medico' AND s.ativo=TRUE
+        ON s.medico_id=f.medico_id AND s.papel='medico' AND s.ativo=TRUE AND s.medico_avisar_mensagens=TRUE
+      JOIN medicos dr ON dr.id=s.medico_id AND dr.ativo=TRUE
      WHERE m.autor='paciente'
        AND f.medico_id IS NOT NULL
        AND m.web_push_medico_em IS NULL
@@ -376,6 +453,52 @@ async function processarMensagensParaMedicoWeb() {
   }
 }
 
+// Paciente novo: sem conteúdo clínico nem nome no bloqueio de tela, sem replay
+// de atendimentos anteriores ao cadastro deste dispositivo.
+async function processarFilaParaMedicoWeb() {
+  const { rows } = await pool.query(`
+    SELECT f.id AS atendimento_id,
+           s.id AS chat_subscription_id,s.endpoint,s.p256dh,s.auth
+      FROM fila_atendimentos f
+      JOIN web_push_chat_subscriptions s
+        ON s.papel='medico' AND s.ativo=TRUE AND s.medico_avisar_fila=TRUE
+       AND s.criado_em <= COALESCE(f.pagamento_confirmado_em,f.criado_em)
+      JOIN medicos dr ON dr.id=s.medico_id AND dr.ativo=TRUE
+      LEFT JOIN web_push_medico_fila_entregas e
+        ON e.atendimento_id=f.id AND e.subscription_id=s.id
+     WHERE f.status='aguardando'
+       AND f.pagamento_status IN ('confirmado','isento_admin')
+       AND f.tipo NOT LIKE 'renovacao%'
+       AND COALESCE(f.categoria_atendimento,'clinico') <> 'especialista_imediato'
+       AND (f.prioridade_medico_id IS NULL OR f.prioridade_medico_id=s.medico_id
+            OR f.prioridade_ate <= NOW())
+       AND LOWER(TRIM(COALESCE(f.triagem,''))) NOT LIKE '(aguardando pagamento)%'
+       AND LOWER(TRIM(COALESCE(f.triagem,''))) NOT LIKE '(pagamento confirmado%'
+       AND LOWER(TRIM(COALESCE(f.triagem,''))) NOT LIKE '(triagem em andamento)%'
+       AND LOWER(TRIM(COALESCE(f.triagem,''))) NOT LIKE '(aguardando triagem%'
+       AND f.criado_em >= NOW() - INTERVAL '2 hours'
+       AND e.atendimento_id IS NULL
+     ORDER BY f.criado_em ASC
+     LIMIT 80
+  `);
+  for (const row of rows) {
+    // Claim idempotente antes do envio: vários workers não podem notificar duplicado.
+    const claim = await pool.query(`INSERT INTO web_push_medico_fila_entregas(atendimento_id,subscription_id)
+      VALUES($1,$2) ON CONFLICT DO NOTHING RETURNING atendimento_id`,
+      [row.atendimento_id,row.chat_subscription_id]);
+    if (!claim.rowCount) continue;
+    const ok = await sendSubscription(row, {
+      title: 'Novo paciente na fila',
+      body: 'Há um atendimento pronto para ser assumido. Toque para abrir a fila.',
+      url: PANEL_URL + '/?src=push&fila=1',
+      kind: 'fila-medico', atendimentoId: Number(row.atendimento_id),
+    }, 600);
+    await pool.query(`UPDATE web_push_medico_fila_entregas SET status=$1
+      WHERE atendimento_id=$2 AND subscription_id=$3`,
+      [ok?'enviado':'falhou',row.atendimento_id,row.chat_subscription_id]).catch(()=>{});
+  }
+}
+
 async function runChatWorker() {
   if (!chatPushEnabled() || chatWorkerBusy) return;
   chatWorkerBusy = true;
@@ -383,6 +506,7 @@ async function runChatWorker() {
     await ensureSchema();
     await processarMensagensParaPacienteWeb();
     await processarMensagensParaMedicoWeb();
+    await processarFilaParaMedicoWeb();
   } catch (error) {
     console.warn('[WEB-PUSH-CHAT]', error?.message || error);
   } finally {
