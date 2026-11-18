@@ -2439,7 +2439,7 @@ app.get('/api/admin/push/publico', checkAdmin, async (req,res) => {
          JOIN paciente_push_marketing m ON m.paciente_id=t.paciente_id
          WHERE t.ativo=TRUE AND m.autorizado=FALSE) AS recusados
     `);
-    res.json({ok:true,...rows[0],publico_disponivel:'marketing_autorizado'});
+    res.json({ok:true,...rows[0],publicos_disponiveis:['marketing_autorizado','tecnico_todos_ativos']});
   } catch(e) {
     console.error('[ADMIN-PUSH] publico',e?.message);
     res.status(500).json({ok:false,error:'Não foi possível consultar o público'});
@@ -2457,14 +2457,41 @@ app.get('/api/admin/push/campanhas', checkAdmin, async (req,res) => {
     res.status(500).json({ok:false,error:'Não foi possível consultar campanhas'});
   }
 });
+// Avisos estritamente operacionais para todos os dispositivos com push ativo.
+// Títulos e textos fixados no servidor: não podem ser usados como atalho para marketing.
+const PUSH_TECNICO_MODELOS = Object.freeze({
+  manutencao: {
+    titulo:'Aviso de manutenção · ConsultaJá24h',
+    mensagem:'Estamos realizando uma manutenção técnica no aplicativo. Algumas funções podem ficar temporariamente indisponíveis.'
+  },
+  instabilidade: {
+    titulo:'Instabilidade no aplicativo',
+    mensagem:'Identificamos uma instabilidade técnica no ConsultaJá24h e estamos trabalhando para restabelecer o funcionamento.'
+  },
+  normalizado: {
+    titulo:'Funcionamento normalizado',
+    mensagem:'O funcionamento do aplicativo ConsultaJá24h foi normalizado. Obrigado pela compreensão.'
+  },
+  seguranca: {
+    titulo:'Aviso de segurança do aplicativo',
+    mensagem:'Há uma atualização importante de segurança disponível. Atualize o ConsultaJá24h pela loja oficial do seu celular.'
+  }
+});
 app.post('/api/admin/push/campanhas', checkAdmin, express.json({limit:'8kb'}), async (req,res) => {
   const titulo=String(req.body?.titulo||'').trim();
   const mensagem=String(req.body?.mensagem||'').trim();
   const id=String(req.body?.id||'').trim().toLowerCase();
   const publico=String(req.body?.publico||'');
+  const tecnico=publico==='tecnico_todos_ativos';
+  const modelo=String(req.body?.modelo_tecnico||'');
+  if (!['marketing_autorizado','tecnico_todos_ativos'].includes(publico))
+    return res.status(400).json({ok:false,error:'Público inválido'});
+  if(tecnico && (!Object.hasOwn(PUSH_TECNICO_MODELOS,modelo)
+    || titulo!==PUSH_TECNICO_MODELOS[modelo].titulo
+    || mensagem!==PUSH_TECNICO_MODELOS[modelo].mensagem))
+    return res.status(400).json({ok:false,error:'Para todos os dispositivos, utilize um dos modelos operacionais sem alterações'});
   if (!/^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(id)
-      || !titulo || titulo.length>90 || !mensagem || mensagem.length>230
-      || publico!=='marketing_autorizado')
+      || !titulo || titulo.length>90 || !mensagem || mensagem.length>230)
     return res.status(400).json({ok:false,error:'Informe campanha, título e mensagem válidos'});
   try {
     await pushAdminSchema();
@@ -2474,10 +2501,12 @@ app.post('/api/admin/push/campanhas', checkAdmin, express.json({limit:'8kb'}), a
       [id,titulo,mensagem,publico]);
     if(!created.length)
       return res.status(409).json({ok:false,error:'Esta campanha já foi iniciada. Consulte o histórico para evitar reenvio.'});
-    const {rows:tokens}=await pool.query(`
-      SELECT t.id,t.expo_push_token FROM paciente_push_tokens t
-      JOIN paciente_push_marketing m ON m.paciente_id=t.paciente_id AND m.autorizado=TRUE
-      WHERE t.ativo=TRUE ORDER BY t.id LIMIT 5000`);
+    const {rows:tokens}=await pool.query(tecnico
+      ? `SELECT t.id,t.expo_push_token FROM paciente_push_tokens t
+          WHERE t.ativo=TRUE ORDER BY t.id LIMIT 5000`
+      : `SELECT t.id,t.expo_push_token FROM paciente_push_tokens t
+          JOIN paciente_push_marketing m ON m.paciente_id=t.paciente_id AND m.autorizado=TRUE
+          WHERE t.ativo=TRUE ORDER BY t.id LIMIT 5000`);
     await pool.query('UPDATE admin_push_campanhas SET elegiveis=$2,status=$3 WHERE id=$1',
       [id,tokens.length,'enviando']);
     let aceitos=0,falhas=0;
@@ -2490,7 +2519,7 @@ app.post('/api/admin/push/campanhas', checkAdmin, express.json({limit:'8kb'}), a
           headers:{'Content-Type':'application/json','Accept':'application/json'},
           body:JSON.stringify(lote.map(t=>({
             to:t.expo_push_token,title:titulo,body:mensagem,
-            data:{kind:'marketing',destination:'consulta',campaign:id},
+            data:tecnico?{kind:'technical',campaign:id}:{kind:'marketing',destination:'consulta',campaign:id},
             sound:'default',priority:'high'
           }))),
           signal:AbortSignal.timeout(15000)
