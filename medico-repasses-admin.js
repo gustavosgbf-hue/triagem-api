@@ -2,7 +2,7 @@
 // Escopo: consulta e registro administrativo manual de quinzena encerrada.
 import { GANHOS_INICIO_ISO, GANHOS_INICIO_DATA, SQL_GANHOS_MEDICO,
   montarResumoGanhos, classificarFaixaMedico, valorPorAtendimentoCentavos,
-  classificarAtendimentoGanhos, quinzenaDe, dataIsoNoFuso } from './medico-ganhos.js';
+  classificarAtendimentoGanhos, quinzenaDe, dataIsoNoFuso, preverDiaUtilRepasse } from './medico-ganhos.js';
 
 const RE_Q = /^(20\d{2})-(0[1-9]|1[0-2])-Q([12])$/;
 const GESTOR = 'gustavosgbf@gmail.com';
@@ -16,21 +16,7 @@ function competencia(id) {
   const fim=`${m[1]}-${m[2]}-${sem===1?'15':String(ultimoDia(a,mes)).padStart(2,'0')}`;
   return {id,inicio,fim};
 }
-// Feriados nacionais federais fixos. Os móveis e feriados locais precisam de
-// calendário financeiro validado: datas exibidas como estimativas, nunca garantia.
-function feriadoFixo(d) {
-  return ['01-01','04-21','05-01','09-07','10-12','11-02','11-15','11-20','12-25'].includes(d.slice(5));
-}
-export function proximoDiaUtilEstimado(fim) {
-  const d=new Date(fim+'T12:00:00Z');
-  for(let n=0;n<12;n++) {
-    d.setUTCDate(d.getUTCDate()+1);
-    const iso=toISO(d), dia=d.getUTCDay();
-    if(dia!==0&&dia!==6&&!feriadoFixo(iso))
-      return {data:iso,provisorio:true,observacao:'Sujeito à conferência de feriados móveis e locais'};
-  }
-  return {data:null,provisorio:true};
-}
+export const proximoDiaUtilEstimado = preverDiaUtilRepasse;
 async function garantirTabela(pool) {
   await pool.query(`CREATE TABLE IF NOT EXISTS medico_repasses_registros (
     id BIGSERIAL PRIMARY KEY,

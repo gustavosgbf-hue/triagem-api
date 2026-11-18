@@ -108,6 +108,21 @@ export function quinzenaDe(dataIso) {
   };
 }
 
+// Previsão para o primeiro dia útil após fechamento. Feriados locais/móveis
+// dependem de conferência no financeiro; a data nunca é garantia de pagamento.
+const FERIADOS_FIXOS_NACIONAIS = new Set(['01-01','04-21','05-01','09-07','10-12','11-02','11-15','11-20','12-25']);
+export function preverDiaUtilRepasse(fim) {
+  const data=new Date(fim+'T12:00:00Z');
+  if (!Number.isFinite(data.getTime())) return { data:null,provisorio:true };
+  for (let i=0;i<20;i++) {
+    data.setUTCDate(data.getUTCDate()+1);
+    const dia=data.getUTCDay(),iso=data.toISOString().slice(0,10);
+    if (dia!==0 && dia!==6 && !FERIADOS_FIXOS_NACIONAIS.has(iso.slice(5)))
+      return {data:iso,provisorio:true,observacao:'Sujeito a feriados móveis e locais'};
+  }
+  return {data:null,provisorio:true};
+}
+
 export function dataIsoNoFuso(date = new Date(), fuso = GANHOS_FUSO) {
   return new Intl.DateTimeFormat("en-CA", {
     timeZone: fuso, year: "numeric", month: "2-digit", day: "2-digit",
@@ -170,10 +185,10 @@ export function montarResumoGanhos({ medico, rows, hojeIso, adminEmail, agora = 
         atendimentos: q.atendimentos,
         valor_centavos: valor(q.atendimentos),
         situacao: "pendente_estimado",
-        data_pagamento: null,
-        data_pagamento_status: "a_definir",
+        data_pagamento: preverDiaUtilRepasse(q.fim).data,
+        data_pagamento_status: "previsao_provisoria",
       })),
-    pagamento: { regra_definida: false, data_prevista: null, status: "a_definir" },
+    pagamento: { regra_definida: true, criterio: "primeiro_dia_util_apos_fechamento", data_prevista: null, status: "previsao_provisoria" },
     nao_contabilizados: { total: naoContabilizados, motivos },
     atualizado_em: agora.toISOString(),
   };
@@ -217,7 +232,27 @@ export function registrarRotaGanhosMedico(app, { pool, checkMedico, adminEmail }
         return res.status(403).json({ ok: false, error: "Acesso não autorizado." });
       }
       const { rows } = await pool.query(SQL_GANHOS_MEDICO, [medicoId, GANHOS_INICIO_ISO]);
-      return res.json(montarResumoGanhos({ medico, rows, hojeIso: dataIsoNoFuso(), adminEmail }));
+      const resumo = montarResumoGanhos({ medico, rows, hojeIso: dataIsoNoFuso(), adminEmail });
+      // Registro manual de quinzena paga (quando tabela ainda não foi criada,
+      // permite uso da consulta sem simular pagamentos).
+      let pagos=[];
+      try {
+        pagos=(await pool.query("SELECT periodo,valor_centavos,atendimentos,pago_em FROM medico_repasses_registros WHERE medico_id=$1",[medicoId])).rows;
+      } catch(e) {
+        if (e.code!=='42P01') throw e;
+      }
+      const mapa=new Map(pagos.map(p=>[String(p.periodo),p]));
+      resumo.quinzenas=resumo.quinzenas.map(q=>{
+        const pago=mapa.get(q.id);
+        return {...q, situacao:pago?"pago_registrado":"pendente_estimado",
+          registrado_pago:!!pago, pago_em:pago?.pago_em||null,
+          divergencia:!!pago&&(Number(pago.valor_centavos)!==q.valor_centavos||Number(pago.atendimentos)!==q.atendimentos)};
+      });
+      resumo.total_pendente_centavos=resumo.quinzenas.filter(q=>!q.registrado_pago).reduce((sum,q)=>sum+q.valor_centavos,0);
+      const atual=resumo.quinzenas.find(q=>q.id===quinzenaDe(dataIsoNoFuso()).id);
+      resumo.quinzena_atual=atual||null;
+      resumo.pagamento.data_prevista=atual?.data_pagamento||null;
+      return res.json(resumo);
     } catch (e) {
       console.error("[MEDICO-GANHOS] Erro:", e.message);
       return res.status(500).json({ ok: false, error: "Erro ao calcular ganhos." });
