@@ -96,6 +96,10 @@ function installActivePatientRoute(app) {
            NULLIF(to_jsonb(f)->>'criado_em','')::timestamptz AS criado_em
          FROM fila_atendimentos f
         WHERE COALESCE(to_jsonb(f)->>'tipo','') NOT LIKE 'renovacao_%'
+          AND (
+            COALESCE(LOWER(to_jsonb(f)->>'pagamento_status'),'') IN ('confirmado','isento_admin')
+            OR NULLIF(to_jsonb(f)->>'criado_em','')::timestamptz >= NOW() - INTERVAL '12 hours'
+          )
           AND COALESCE(LOWER(to_jsonb(f)->>'status'),'') NOT IN ('encerrado','finalizado','finalizada','concluido','concluído','cancelado','expirado','arquivado')
           AND NULLIF(to_jsonb(f)->>'encerrado_em','') IS NULL
           AND NULLIF(to_jsonb(f)->>'finalizado_em','') IS NULL

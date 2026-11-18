@@ -99,6 +99,9 @@ function installPatientChatUpload(app) {
 
       const atendimento = await atendimentoDoPaciente(req.pacienteId, atendimentoId);
       if (!atendimento) return res.status(404).json({ ok: false, error: 'Atendimento não encontrado.' });
+      if (!['confirmado','isento_admin'].includes(String(atendimento.pagamento_status || '').toLowerCase())) {
+        return res.status(402).json({ ok: false, error: 'Pagamento confirmado é necessário para enviar anexos.' });
+      }
       if (String(atendimento.status || '').toLowerCase() !== 'assumido' || !atendimento.medico_id) {
         return res.status(409).json({ ok: false, error: 'Este atendimento não está disponível para novos anexos.' });
       }

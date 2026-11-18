@@ -173,6 +173,9 @@ function installChatExperience(app) {
       if (!atendimentoId) return res.status(400).json({ ok: false, error: 'Atendimento inválido' });
       const atendimento = await atendimentoDoPaciente(req.pacienteId, atendimentoId);
       if (!atendimento) return res.status(404).json({ ok: false, error: 'Atendimento não encontrado' });
+      if (!['confirmado','isento_admin'].includes(String(atendimento.pagamento_status || '').toLowerCase())) {
+        return res.status(402).json({ ok: false, error: 'Pagamento confirmado é necessário para acessar esta consulta.' });
+      }
 
       await pool.query(
         `UPDATE mensagens
@@ -216,6 +219,9 @@ function installChatExperience(app) {
 
       const atendimento = await atendimentoDoPaciente(req.pacienteId, atendimentoId);
       if (!atendimento) return res.status(404).json({ ok: false, error: 'Atendimento não encontrado' });
+      if (!['confirmado','isento_admin'].includes(String(atendimento.pagamento_status || '').toLowerCase())) {
+        return res.status(402).json({ ok: false, error: 'Pagamento confirmado é necessário para acessar esta consulta.' });
+      }
       if (String(atendimento.status || '').toLowerCase() !== 'assumido' || !atendimento.medico_id) {
         return res.status(409).json({ ok: false, error: 'Este atendimento não está mais disponível para novas mensagens.' });
       }

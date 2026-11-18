@@ -237,7 +237,11 @@ function installPatientHistoryRoutes(app) {
            NULLIF(to_jsonb(f)->>'medico_nome','') AS medico_nome,
            NULLIF(to_jsonb(f)->>'criado_em','')::timestamptz AS criado_em
          FROM fila_atendimentos f
-        WHERE COALESCE(LOWER(to_jsonb(f)->>'status'),'') NOT IN ('encerrado','finalizado','finalizada','concluido','concluído','cancelado','expirado','arquivado')
+        WHERE (
+          COALESCE(LOWER(to_jsonb(f)->>'pagamento_status'),'') IN ('confirmado','isento_admin')
+          OR NULLIF(to_jsonb(f)->>'criado_em','')::timestamptz >= NOW() - INTERVAL '12 hours'
+        )
+          AND COALESCE(LOWER(to_jsonb(f)->>'status'),'') NOT IN ('encerrado','finalizado','finalizada','concluido','concluído','cancelado','expirado','arquivado')
           AND NULLIF(to_jsonb(f)->>'encerrado_em','') IS NULL
           AND NULLIF(to_jsonb(f)->>'finalizado_em','') IS NULL
           AND ($3::boolean = false OR COALESCE(to_jsonb(f)->>'pagamento_metodo','') = 'beta_test')
@@ -273,6 +277,9 @@ function installPatientHistoryRoutes(app) {
       if (!atendimentoId) return res.status(400).json({ ok: false, error: 'Atendimento inválido' });
       const atendimento = await atendimentoDoPaciente(req.pacienteId, atendimentoId);
       if (!atendimento) return res.status(404).json({ ok: false, error: 'Atendimento não encontrado' });
+      if (!['confirmado','isento_admin'].includes(String(atendimento.pagamento_status || '').toLowerCase())) {
+        return res.status(402).json({ ok: false, error: 'O acesso ao atendimento exige pagamento confirmado.' });
+      }
 
       const result = await pool.query(
         `SELECT id,atendimento_id,autor,texto,arquivo_url,arquivo_tipo,arquivo_nome,criado_em
@@ -305,6 +312,9 @@ function installPatientHistoryRoutes(app) {
 
       const atendimento = await atendimentoDoPaciente(req.pacienteId, atendimentoId);
       if (!atendimento) return res.status(404).json({ ok: false, error: 'Atendimento não encontrado' });
+      if (!['confirmado','isento_admin'].includes(String(atendimento.pagamento_status || '').toLowerCase())) {
+        return res.status(402).json({ ok: false, error: 'O acesso ao atendimento exige pagamento confirmado.' });
+      }
       if (String(atendimento.status || '').toLowerCase() !== 'assumido' || !atendimento.medico_id) {
         return res.status(409).json({ ok: false, error: 'O chat será liberado quando um médico assumir o atendimento.' });
       }
