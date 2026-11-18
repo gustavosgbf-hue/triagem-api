@@ -12,7 +12,7 @@ import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import multer from "multer";
-import { createHash, randomUUID } from "crypto";
+import { createHash, randomUUID, timingSafeEqual } from "crypto";
 import rateLimit from "express-rate-limit";
 import {
   codigoErroMemed,
@@ -58,7 +58,8 @@ pool.query(
 const adsAttributionSchemaReady = pool.query(`
   ALTER TABLE fila_atendimentos
     ADD COLUMN IF NOT EXISTS stripe_checkout_session_id TEXT,
-    ADD COLUMN IF NOT EXISTS stripe_payment_intent_id TEXT;
+    ADD COLUMN IF NOT EXISTS stripe_payment_intent_id TEXT,
+    ADD COLUMN IF NOT EXISTS conta_paciente_id INTEGER;
 
   ALTER TABLE fila_atendimentos
     ADD COLUMN IF NOT EXISTS ads_fbclid TEXT,
@@ -174,6 +175,19 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
       if (session.payment_status === "paid") {
         const atendimentoId = Number.parseInt(String(session.metadata?.atendimento_id || ""), 10) || null;
         if (atendimentoId) {
+          if (session.metadata?.origem === "renovacao_receita") {
+            const { rows: pedidos } = await pool.query(
+              "SELECT id,tipo,frete_valor,stripe_checkout_session_id FROM fila_atendimentos WHERE id=$1 AND tipo LIKE 'renovacao_%'",
+              [atendimentoId]
+            );
+            const pedido = pedidos[0];
+            if (pedido && pedido.stripe_checkout_session_id === session.id && session.currency === "brl" && session.amount_total === renovacaoValorCentavos(pedido)) {
+              await confirmarRenovacaoPorId(atendimentoId, "stripe_webhook");
+            } else {
+              console.warn("[RENOVACAO-STRIPE] Sessão inválida ou valor divergente", { atendimentoId, sessionId: session.id });
+            }
+            return res.json({ received: true });
+          }
           const paymentIntentId = typeof session.payment_intent === "string" ? session.payment_intent : session.payment_intent?.id;
           const { rows } = await pool.query(
             `UPDATE fila_atendimentos
@@ -2390,6 +2404,58 @@ function checkAdmin(req, res, next) {
   next();
 }
 
+// Importação programada de conversões offline (Google Ads > Conversões > Uploads > Programar, fonte HTTPS).
+// Não depende de developer token: o Google baixa este CSV a cada X horas.
+// Autenticação HTTP Basic: usuário "consultaja", senha = ADMIN_PASSWORD. Só lista consultas pagas que têm gclid.
+app.get("/api/google-ads/conversoes.csv", rlGeral, async (req, res) => {
+  const senhaAdmin = process.env.ADMIN_PASSWORD;
+  const auth = String(req.headers.authorization || "");
+  let user = "", pass = "";
+  if (auth.startsWith("Basic ")) {
+    const dec = Buffer.from(auth.slice(6), "base64").toString("utf8");
+    const i = dec.indexOf(":");
+    user = dec.slice(0, i); pass = dec.slice(i + 1);
+  }
+  const passBuf = Buffer.from(String(pass)), adminBuf = Buffer.from(String(senhaAdmin || ""));
+  const ok = !!senhaAdmin && user === "consultaja" && passBuf.length === adminBuf.length && timingSafeEqual(passBuf, adminBuf);
+  if (!ok) {
+    res.set("WWW-Authenticate", 'Basic realm="conversoes"');
+    return res.status(401).send("Acesso negado");
+  }
+  try {
+    const dias = Math.min(60, Math.max(1, parseInt(req.query.dias || "14", 10) || 14));
+    const nome = limitarTexto(process.env.GOOGLE_ADS_CSV_CONVERSION_NAME || "Consulta paga (servidor)", 100);
+    const valorPadrao = Number(process.env.GOOGLE_ADS_CONVERSION_VALUE || "49.90") || 49.90;
+    const { rows } = await pool.query(
+      `SELECT id, tipo, frete_valor, ads_gclid,
+              to_char(pagamento_confirmado_em AT TIME ZONE 'America/Fortaleza', 'YYYY-MM-DD HH24:MI:SS') AS quando
+         FROM fila_atendimentos
+        WHERE pagamento_status = 'confirmado'
+          AND pagamento_confirmado_em IS NOT NULL
+          AND pagamento_confirmado_em > NOW() - ($1::int * INTERVAL '1 day')
+          AND COALESCE(ads_gclid, '') <> ''
+        ORDER BY pagamento_confirmado_em ASC`,
+      [dias]
+    );
+    const linhas = ["Parameters:TimeZone=America/Fortaleza", "Google Click ID,Conversion Name,Conversion Time,Conversion Value,Conversion Currency"];
+    for (const r of rows) {
+      const gclid = String(r.ads_gclid).replace(/[^A-Za-z0-9_\-]/g, "");
+      if (!gclid) continue;
+      let valor = valorPadrao;
+      if (String(r.tipo || "").startsWith("renovacao_")) {
+        try { valor = renovacaoValorCentavos(r) / 100; } catch (_e) { valor = 59.90; }
+      }
+      linhas.push([gclid, '"' + nome.replace(/"/g, "") + '"', r.quando, valor.toFixed(2), "BRL"].join(","));
+    }
+    res.set("Content-Type", "text/csv; charset=utf-8");
+    res.set("Cache-Control", "no-store");
+    return res.send(linhas.join("\n") + "\n");
+  } catch (e) {
+    console.error("[GADS-CSV]", e.message);
+    return res.status(500).send("Erro ao gerar CSV");
+  }
+});
+
 app.post("/api/admin/google-ads/offline/retry", checkAdmin, async (req, res) => {
   const limit = Math.min(100, Math.max(1, parseInt(req.body?.limit || req.query.limit || "25", 10) || 25));
   const force = /^(1|true|yes|sim)$/i.test(String(req.body?.force || req.query.force || ""));
@@ -2805,7 +2871,8 @@ async function buscarAtendimentoPagoAtivoPorIdentidade({ cpf, tel, especialidade
   const { rows } = await pool.query(
     `SELECT id,nome,tel,cpf,email,tipo,status,pagamento_status,
             pagbank_order_id,efi_charge_id,pagamento_metodo,
-            categoria_atendimento,especialidade_solicitada,valor_cobrado_centavos
+            categoria_atendimento,especialidade_solicitada,valor_cobrado_centavos,
+            to_jsonb(fila_atendimentos)->>'conta_paciente_id' AS conta_paciente_id,pagador_cpf
        FROM fila_atendimentos
       WHERE pagamento_status='confirmado'
         AND status IN ('triagem','aguardando','assumido')
@@ -4495,6 +4562,33 @@ app.post("/api/notify", rlTriagem, async (req, res) => {
     const pagadorNomeLimpo = normalizarNomePaciente(pagador_nome);
     const pagadorCpfLimpo = normalizarCpf(pagador_cpf);
     const pagadorEmailLimpo = normalizarEmail(pagador_email);
+    let contaPacienteId = null;
+    let contaPacienteCpf = null;
+    // Mobile third-party checkout: the authenticated account is the responsible
+    // party, not the clinical patient. Preserve the existing mobile access
+    // contract before Stripe creates a session (which does not send payer CPF).
+    const mobileOrigin = String(req.body?.origem || "");
+    const bearer = String(req.headers.authorization || "").match(/^Bearer\s+(.+)$/i);
+    if (!atendimentoId && ["app_ios", "app_android"].includes(mobileOrigin) && bearer) {
+      let decoded;
+      try { decoded = jwt.verify(bearer[1], JWT_SECRET); }
+      catch { return res.status(401).json({ ok: false, error: "Sessão expirada" }); }
+      if (decoded?.tipo !== "paciente" || !decoded?.id) {
+        return res.status(401).json({ ok: false, error: "Sessão inválida" });
+      }
+      const { rows: accounts } = await pool.query("SELECT nome,cpf,tel,email FROM pacientes WHERE id=$1 LIMIT 1", [decoded.id]);
+      const conta = accounts[0];
+      const accountCpf = normalizarCpf(conta?.cpf);
+      const phone = value => String(value || "").replace(/\D/g, "").slice(-11);
+      if (!accountCpf || phone(conta?.tel).length < 10 || phone(conta.tel) !== phone(telLimpo)) {
+        return res.status(403).json({ ok: false, error: "Confira os dados da sua conta" });
+      }
+      if (!atendimentoTerceiro && accountCpf !== cpfLimpo) {
+        return res.status(403).json({ ok: false, error: "CPF não corresponde à conta" });
+      }
+      contaPacienteId = Number(decoded.id);
+      contaPacienteCpf = accountCpf;
+    }
     const checkoutSessionId = adsAttribution.checkoutSessionId || null;
     const especialidadeImediata = normalizarEspecialidadeImediata(especialidade_solicitada);
     const configuracao = configuracaoAtendimentoImediato(especialidadeImediata);
@@ -4508,6 +4602,13 @@ app.post("/api/notify", rlTriagem, async (req, res) => {
         especialidade: especialidadeImediata
       });
       if (atendimentoPago) {
+        if (contaPacienteId) {
+          const ownerId = atendimentoPago.conta_paciente_id;
+          const sameContact = String(atendimentoPago.tel || "").replace(/\D/g, "").slice(-11) === String(telLimpo || "").replace(/\D/g, "").slice(-11);
+          const sameAccount = ownerId ? Number(ownerId) === contaPacienteId :
+            sameContact && [normalizarCpf(atendimentoPago.cpf), normalizarCpf(atendimentoPago.pagador_cpf)].includes(contaPacienteCpf);
+          if (!sameAccount) return res.status(409).json({ ok: false, error: "Já há uma consulta paga para este paciente. Fale com o suporte para recuperá-la sem novo pagamento." });
+        }
         await pool.query(
           `UPDATE fila_atendimentos
               SET nome=CASE
@@ -4607,12 +4708,13 @@ app.post("/api/notify", rlTriagem, async (req, res) => {
       return res.status(400).json({ ok: false, error: "nome_paciente_obrigatorio" });
     }
     const statusInicial = triagemPlaceholder ? 'pagamento_pendente' : 'aguardando';
+    await adsAttributionSchemaReady;
     const insertParams = [
       nomeLimpo||"Paciente",telLimpo||"-",telDocLimpo||telLimpo||"-",cpfLimpo||"",tipoConsulta,triagemTexto,statusInicial,
       campos.queixa||triagemTexto||"",idadeClinica,campos.sexo||"",campos.alergias||"",campos.cronicas||"",
       campos.medicacoes||"",dataNascLimpa||"",emailLimpo,atendimentoTerceiro,pagadorNomeLimpo,pagadorCpfLimpo,
       pagadorEmailLimpo,checkoutSessionId,configuracao.categoria,configuracao.especialidade,
-      configuracao.valorCentavos
+      configuracao.valorCentavos,contaPacienteId
     ];
     const insertResult = checkoutSessionId
       ? await pool.query(
@@ -4624,6 +4726,7 @@ app.post("/api/notify", rlTriagem, async (req, res) => {
                FROM fila_atendimentos f, trava
               WHERE f.ads_checkout_session_id = $20
                 AND f.criado_em > NOW() - INTERVAL '12 hours'
+                AND f.conta_paciente_id IS NOT DISTINCT FROM $24::integer
                 AND f.status NOT IN ('encerrado','cancelado','expirado','arquivado')
               ORDER BY f.criado_em DESC
               LIMIT 1
@@ -4633,9 +4736,9 @@ app.post("/api/notify", rlTriagem, async (req, res) => {
                nome,tel,tel_documentos,cpf,tipo,triagem,status,queixa,idade,sexo,alergias,cronicas,
                medicacoes,data_nascimento,email,atendimento_para_terceiro,pagador_nome,pagador_cpf,
                pagador_email,ads_checkout_session_id,categoria_atendimento,especialidade_solicitada,
-               valor_cobrado_centavos
+               valor_cobrado_centavos,conta_paciente_id
              )
-             SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23
+             SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24
                FROM trava
               WHERE NOT EXISTS (SELECT 1 FROM existente)
              RETURNING id
@@ -4651,9 +4754,9 @@ app.post("/api/notify", rlTriagem, async (req, res) => {
              nome,tel,tel_documentos,cpf,tipo,triagem,status,queixa,idade,sexo,alergias,cronicas,
              medicacoes,data_nascimento,email,atendimento_para_terceiro,pagador_nome,pagador_cpf,
              pagador_email,ads_checkout_session_id,categoria_atendimento,especialidade_solicitada,
-             valor_cobrado_centavos
+             valor_cobrado_centavos,conta_paciente_id
            )
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)
            RETURNING id, false AS reutilizado`,
           insertParams
         );
@@ -5228,7 +5331,7 @@ app.get("/api/atendimento/assumir-email", async (req, res) => {
     if (payload.tipo !== "assumir") return res.status(400).send("<h2>Token inválido.</h2>");
     const { medicoId, medicoNome, atendimentoId } = payload;
     const reserva = await pool.query(
-      `SELECT categoria_atendimento,especialidade_solicitada,fallback_decisao,
+      `SELECT tipo,categoria_atendimento,especialidade_solicitada,fallback_decisao,
               prioridade_medico_id,prioridade_ate
          FROM fila_atendimentos
         WHERE id=$1`,
@@ -5238,6 +5341,10 @@ app.get("/api/atendimento/assumir-email", async (req, res) => {
       `SELECT email,especialidade FROM medicos WHERE id=$1 AND ativo=true AND status='aprovado'`,
       [medicoId]
     )).rows[0];
+    if (String(reserva.rows[0]?.tipo || "").toLowerCase().startsWith("renovacao") &&
+        String(medicoReserva?.email || "").trim().toLowerCase() !== ADMIN_MEDICO_EMAIL) {
+      return res.status(403).send("Renovacao reservada ao administrador");
+    }
     if (reserva.rows[0]?.categoria_atendimento === "especialista_imediato"
         && reserva.rows[0]?.fallback_decisao !== "clinico"
         && Number(medicoId) !== 0) {
@@ -7163,7 +7270,7 @@ app.post('/api/lead/registrar', rlGeral, async (req, res) => {
   }
 });
 
-const FUNIL_MODULOS = new Set(['especialistas', 'psicologia', 'consulta']);
+const FUNIL_MODULOS = new Set(['especialistas', 'psicologia', 'consulta', 'renovacao']);
 const FUNIL_EVENTOS = new Set([
   'page_view',
   'profile_opened',
@@ -7191,7 +7298,11 @@ const FUNIL_EVENTOS = new Set([
   'manual_payment_check',
   'manual_payment_check_result',
   'pagamento_confirmado_redirect_confirmado',
-  'triage_redirect_start'
+  'triage_redirect_start',
+  'renovacao_cta_home_click',
+  'renovacao_page_view',
+  'renovacao_form_start',
+  'renovacao_checkout_start'
 ]);
 
 function limitarTextoFunil(valor, limite) {
@@ -9799,7 +9910,7 @@ app.post("/api/atendimento/assumir", checkMedico, async (req, res) => {
     if (!medicoResult.rows[0]) return res.status(403).json({ ok: false, error: "Medico nao autorizado" });
     const medico = medicoResult.rows[0];
     const atendimentoResult = await pool.query(
-      `SELECT id,categoria_atendimento,especialidade_solicitada,fallback_decisao,
+      `SELECT id,tipo,categoria_atendimento,especialidade_solicitada,fallback_decisao,
               prioridade_medico_id,prioridade_ate
          FROM fila_atendimentos
         WHERE id=$1`,
@@ -9807,7 +9918,10 @@ app.post("/api/atendimento/assumir", checkMedico, async (req, res) => {
     );
     const atendimento = atendimentoResult.rows[0];
     if (!atendimento) return res.status(404).json({ ok: false, error: "Atendimento nao encontrado" });
-    const isAdmin = medico.email === "gustavosgbf@gmail.com";
+    const isAdmin = String(medico.email || "").trim().toLowerCase() === ADMIN_MEDICO_EMAIL;
+    if (String(atendimento.tipo || "").toLowerCase().startsWith("renovacao") && !isAdmin) {
+      return res.status(403).json({ ok: false, error: "Renovacao reservada ao administrador" });
+    }
     const reservadoEspecialista = atendimento.categoria_atendimento === "especialista_imediato"
       && atendimento.fallback_decisao !== "clinico";
     if (
@@ -10410,14 +10524,25 @@ async function efiGetToken() {
 
 // ── EFÍ: rota de teste (admin) ────────────────────────────────────────────────
 // ── STRIPE: cartão via Checkout Sessions + Payment Element ───────────────────
+function stripeCartaoProntoProducao() {
+  const publica = String(process.env.STRIPE_PUBLISHABLE_KEY || "").trim();
+  const secreta = String(process.env.STRIPE_SECRET_KEY || "").trim();
+  const webhook = String(process.env.STRIPE_WEBHOOK_SECRET || "").trim();
+  // Nunca liberar pagamentos com cartão em uma página de pacientes com chaves de teste.
+  return !!(stripe && publica.startsWith("pk_live_") &&
+    (secreta.startsWith("sk_live_") || secreta.startsWith("rk_live_")) &&
+    webhook.startsWith("whsec_"));
+}
+
 app.get("/api/stripe/config", (_req, res) => {
   const publishableKey = String(process.env.STRIPE_PUBLISHABLE_KEY || "").trim();
-  res.json({ ok: true, enabled: !!(stripe && publishableKey), publishableKey: publishableKey || null, mode: publishableKey.startsWith("pk_live_") ? "live" : "test" });
+  const enabled = stripeCartaoProntoProducao();
+  res.json({ ok: true, enabled, publishableKey: enabled ? publishableKey : null, mode: enabled ? "live" : "not_ready" });
 });
 
 app.post("/api/stripe/checkout-session", rlGeral, async (req, res) => {
   try {
-    if (!stripe) return res.status(503).json({ ok: false, error: "Stripe indisponível" });
+    if (!stripeCartaoProntoProducao()) return res.status(503).json({ ok: false, error: "Pagamento com cartão temporariamente indisponível" });
     const atendimentoId = Number.parseInt(String(req.body?.atendimentoId || ""), 10) || null;
     if (!atendimentoId) return res.status(400).json({ ok: false, error: "atendimentoId obrigatório" });
 
@@ -12287,7 +12412,7 @@ async function enviarEmailRenovacaoAdmin(at) {
   const endereco = at.endereco_envio || {};
   const questionario = at.questionario || {};
   const esc = (v) => String(v || "").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-  const tipoLabel = at.tipo === "renovacao_fisica" ? "FÍSICA" : "DIGITAL";
+  const tipoLabel = at.questionario?.origem_pedido === "tratamento_peso_glp1" ? "GLP-1 / CONTROLE DO PESO" : at.tipo === "renovacao_fisica" ? "FÍSICA" : "DIGITAL";
   const labelsQuestionario = {
     condicao_diagnostico: "Condição/diagnóstico",
     tempo_uso: "Tempo de uso",
@@ -12296,11 +12421,18 @@ async function enviarEmailRenovacaoAdmin(at) {
     informacoes_importantes: "Informações importantes",
     medico_original: "Médico/especialidade original",
     acompanhamento: "Acompanhamento regular",
-    laudo_diagnostico: "Laudo/diagnóstico documentado"
+    laudo_diagnostico: "Laudo/diagnóstico documentado",
+    origem_pedido: "Categoria da solicitação",
+    medicamento_declarado: "Medicação de GLP-1/controle do peso informada",
+    peso_atual_kg: "Peso atual (kg)",
+    altura_cm: "Altura atual (cm)",
+    declara_uso_previo: "Declara uso prévio",
+    declara_receita_anterior: "Declara possuir receita anterior",
+    declara_avaliacao: "Ciente da avaliação médica"
   };
   const linhasQuestionario = Object.entries(labelsQuestionario)
     .filter(([key]) => questionario[key])
-    .map(([key, label]) => `<div style="margin:6px 0"><strong>${label}:</strong> ${esc(questionario[key])}</div>`)
+    .map(([key, label]) => `<div style="margin:6px 0"><strong>${label}:</strong> ${esc(typeof questionario[key] === "boolean" ? (questionario[key] ? "Sim" : "Não") : questionario[key])}</div>`)
     .join("");
   const html = `
     <div style="font-family:Arial,sans-serif;background:#f7f7f7;padding:24px">
@@ -12478,6 +12610,84 @@ app.post("/api/renovacao/upload-anexo", rlUpload, upload.single("arquivo"), asyn
   } catch (e) {
     console.error("[RENOVACAO-UPLOAD]", e.message);
     return res.status(500).json({ ok: false, error: "Erro ao fazer upload" });
+  }
+});
+
+
+// Checkout Stripe para renovação: valor e tipo SEMPRE calculados no servidor.
+// Separado do Checkout de consultas comuns (R$ 49,90).
+app.post("/api/renovacao/stripe/checkout-session", rlGeral, async (req, res) => {
+  try {
+    if (!stripeCartaoProntoProducao()) return res.status(503).json({ ok: false, error: "Pagamento com cartão temporariamente indisponível" });
+    const atendimentoId = Number.parseInt(String(req.body?.atendimentoId || ""), 10) || null;
+    if (!atendimentoId) return res.status(400).json({ ok: false, error: "Solicitação inválida" });
+    const { rows } = await pool.query(
+      `SELECT id,tipo,pagamento_status,frete_valor,email,anexos_urls,stripe_checkout_session_id
+       FROM fila_atendimentos WHERE id=$1 AND tipo='renovacao_digital' LIMIT 1`,
+      [atendimentoId]
+    );
+    const at = rows[0];
+    if (!at) return res.status(404).json({ ok: false, error: "Solicitação de renovação não encontrada" });
+    if (at.pagamento_status === "confirmado") return res.status(409).json({ ok: false, error: "Pagamento já confirmado", already_paid: true });
+    if (!at.anexos_urls?.receita_anterior) return res.status(400).json({ ok: false, error: "Anexe a receita anterior antes do pagamento" });
+
+    const expectedAmount = 5990;
+    if (renovacaoValorCentavos(at) !== expectedAmount) {
+      console.error("[RENOVACAO-STRIPE] Preço de renovação divergente da configuração", { atendimentoId });
+      return res.status(503).json({ ok: false, error: "Configuração do preço em manutenção" });
+    }
+    const oldId = String(at.stripe_checkout_session_id || "").trim();
+    if (oldId) {
+      try {
+        const previous = await stripe.checkout.sessions.retrieve(oldId);
+        if (previous.payment_status === "paid") {
+          // Confirmação idempotente também cobre a eventual chegada tardia do webhook.
+          await confirmarRenovacaoPorId(atendimentoId, "stripe_checkout_recovered");
+          return res.status(409).json({ ok: false, already_paid: true, error: "Pagamento já confirmado" });
+        }
+        if (previous.status === "open" && previous.amount_total === expectedAmount && previous.client_secret && previous.metadata?.origem === "renovacao_receita") {
+          return res.json({ ok: true, sessionId: previous.id, clientSecret: previous.client_secret });
+        }
+      } catch (err) {
+        console.warn("[RENOVACAO-STRIPE] Sessão anterior não reutilizável:", err.message);
+      }
+    }
+    const session = await stripe.checkout.sessions.create({
+      ui_mode: "embedded_page", mode: "payment",
+      payment_method_types: ["card"],
+      line_items: [{ price_data: { currency: "brl", product_data: { name: "Avaliação de renovação de receita — ConsultaJá24h" }, unit_amount: expectedAmount }, quantity: 1 }],
+      ...(at.email && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(at.email) ? { customer_email: at.email } : {}),
+      redirect_on_completion: "if_required",
+      return_url: `https://consultaja24h.com.br/renovacao-de-receita/?stripe_return=1&session_id={CHECKOUT_SESSION_ID}`,
+      metadata: { atendimento_id: String(atendimentoId), origem: "renovacao_receita" },
+      payment_intent_data: { metadata: { atendimento_id: String(atendimentoId), origem: "renovacao_receita" } },
+    });
+    await pool.query("UPDATE fila_atendimentos SET stripe_checkout_session_id=$2,pagamento_metodo='cartao' WHERE id=$1 AND pagamento_status='pendente'", [atendimentoId,session.id]);
+    return res.json({ ok: true, sessionId: session.id, clientSecret: session.client_secret });
+  } catch (e) {
+    console.error("[RENOVACAO-STRIPE] checkout:", e.message);
+    return res.status(500).json({ ok: false, error: "Não foi possível abrir o pagamento com cartão" });
+  }
+});
+
+app.get("/api/renovacao/stripe/session-status", rlGeral, async (req, res) => {
+  try {
+    if (!stripe) return res.status(503).json({ ok: false, error: "Stripe indisponível" });
+    const sessionId=String(req.query.session_id || "").trim();
+    if (!/^cs_/.test(sessionId)) return res.status(400).json({ ok: false, error: "Sessão inválida" });
+    const session=await stripe.checkout.sessions.retrieve(sessionId);
+    if (session.metadata?.origem!=="renovacao_receita") return res.status(404).json({ ok: false, error: "Sessão não encontrada" });
+    const id=Number.parseInt(session.metadata?.atendimento_id,10);
+    if (!id) return res.status(400).json({ ok: false, error: "Identificação inválida" });
+    const {rows}=await pool.query("SELECT id,tipo,stripe_checkout_session_id FROM fila_atendimentos WHERE id=$1 AND tipo LIKE 'renovacao_%' LIMIT 1",[id]);
+    const at=rows[0];
+    if (!at || at.stripe_checkout_session_id!==session.id) return res.status(404).json({ ok: false, error: "Sessão não corresponde à solicitação" });
+    const paid=session.payment_status==="paid" && session.currency==="brl" && session.amount_total===renovacaoValorCentavos(at);
+    if (paid) await confirmarRenovacaoPorId(id,"stripe_session_status");
+    return res.json({ ok:true, paid, status:session.status });
+  } catch(e){
+    console.error("[RENOVACAO-STRIPE] status:",e.message);
+    return res.status(400).json({ok:false,error:"Não foi possível verificar pagamento"});
   }
 });
 

@@ -18,15 +18,13 @@ test('não inscreve sem consentimento por padrão',()=>{
  assert.match(src,/medico_avisar_mensagens BOOLEAN NOT NULL DEFAULT FALSE/);
  assert.match(src,/medico_avisar_fila BOOLEAN NOT NULL DEFAULT FALSE/);
  assert.match(src,/s\.ativo=TRUE AND s\.medico_avisar_mensagens=TRUE/);
- assert.match(src,/s\.ativo=TRUE AND s\.medico_avisar_fila=TRUE/);
+ assert.doesNotMatch(src,/s\.ativo=TRUE AND s\.medico_avisar_fila=TRUE/);
 });
-test('novos pacientes: só elegíveis e uma entrega por assinatura',()=>{
- assert.match(src,/PRIMARY KEY \(atendimento_id,subscription_id\)/);
- assert.match(src,/INSERT INTO web_push_medico_fila_entregas/);
- assert.match(src,/ON CONFLICT DO NOTHING RETURNING atendimento_id/);
- assert.match(src,/f\.status='aguardando'/);
- assert.match(src,/f\.pagamento_status IN \('confirmado','isento_admin'\)/);
- assert.match(src,/COALESCE\(f\.categoria_atendimento,'clinico'\) <> 'especialista_imediato'/);
+test('push de fila não existe para médicos',()=>{
+ assert.doesNotMatch(src,/async function processarFilaParaMedicoWeb/);
+ assert.doesNotMatch(src,/Novo paciente na fila/);
+ assert.match(src,/medico_avisar_fila=EXCLUDED.medico_avisar_fila/);
+ assert.match(src,/\[Number\(medico.id\), endpoint, p256dh, auth, mensagens, mensagens, false\]/);
 });
 test('pushs médicos não incluem texto de triagem ou mensagem clínica',()=>{
  const begin=src.indexOf('async function processarMensagensParaMedicoWeb');
@@ -34,6 +32,6 @@ test('pushs médicos não incluem texto de triagem ou mensagem clínica',()=>{
  const portion=src.slice(begin,end);
  assert.doesNotMatch(portion,/m\.texto\b|f\.triagem\s+AS|m\.arquivo_url\b/);
  assert.match(portion,/Nova mensagem do paciente/);
- assert.match(portion,/Novo paciente na fila/);
+ assert.doesNotMatch(portion,/Novo paciente na fila/);
  assert.match(portion,/JOIN medicos dr ON dr.id=s.medico_id AND dr.ativo=TRUE/);
 });

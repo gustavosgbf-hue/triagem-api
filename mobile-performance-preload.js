@@ -80,12 +80,12 @@ function installFastPatientRoutes(app) {
           WHERE COALESCE(tipo,'') NOT LIKE 'renovacao_%'
             AND COALESCE(LOWER(status),'') NOT IN ('encerrado','finalizado','finalizada','concluido','concluído','cancelado','expirado','arquivado')
             AND encerrado_em IS NULL
-            AND (regexp_replace(COALESCE(cpf,''), '\\D', '', 'g') = $1
+            AND ((to_jsonb(fila_atendimentos)->>'conta_paciente_id') = $3::text OR ((to_jsonb(fila_atendimentos)->>'conta_paciente_id') IS NULL AND ((regexp_replace(COALESCE(cpf,''), '\\D', '', 'g') = $1
               OR regexp_replace(COALESCE(pagador_cpf,''), '\\D', '', 'g') = $1)
-            AND RIGHT(regexp_replace(COALESCE(tel,''), '\\D', '', 'g'), 11) = $2
+            AND RIGHT(regexp_replace(COALESCE(tel,''), '\\D', '', 'g'), 11) = $2)))
           ORDER BY criado_em DESC NULLS LAST
           LIMIT 1`,
-        [cpf, phone],
+        [cpf, phone, req.pacienteId],
       );
 
       const row = rows[0];
@@ -112,13 +112,13 @@ function installFastPatientRoutes(app) {
                 NULLIF(TRIM(COALESCE(triagem,'')), '') AS resumo,
                 COALESCE(encerrado_em, assumido_em, criado_em, NOW()) AS data_atendimento
            FROM fila_atendimentos
-          WHERE RIGHT(regexp_replace(COALESCE(tel,''), '\\D', '', 'g'), 11) = $1
+          WHERE ((to_jsonb(fila_atendimentos)->>'conta_paciente_id') = $3::text OR ((to_jsonb(fila_atendimentos)->>'conta_paciente_id') IS NULL AND (RIGHT(regexp_replace(COALESCE(tel,''), '\\D', '', 'g'), 11) = $1
             AND ($2 = '' OR regexp_replace(COALESCE(cpf,''), '\\D', '', 'g') = $2
-                         OR regexp_replace(COALESCE(pagador_cpf,''), '\\D', '', 'g') = $2)
+                         OR regexp_replace(COALESCE(pagador_cpf,''), '\\D', '', 'g') = $2))))
             AND COALESCE(status,'') NOT IN ('cancelado','expirado')
           ORDER BY data_atendimento DESC
           LIMIT 50`,
-        [phone, cpf],
+        [phone, cpf, req.pacienteId],
       );
 
       return res.json({
@@ -157,13 +157,13 @@ function installFastPatientRoutes(app) {
            JOIN fila_atendimentos f ON f.id = m.atendimento_id
           WHERE m.arquivo_url IS NOT NULL
             AND LOWER(COALESCE(m.arquivo_tipo,'')) = 'pdf'
-            AND RIGHT(regexp_replace(COALESCE(f.tel,''), '\\D', '', 'g'), 11) = $1
+            AND ((to_jsonb(f)->>'conta_paciente_id') = $3::text OR ((to_jsonb(f)->>'conta_paciente_id') IS NULL AND (RIGHT(regexp_replace(COALESCE(f.tel,''), '\\D', '', 'g'), 11) = $1
             AND ($2 = '' OR regexp_replace(COALESCE(f.cpf,''), '\\D', '', 'g') = $2
-                         OR regexp_replace(COALESCE(f.pagador_cpf,''), '\\D', '', 'g') = $2)
+                         OR regexp_replace(COALESCE(f.pagador_cpf,''), '\\D', '', 'g') = $2))))
             AND COALESCE(f.status,'') NOT IN ('cancelado','expirado')
           ORDER BY m.criado_em DESC, m.id DESC
           LIMIT 100`,
-        [phone, cpf],
+        [phone, cpf, req.pacienteId],
       );
 
       return res.json({

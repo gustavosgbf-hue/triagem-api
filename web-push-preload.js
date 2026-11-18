@@ -91,17 +91,22 @@ async function ensureSchema() {
       ADD COLUMN IF NOT EXISTS medico_avisar_mensagens BOOLEAN NOT NULL DEFAULT FALSE;
     ALTER TABLE web_push_chat_subscriptions
       ADD COLUMN IF NOT EXISTS medico_avisar_fila BOOLEAN NOT NULL DEFAULT FALSE;
-    CREATE TABLE IF NOT EXISTS web_push_medico_fila_entregas (
-      atendimento_id BIGINT NOT NULL,
-      subscription_id BIGINT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'tentativa',
-      criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      PRIMARY KEY (atendimento_id,subscription_id)
+    CREATE TABLE IF NOT EXISTS web_push_medico_migracoes (
+      chave TEXT PRIMARY KEY,
+      criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
-
     ALTER TABLE mensagens ADD COLUMN IF NOT EXISTS web_push_paciente_em TIMESTAMPTZ;
     ALTER TABLE mensagens ADD COLUMN IF NOT EXISTS web_push_medico_em TIMESTAMPTZ;
   `);
+  // Compatibilidade: quem já autorizou o Web Push de mensagens antes do sino
+  // não deve perder notificações no intervalo entre os deploys.
+  const mig = await pool.query(`INSERT INTO web_push_medico_migracoes(chave)
+    VALUES('legado_mensagens_v1') ON CONFLICT DO NOTHING RETURNING chave`);
+  if (mig.rowCount) {
+    await pool.query(`UPDATE web_push_chat_subscriptions
+      SET medico_avisar_mensagens=TRUE
+      WHERE papel='medico' AND ativo=TRUE AND medico_avisar_mensagens=FALSE`);
+  }
   schemaReady = true;
 }
 
@@ -213,8 +218,8 @@ function installRoutes(app) {
     const medico = decodeMedico(req);
     if (!medico) return res.status(401).json({ ok: false, error: 'Sessão inválida' });
     if (!chatPushEnabled()) return res.status(503).json({ ok: false, error: 'Notificações indisponíveis' });
-    const mensagens = req.body?.mensagens, fila = req.body?.fila;
-    if (typeof mensagens !== 'boolean' || typeof fila !== 'boolean')
+    const mensagens = req.body?.mensagens;
+    if (typeof mensagens !== 'boolean')
       return res.status(400).json({ ok: false, error: 'Preferências inválidas' });
     const subscription = req.body?.subscription || {};
     const { endpoint, p256dh, auth } = subscriptionParts(subscription);
@@ -240,8 +245,8 @@ function installRoutes(app) {
           criado_em=CASE WHEN web_push_chat_subscriptions.medico_id IS DISTINCT FROM EXCLUDED.medico_id
                      THEN NOW() ELSE web_push_chat_subscriptions.criado_em END,
           atualizado_em=NOW()`,
-        [Number(medico.id), endpoint, p256dh, auth, mensagens || fila, mensagens, fila]);
-      return res.json({ ok: true, mensagens, fila, ativo: mensagens || fila });
+        [Number(medico.id), endpoint, p256dh, auth, mensagens, mensagens, false]);
+      return res.json({ ok: true, mensagens, ativo: mensagens });
     } catch(e) {
       console.warn('[MEDICO-WEB-PUSH-CONFIG]', e?.message || e);
       return res.status(500).json({ ok: false, error: 'Não foi possível salvar suas preferências.' });
@@ -253,7 +258,7 @@ function installRoutes(app) {
     if (!medico) return res.status(401).json({ ok: false, error: 'Sessão inválida' });
     const endpoint = String(req.body?.endpoint || '').trim();
     if (!endpoint || endpoint.length > 2048)
-      return res.json({ ok: true, ativo: false, mensagens: false, fila: false });
+      return res.json({ ok: true, ativo: false, mensagens: false });
     try {
       await ensureSchema();
       const ativo = await pool.query('SELECT id FROM medicos WHERE id=$1 AND ativo=TRUE AND lower(email)=lower($2) LIMIT 1',
@@ -263,9 +268,8 @@ function installRoutes(app) {
         FROM web_push_chat_subscriptions WHERE endpoint=$1 AND medico_id=$2 AND papel='medico' LIMIT 1`,
         [endpoint, Number(medico.id)]);
       const r = rows[0];
-      return res.json({ ok: true, ativo: !!r?.ativo,
-        mensagens: !!(r?.ativo && r?.medico_avisar_mensagens),
-        fila: !!(r?.ativo && r?.medico_avisar_fila) });
+      const mensagens = !!(r?.ativo && r?.medico_avisar_mensagens);
+      return res.json({ ok: true, ativo: mensagens, mensagens });
     } catch(e) {
       return res.status(500).json({ ok: false, error: 'Estado indisponível.' });
     }
@@ -288,8 +292,9 @@ function installRoutes(app) {
       if (papel === 'medico') {
         const decoded = decodeMedico(req);
         if (!decoded) return res.status(401).json({ ok: false, error: 'Sessão inválida' });
-        await saveChatSubscription({ papel, medicoId: Number(decoded.id), subscription });
-        return res.json({ ok: true });
+        // O fluxo legado sobrescreve dono de endpoint e pode reativar permissões
+        // desativadas. Médicos novos devem optar explicitamente pelo novo sino.
+        return res.status(410).json({ ok: false, error: 'Use as preferências do sino para ativar notificações.' });
       }
       return res.status(400).json({ ok: false, error: 'Papel inválido' });
     } catch (error) {
@@ -453,52 +458,6 @@ async function processarMensagensParaMedicoWeb() {
   }
 }
 
-// Paciente novo: sem conteúdo clínico nem nome no bloqueio de tela, sem replay
-// de atendimentos anteriores ao cadastro deste dispositivo.
-async function processarFilaParaMedicoWeb() {
-  const { rows } = await pool.query(`
-    SELECT f.id AS atendimento_id,
-           s.id AS chat_subscription_id,s.endpoint,s.p256dh,s.auth
-      FROM fila_atendimentos f
-      JOIN web_push_chat_subscriptions s
-        ON s.papel='medico' AND s.ativo=TRUE AND s.medico_avisar_fila=TRUE
-       AND s.criado_em <= COALESCE(f.pagamento_confirmado_em,f.criado_em)
-      JOIN medicos dr ON dr.id=s.medico_id AND dr.ativo=TRUE
-      LEFT JOIN web_push_medico_fila_entregas e
-        ON e.atendimento_id=f.id AND e.subscription_id=s.id
-     WHERE f.status='aguardando'
-       AND f.pagamento_status IN ('confirmado','isento_admin')
-       AND f.tipo NOT LIKE 'renovacao%'
-       AND COALESCE(f.categoria_atendimento,'clinico') <> 'especialista_imediato'
-       AND (f.prioridade_medico_id IS NULL OR f.prioridade_medico_id=s.medico_id
-            OR f.prioridade_ate <= NOW())
-       AND LOWER(TRIM(COALESCE(f.triagem,''))) NOT LIKE '(aguardando pagamento)%'
-       AND LOWER(TRIM(COALESCE(f.triagem,''))) NOT LIKE '(pagamento confirmado%'
-       AND LOWER(TRIM(COALESCE(f.triagem,''))) NOT LIKE '(triagem em andamento)%'
-       AND LOWER(TRIM(COALESCE(f.triagem,''))) NOT LIKE '(aguardando triagem%'
-       AND f.criado_em >= NOW() - INTERVAL '2 hours'
-       AND e.atendimento_id IS NULL
-     ORDER BY f.criado_em ASC
-     LIMIT 80
-  `);
-  for (const row of rows) {
-    // Claim idempotente antes do envio: vários workers não podem notificar duplicado.
-    const claim = await pool.query(`INSERT INTO web_push_medico_fila_entregas(atendimento_id,subscription_id)
-      VALUES($1,$2) ON CONFLICT DO NOTHING RETURNING atendimento_id`,
-      [row.atendimento_id,row.chat_subscription_id]);
-    if (!claim.rowCount) continue;
-    const ok = await sendSubscription(row, {
-      title: 'Novo paciente na fila',
-      body: 'Há um atendimento pronto para ser assumido. Toque para abrir a fila.',
-      url: PANEL_URL + '/?src=push&fila=1',
-      kind: 'fila-medico', atendimentoId: Number(row.atendimento_id),
-    }, 600);
-    await pool.query(`UPDATE web_push_medico_fila_entregas SET status=$1
-      WHERE atendimento_id=$2 AND subscription_id=$3`,
-      [ok?'enviado':'falhou',row.atendimento_id,row.chat_subscription_id]).catch(()=>{});
-  }
-}
-
 async function runChatWorker() {
   if (!chatPushEnabled() || chatWorkerBusy) return;
   chatWorkerBusy = true;
@@ -506,7 +465,6 @@ async function runChatWorker() {
     await ensureSchema();
     await processarMensagensParaPacienteWeb();
     await processarMensagensParaMedicoWeb();
-    await processarFilaParaMedicoWeb();
   } catch (error) {
     console.warn('[WEB-PUSH-CHAT]', error?.message || error);
   } finally {

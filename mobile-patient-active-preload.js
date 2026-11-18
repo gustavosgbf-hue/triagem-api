@@ -100,14 +100,14 @@ function installActivePatientRoute(app) {
           AND NULLIF(to_jsonb(f)->>'encerrado_em','') IS NULL
           AND NULLIF(to_jsonb(f)->>'finalizado_em','') IS NULL
           AND ($3::boolean = false OR COALESCE(to_jsonb(f)->>'pagamento_metodo','') = 'beta_test')
-          AND (
+          AND ((to_jsonb(f)->>'conta_paciente_id') = $4::text OR ((to_jsonb(f)->>'conta_paciente_id') IS NULL AND ((
             regexp_replace(COALESCE(to_jsonb(f)->>'cpf',''), '\\D', '', 'g') = $1
             OR regexp_replace(COALESCE(to_jsonb(f)->>'pagador_cpf',''), '\\D', '', 'g') = $1
           )
-          AND RIGHT(regexp_replace(COALESCE(to_jsonb(f)->>'tel',''), '\\D', '', 'g'), 11) = $2
+          AND RIGHT(regexp_replace(COALESCE(to_jsonb(f)->>'tel',''), '\\D', '', 'g'), 11) = $2)))
         ORDER BY NULLIF(to_jsonb(f)->>'criado_em','')::timestamptz DESC NULLS LAST
         LIMIT 1`,
-        [cpf, phone, isBeta],
+        [cpf, phone, isBeta, req.pacienteId],
       );
 
       const row = result.rows[0];

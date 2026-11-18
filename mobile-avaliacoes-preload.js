@@ -98,12 +98,12 @@ async function atendimentoAvaliavelDoPaciente(pacienteId, atendimentoId) {
        AND NULLIF(to_jsonb(f)->>'medico_id','') IS NOT NULL
        AND COALESCE(LOWER(to_jsonb(f)->>'status'),'') IN ('encerrado','finalizado','finalizada','concluido','concluído','arquivado')
        AND COALESCE(to_jsonb(f)->>'tipo','') NOT LIKE 'renovacao_%'
-       AND (
+       AND ((to_jsonb(f)->>'conta_paciente_id') = $4::text OR ((to_jsonb(f)->>'conta_paciente_id') IS NULL AND ((
          regexp_replace(COALESCE(to_jsonb(f)->>'cpf',''), '\\D', '', 'g') = $2
          OR regexp_replace(COALESCE(to_jsonb(f)->>'pagador_cpf',''), '\\D', '', 'g') = $2
        )
-       AND RIGHT(regexp_replace(COALESCE(to_jsonb(f)->>'tel',''), '\\D', '', 'g'), 11) = $3
-     LIMIT 1`, [atendimentoId, cpf, phone]);
+       AND RIGHT(regexp_replace(COALESCE(to_jsonb(f)->>'tel',''), '\\D', '', 'g'), 11) = $3)))
+     LIMIT 1`, [atendimentoId, cpf, phone, pacienteId]);
   return rows[0] || null;
 }
 

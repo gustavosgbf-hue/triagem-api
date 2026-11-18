@@ -50,11 +50,11 @@ async function atendimentoDoPaciente(pacienteId, atendimentoId) {
   const result = await pool.query(
     `SELECT f.* FROM fila_atendimentos f
       WHERE f.id=$1
-        AND (regexp_replace(COALESCE(to_jsonb(f)->>'cpf',''), '\\D', '', 'g')=$2
+        AND ((to_jsonb(f)->>'conta_paciente_id') = $4::text OR ((to_jsonb(f)->>'conta_paciente_id') IS NULL AND ((regexp_replace(COALESCE(to_jsonb(f)->>'cpf',''), '\\D', '', 'g')=$2
           OR regexp_replace(COALESCE(to_jsonb(f)->>'pagador_cpf',''), '\\D', '', 'g')=$2)
-        AND RIGHT(regexp_replace(COALESCE(to_jsonb(f)->>'tel',''), '\\D', '', 'g'),11)=$3
+        AND RIGHT(regexp_replace(COALESCE(to_jsonb(f)->>'tel',''), '\\D', '', 'g'),11)=$3)))
       LIMIT 1`,
-    [atendimentoId, cpf, phone],
+    [atendimentoId, cpf, phone, pacienteId],
   );
   return result.rows[0] || null;
 }
