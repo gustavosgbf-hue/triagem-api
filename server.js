@@ -4237,8 +4237,6 @@ async function aplicarPrioridadeAdminSeElegivel(atendimentoId) {
 // Notificacao centralizada: unica fonte de verdade para envio de email aos medicos
 async function notificarMedicos(at) {
   at = await garantirNomePacienteParaFila(at);
-  const prioridade = await aplicarPrioridadeAdminSeElegivel(at.id);
-  if (prioridade?.atendimento) at = prioridade.atendimento;
   const nomeFila = normalizarNomePaciente(at.nome) || "Nome não informado";
   const SITE_URL = process.env.SITE_URL || "https://consultaja24h.com.br";
   const linkRetorno = SITE_URL + "/triagem.html?consulta=" + at.id;
@@ -4248,12 +4246,6 @@ async function notificarMedicos(at) {
     agora, nomeFila, at.tel||"", at.cpf||"",
     "Aguardando", "", triagemParaPlanilha(at.triagem, at.queixa), at.tipo||"", "", String(at.id)
   ]).catch(() => {});
-
-  // Durante a reserva do admin, o aviso geral só sai depois que ele assumir.
-  if (prioridade?.atendimento) {
-    console.log(`[NOTIFICACAO] Atendimento #${at.id} reservado sem aviso antecipado à equipe.`);
-    return;
-  }
 
   await enviarEmailMedicos({
     nome: nomeFila, tel: at.tel, tipo: at.tipo,
