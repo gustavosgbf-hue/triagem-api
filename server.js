@@ -52,10 +52,15 @@ import {
 import { registrarRotasRepasses } from "./medico-repasses-admin.js";
 import {
   registrarRotasRecuperacaoEspecialista,
+  registrarRotasRecuperacaoMedico,
   MIGRACOES_RESET_ESPECIALISTA,
+  MIGRACOES_RESET_MEDICO,
+  criarRevogadorSessoes,
+  criarLimitadorJanela as criarLimitadorJanelaVinculo,
   tokenSessaoRevogado,
 } from "./especialista-senha-reset.js";
 import {
+  avaliarVinculoOrderPagBank,
   criarDeduplicadorPedidos,
   expiracaoPixFortaleza,
   idFilaDeReferenciaPagBank,
@@ -2727,6 +2732,28 @@ app.post("/api/admin/google-ads/margem/retry", checkAdmin, async (req, res) => {
   }
 });
 
+// Sessões de médico abertas antes de uma redefinição de senha por token deixam de
+// valer. Mapa em memória (id → senha_alterada_em), atualizado no ato da redefinição
+// e sincronizado do banco a cada 60 s (outras instâncias). Sem query por request.
+const revogacoesSessaoMedico = criarRevogadorSessoes();
+function registrarRevogacaoSessaoMedico(id, alteradaEm) {
+  revogacoesSessaoMedico.registrar(id, alteradaEm);
+}
+async function atualizarRevogacoesSessaoMedico() {
+  try {
+    // JWT de médico dura 8 h: só interessam redefinições recentes.
+    const { rows } = await pool.query(
+      `SELECT id, senha_alterada_em FROM medicos
+        WHERE senha_alterada_em > NOW() - INTERVAL '9 hours'`
+    );
+    for (const r of rows) revogacoesSessaoMedico.registrar(r.id, r.senha_alterada_em);
+    revogacoesSessaoMedico.limpar(9 * 60 * 60 * 1000);
+  } catch (e) {
+    if (!/senha_alterada_em/.test(e.message)) console.warn("[MED-SESSOES]", e.message);
+  }
+}
+setInterval(atualizarRevogacoesSessaoMedico, 60_000).unref?.();
+
 function checkMedico(req, res, next) {
   const auth = req.headers["authorization"] || "";
   const token = auth.replace(/^Bearer\s+/i, "").trim();
@@ -2734,6 +2761,9 @@ function checkMedico(req, res, next) {
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
     if (medicoBloqueado(decoded)) return res.status(403).json({ ok: false, error: "Acesso desativado." });
+    if (decoded?.tipo !== "especialista" && revogacoesSessaoMedico.revogado(decoded?.id, decoded?.iat)) {
+      return res.status(401).json({ ok: false, error: "Sessão expirada. Entre novamente." });
+    }
     req.medico = decoded; req.medicoId = decoded.id; next();
   } catch(e) {
     return res.status(401).json({ ok: false, error: "Token invalido ou expirado" });
@@ -2749,6 +2779,7 @@ function decodificarMedicoRequest(req) {
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
     if (medicoBloqueado(decoded)) return null;
+    if (decoded?.tipo !== "especialista" && revogacoesSessaoMedico.revogado(decoded?.id, decoded?.iat)) return null;
     return decoded;
   } catch {
     return null;
@@ -9384,6 +9415,9 @@ function checkMedicoOuEspecialista(req, res, next) {
       return next();
     }
     // Fluxo normal de médico
+    if (revogacoesSessaoMedico.revogado(decoded?.id, decoded?.iat)) {
+      return res.status(401).json({ ok: false, error: 'Sessão expirada. Entre novamente.' });
+    }
     req.medico = decoded;
     req.medicoId = decoded.id;
     req._isEspecialista = false;
@@ -10033,62 +10067,35 @@ app.post("/api/admin/atendimentos/:id/transferir", checkAdmin, async (req, res) 
   }
 });
 
-// Rate limiting simples para esqueci-senha
-const esqueciRateLimit = new Map();
-
-app.post("/api/medico/esqueci-senha", rlLogin, async (req, res) => {
-  const MSG_GENERICA = { ok: true, message: "Se o e-mail existir na plataforma, enviamos as instruções de acesso." };
-  try {
-    const { email } = req.body || {};
-    if (!email) return res.json(MSG_GENERICA);
-    const emailNorm = email.trim().toLowerCase();
-    // Rate limit: max 3 tentativas por e-mail a cada 15min
-    const agora = Date.now();
-    const chave = emailNorm;
-    const hist = esqueciRateLimit.get(chave) || [];
-    const recentes = hist.filter(t => agora - t < 15 * 60 * 1000);
-    if (recentes.length >= 3) return res.json(MSG_GENERICA);
-    esqueciRateLimit.set(chave, [...recentes, agora]);
-    // Busca médico
-    const result = await pool.query("SELECT id,nome,email FROM medicos WHERE email=$1 AND ativo=true LIMIT 1",[emailNorm]);
-    if (result.rowCount === 0) return res.json(MSG_GENERICA);
-    const med = result.rows[0];
-    if (medicoBloqueado(med)) return res.json(MSG_GENERICA);
-    // Gera senha temporária aleatória
-    const { randomBytes } = await import("crypto");
-    const tempSenha = randomBytes(12).toString("base64url"); // 16 chars base64url
-    const tempHash = await bcrypt.hash(tempSenha, 10);
-    await pool.query("UPDATE medicos SET senha_hash=$1, precisa_trocar_senha=true WHERE id=$2",[tempHash, med.id]);
-    // Envia e-mail
-    const RESEND_KEY = process.env.RESEND_API_KEY;
-    const PAINEL_URL = "https://painel.consultaja24h.com.br";
-    if (RESEND_KEY) {
-      const html = `<div style="font-family:Arial,sans-serif;max-width:520px;margin:0 auto;background:#060d0b;color:#fff;border-radius:12px;overflow:hidden">
-        <div style="background:linear-gradient(135deg,#b4e05a,#5ee0a0);padding:18px 24px"><h2 style="margin:0;color:#051208;font-size:17px">Acesso temporário ao painel médico</h2></div>
-        <div style="padding:28px">
-          <p style="margin:0 0 16px">Olá, <strong>${med.nome}</strong>.</p>
-          <p style="margin:0 0 16px;color:rgba(255,255,255,.7)">Recebemos uma solicitação de recuperação de acesso ao painel médico ConsultaJá24h.</p>
-          <p style="margin:0 0 8px;color:rgba(255,255,255,.5);font-size:13px">Sua senha temporária é:</p>
-          <div style="background:rgba(255,255,255,.07);border:1px solid rgba(180,224,90,.3);border-radius:10px;padding:16px 20px;text-align:center;margin-bottom:20px">
-            <span style="font-family:monospace;font-size:22px;font-weight:700;color:#b4e05a;letter-spacing:3px">${tempSenha}</span>
-          </div>
-          <p style="margin:0 0 20px;color:rgba(255,255,255,.5);font-size:13px">⚠️ Troque esta senha imediatamente após o login. Ela é válida para um único acesso.</p>
-          <a href="${PAINEL_URL}" style="display:inline-block;padding:12px 28px;border-radius:10px;background:linear-gradient(135deg,#b4e05a,#5ee0a0);color:#051208;font-weight:700;font-size:.9rem;text-decoration:none">Acessar o painel</a>
-          <p style="margin:24px 0 0;font-size:11px;color:rgba(255,255,255,.2)">Se você não solicitou isso, ignore este e-mail. Sua senha anterior continuará funcionando.</p>
-        </div>
-      </div>`;
-      await fetch("https://api.resend.com/emails", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${RESEND_KEY}` },
-        body: JSON.stringify({ from: "ConsultaJa24h <contato@consultaja24h.com.br>", to: [med.email], subject: "Acesso temporário ao painel médico", html })
-      });
-    }
-    console.log("[ESQUECI-SENHA] Senha temporária gerada para médico #" + med.id);
-    return res.json(MSG_GENERICA);
-  } catch(e) {
-    console.error("[ESQUECI-SENHA] Erro:", e.message);
-    return res.json({ ok: true, message: "Se o e-mail existir na plataforma, enviamos as instruções de acesso." });
+// ── MÉDICO: recuperação de senha por token de uso único ─────────────────────
+// (ver especialista-senha-reset.js). Antes este endpoint sobrescrevia a senha do
+// médico na hora e enviava uma senha temporária em texto puro: qualquer pessoa que
+// soubesse o e-mail derrubava o acesso. Agora só um link (token SHA-256, 60 min,
+// uso único) vai para o e-mail da conta; a senha atual segue válida até o consumo.
+(async () => {
+  for (const sql of MIGRACOES_RESET_MEDICO) {
+    await pool.query(sql).catch(e => console.warn('[MED-RESET-MIGRATION]', e.message));
   }
+  await atualizarRevogacoesSessaoMedico();
+})();
+registrarRotasRecuperacaoMedico(app, {
+  pool,
+  rlLogin,
+  medicoBloqueado,
+  hashSenha: (senha) => bcrypt.hash(String(senha), 10),
+  onSenhaRedefinida: ({ id, alteradaEm }) => registrarRevogacaoSessaoMedico(id, alteradaEm || new Date()),
+  enviarEmail: async ({ to, subject, html }) => {
+    const RESEND_KEY = process.env.RESEND_API_KEY;
+    if (!RESEND_KEY) { console.error('[MED-RECOVERY] RESEND_API_KEY ausente; e-mail não enviado.'); return; }
+    const r = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${RESEND_KEY}` },
+      body: JSON.stringify({ from: 'ConsultaJá24h <contato@consultaja24h.com.br>', to: [to], subject, html }),
+    });
+    if (!r.ok) console.error('[MED-RECOVERY] Resend recusou o envio. HTTP', r.status);
+  },
+  apiBaseUrl: (process.env.API_URL || 'https://triagem-api.onrender.com').replace(/\/+$/, ''),
+  painelUrl: process.env.PAINEL_MEDICO_URL || 'https://painel.consultaja24h.com.br',
 });
 
 // Ganhos médicos: somente leitura, agregados da própria pessoa (ver medico-ganhos.js).
@@ -10519,24 +10526,87 @@ app.post("/api/atendimento/meet", async (req, res) => {
 });
 
 // ── POST /api/atendimento/vincular-order ─────────────────────────────────────
-// Vincula o pagbank_order_id ao atendimento assim que a order e criada no PagBank.
-// Chamado pelo frontend apos /api/pagbank/order + /api/notify.
-// Idempotente: so grava se ainda nao tiver order vinculada.
-app.post("/api/atendimento/vincular-order", async (req, res) => {
-  try {
-    const { atendimentoId, orderId } = req.body || {};
-    if (!atendimentoId || !orderId)
-      return res.status(400).json({ ok: false, error: "atendimentoId e orderId obrigatorios" });
+// Chamado pelo frontend após /api/pagbank/order (que JÁ vincula a order no ato).
+// Antes aceitava qualquer {atendimentoId, orderId} do corpo e gravava sem checar
+// nada: dava para "plantar" uma order paga de outro atendimento num atendimento
+// pendente (pagamento confirmado pelo webhook/polling sem pagar) ou bloquear o
+// vínculo legítimo de terceiros.
+// Agora o próprio pedido PagBank é a prova de posse: só se vincula uma order que
+// a API do PagBank atesta ter sido criada por nós PARA ESTE atendimento
+// (reference_id "CJ-<id>-…") e com o valor esperado. IDs do corpo servem só
+// como chave de busca; nunca são gravados sem essa verificação.
+const vincularOrderLimitador = criarLimitadorJanelaVinculo({ max: 20, janelaMs: 10 * 60 * 1000 });
+const vincularOrderPodeConsultar = criarDeduplicadorPedidos({ janelaMs: 10000 });
 
-    await pool.query(
+async function consultarPedidoPagBankBruto(orderId) {
+  const id = String(orderId || "").trim();
+  if (!PAGBANK_TOKEN || !orderIdPagBankValido(id)) return null;
+  const r = await fetch(`${PAGBANK_URL}/orders/${encodeURIComponent(id)}`, {
+    headers: { Authorization: `Bearer ${PAGBANK_TOKEN}`, accept: "application/json" },
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!r.ok) return null;
+  const d = await r.json().catch(() => null);
+  return d && typeof d === "object" && String(d.id || "") === id ? d : null;
+}
+
+app.post("/api/atendimento/vincular-order", async (req, res) => {
+  const atendimentoId = parseIdAgendamento(req.body?.atendimentoId);
+  const orderId = String(req.body?.orderId ?? "").trim();
+  if (!atendimentoId || !orderId)
+    return res.status(400).json({ ok: false, error: "atendimentoId e orderId obrigatorios" });
+  if (!orderIdPagBankValido(orderId))
+    return res.status(400).json({ ok: false, error: "orderId invalido" });
+  if (!vincularOrderLimitador.permitir(String(req.ip || "sem-ip")))
+    return res.status(429).json({ ok: false, error: "Muitas tentativas. Aguarde alguns minutos." });
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, pagamento_status, pagbank_order_id FROM fila_atendimentos WHERE id = $1`,
+      [atendimentoId]
+    );
+    const at = rows[0];
+    // Resposta genérica para inexistente/divergente: não serve de oráculo.
+    const recusar = (motivo) => {
+      console.warn(`[VINCULAR-ORDER] Recusado (${motivo}) — atendimento #${atendimentoId} order ${orderId}`);
+      return res.status(409).json({ ok: false, error: "Nao foi possivel vincular a order a este atendimento" });
+    };
+    if (!at) return recusar("atendimento_inexistente");
+    // Caminho normal: /api/pagbank/order já gravou esta mesma order → idempotente.
+    if (at.pagbank_order_id) {
+      return at.pagbank_order_id === orderId ? res.json({ ok: true, jaVinculada: true }) : recusar("ja_vinculado_outra_order");
+    }
+    if (at.pagamento_status !== "pendente") return recusar("atendimento_nao_pendente");
+    if (!PAGBANK_TOKEN) return res.status(503).json({ ok: false, error: "Gateway indisponivel" });
+    if (!vincularOrderPodeConsultar(orderId)) return res.status(429).json({ ok: false, error: "Tente novamente em instantes." });
+
+    const pedido = await consultarPedidoPagBankBruto(orderId);
+    const configuracao = await buscarConfiguracaoAtendimento(atendimentoId);
+    const veredito = avaliarVinculoOrderPagBank({
+      atendimentoId,
+      orderId,
+      pedido,
+      valorEsperadoCentavos: configuracao?.valorCentavos,
+    });
+    if (!veredito.ok) return recusar(veredito.motivo);
+
+    // Order já usada por outro atendimento? (não deve acontecer: a referência é deste)
+    const dup = await pool.query(
+      `SELECT 1 FROM fila_atendimentos WHERE pagbank_order_id = $1 AND id <> $2 LIMIT 1`,
+      [orderId, atendimentoId]
+    );
+    if (dup.rowCount) return recusar("order_em_outro_atendimento");
+
+    const upd = await pool.query(
       `UPDATE fila_atendimentos
           SET pagbank_order_id = $2
         WHERE id = $1
-          AND pagbank_order_id IS NULL`,
+          AND pagbank_order_id IS NULL
+          AND pagamento_status = 'pendente'
+        RETURNING id`,
       [atendimentoId, orderId]
     );
-
-    console.log("[VINCULAR-ORDER] atendimento #" + atendimentoId + " <- order " + orderId);
+    if (!upd.rowCount) return recusar("corrida_vinculo");
+    console.log("[VINCULAR-ORDER] atendimento #" + atendimentoId + " <- order " + orderId + " (verificada no PagBank)");
     return res.json({ ok: true });
   } catch (e) {
     console.error("[VINCULAR-ORDER]", e.message);

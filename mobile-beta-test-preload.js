@@ -300,7 +300,8 @@ function installBetaTestRoutes(app) {
     try {
       const beta = await atendimentoBetaPorId(req.body?.atendimentoId);
       if (!beta) return next();
-      await pool.query(`UPDATE fila_atendimentos SET pagbank_order_id=$2 WHERE id=$1`, [beta.id, String(req.body?.orderId || `BETA-${beta.id}`)]);
+      // Só a order demonstrativa do próprio atendimento beta; nunca um id arbitrário do corpo.
+      await pool.query(`UPDATE fila_atendimentos SET pagbank_order_id=$2 WHERE id=$1`, [beta.id, `BETA-${beta.id}`]);
       return res.json({ ok: true, beta: true });
     } catch (error) {
       console.error('[APP-REVIEW-VINCULAR-PIX]', error);

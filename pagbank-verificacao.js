@@ -84,3 +84,50 @@ export function criarDeduplicadorPedidos({ janelaMs = 20000, max = 2000, agora =
     return true;
   };
 }
+
+/**
+ * Valor total do pedido em centavos, a partir do que a API do PagBank devolve.
+ * Prioridade: QR codes (PIX) → itens. null quando não dá para determinar.
+ */
+export function valorPedidoPagBankCentavos(d) {
+  if (!d || typeof d !== 'object') return null;
+  const inteiro = v => (Number.isSafeInteger(Number(v)) && Number(v) > 0 ? Number(v) : null);
+  const qrs = Array.isArray(d.qr_codes) ? d.qr_codes : [];
+  if (qrs.length) {
+    const vals = qrs.map(q => inteiro(q?.amount?.value));
+    return vals.every(v => v !== null) ? vals.reduce((a, b) => a + b, 0) : null;
+  }
+  const itens = Array.isArray(d.items) ? d.items : [];
+  if (itens.length) {
+    let total = 0;
+    for (const it of itens) {
+      const unit = inteiro(it?.unit_amount);
+      const qtd = inteiro(it?.quantity ?? 1);
+      if (unit === null || qtd === null) return null;
+      total += unit * qtd;
+    }
+    return total;
+  }
+  return null;
+}
+
+/**
+ * Decide se um pedido PagBank (lido da API, nunca do corpo do request) pode ser
+ * vinculado ao atendimento. O pedido só prova posse se:
+ *   - a API devolveu exatamente o id consultado;
+ *   - o reference_id foi gerado por nós PARA ESTE atendimento ("CJ-<id>-…");
+ *   - o valor do pedido é o valor esperado do atendimento.
+ * Retorna { ok: true } ou { ok: false, motivo }.
+ */
+export function avaliarVinculoOrderPagBank({ atendimentoId, orderId, pedido, valorEsperadoCentavos }) {
+  const idAt = Number(atendimentoId);
+  if (!Number.isSafeInteger(idAt) || idAt <= 0) return { ok: false, motivo: 'atendimento_invalido' };
+  if (!orderIdPagBankValido(orderId)) return { ok: false, motivo: 'order_invalida' };
+  if (!pedido || typeof pedido !== 'object') return { ok: false, motivo: 'pedido_nao_encontrado' };
+  if (String(pedido.id || '') !== orderId) return { ok: false, motivo: 'pedido_divergente' };
+  if (idFilaDeReferenciaPagBank(pedido.reference_id) !== idAt) return { ok: false, motivo: 'referencia_divergente' };
+  const esperado = Number(valorEsperadoCentavos);
+  if (!Number.isSafeInteger(esperado) || esperado <= 0) return { ok: false, motivo: 'valor_esperado_desconhecido' };
+  if (valorPedidoPagBankCentavos(pedido) !== esperado) return { ok: false, motivo: 'valor_divergente' };
+  return { ok: true };
+}
