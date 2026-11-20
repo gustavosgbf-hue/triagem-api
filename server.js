@@ -12,7 +12,7 @@ import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import multer from "multer";
-import { createHash, randomUUID, timingSafeEqual } from "crypto";
+import { createHash, randomInt, randomUUID, timingSafeEqual } from "crypto";
 import rateLimit from "express-rate-limit";
 import {
   codigoErroMemed,
@@ -24,6 +24,31 @@ import {
   validarDadosPrescritor,
 } from "./memed-utils.js";
 import { registrarRotaGanhosMedico } from "./medico-ganhos.js";
+import {
+  AGENDA_HORIZONTE_DIAS,
+  AGENDA_TZ,
+  filtrarSlotsExplicitos,
+  gerarSlotsSemanais,
+  horarioPertenceSemanal,
+  itemParaData,
+  paginarSlotsPorDia,
+  parseDisponibilidadeSemanal,
+  removerOcupados,
+  resolverJanela,
+  validarHorarioReserva,
+  validarTamanhoDisponibilidade,
+  AGENDA_MAX_ITENS_DISPONIBILIDADE,
+} from "./agenda-slots.js";
+import {
+  agendamentoAceitaCobranca,
+  extrairCobrancasPagasEfi,
+  extrairTokenAcesso,
+  idDeReferencia,
+  parseIdAgendamento,
+  payloadTokenAcesso,
+  serializarStatusAgendamento,
+  tokenAcessoValido,
+} from "./agendamento-acesso.js";
 import { registrarRotasRepasses } from "./medico-repasses-admin.js";
 const { Pool } = pg;
 
@@ -6187,6 +6212,225 @@ ORDER BY id DESC`
 
 // ── FIM PSICÓLOGOS ────────────────────────────────────────────────────────────
 
+// ── AGENDA: helpers compartilhados (psicologia + especialistas) ──────────────
+// Calendário calculado sob demanda (agenda-slots.js), sem materializar slots.
+// Conflito validado de forma atômica no momento da reserva com advisory lock
+// transacional por profissional (serializa só reservas do MESMO profissional).
+const PSI_DURACAO_MIN = 60; // sessão de 50 min + intervalo — mesma regra anterior
+const ESP_DURACAO_MIN = Math.min(240, Math.max(15, parseInt(process.env.ESP_DURACAO_MIN || '60', 10) || 60));
+// Por padrão só registra em log quando o horário pedido não está na grade semanal
+// do psicólogo (o frontend atual gera horários no fuso do navegador). Com
+// PSI_EXIGIR_SLOT_DISPONIBILIDADE=1 a reserva passa a ser recusada.
+const PSI_EXIGIR_SLOT_DISPONIBILIDADE = process.env.PSI_EXIGIR_SLOT_DISPONIBILIDADE === '1';
+const AGENDA_LOCK_NS = Object.freeze({ psicologia: 72401, especialistas: 72402 });
+const AGENDA_CFG = Object.freeze({
+  psicologia:    { tabela: 'agendamentos_psicologia',    colProf: 'psicologo_id',    duracao: PSI_DURACAO_MIN },
+  especialistas: { tabela: 'agendamentos_especialistas', colProf: 'especialista_id', duracao: ESP_DURACAO_MIN },
+});
+const AGENDA_MAX_OCUPADOS_CONSULTA = 2000;
+
+// Reserva ativa = não cancelada e (paga OU criada há menos de 35 min).
+// Sobreposição simétrica: |existente - pedido| < duração.
+async function buscarConflitoAgenda(db, modulo, profissionalId, horarioIso, excluirId = null) {
+  const cfg = AGENDA_CFG[modulo];
+  const { rows } = await db.query(
+    `SELECT id FROM ${cfg.tabela}
+      WHERE ${cfg.colProf} = $1
+        AND horario_agendado > ($2::timestamp - make_interval(mins => $3::int))
+        AND horario_agendado < ($2::timestamp + make_interval(mins => $3::int))
+        AND ($4::int IS NULL OR id <> $4::int)
+        AND status NOT IN ('cancelado','cancelada')
+        AND (pagamento_status = 'confirmado' OR criado_em > NOW() - INTERVAL '35 minutes')
+      LIMIT 1`,
+    [profissionalId, horarioIso, cfg.duracao, excluirId]
+  );
+  return rows[0] || null;
+}
+
+async function listarOcupadosAgenda(modulo, profissionalId, inicioUtc, fimUtc) {
+  const cfg = AGENDA_CFG[modulo];
+  const { rows } = await pool.query(
+    `SELECT horario_agendado FROM ${cfg.tabela}
+      WHERE ${cfg.colProf} = $1
+        AND horario_agendado > ($2::timestamp - make_interval(mins => $4::int))
+        AND horario_agendado < ($3::timestamp + make_interval(mins => $4::int))
+        AND status NOT IN ('cancelado','cancelada')
+        AND (pagamento_status = 'confirmado' OR criado_em > NOW() - INTERVAL '35 minutes')
+      ORDER BY horario_agendado
+      LIMIT ${AGENDA_MAX_OCUPADOS_CONSULTA}`,
+    [profissionalId, inicioUtc.toISOString(), fimUtc.toISOString(), cfg.duracao]
+  );
+  return rows.map(r => new Date(r.horario_agendado));
+}
+
+// Executa `inserir(client)` só se não houver conflito, sob lock do profissional.
+async function reservarSlotAtomico(modulo, profissionalId, horarioIso, inserir) {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query('SELECT pg_advisory_xact_lock($1::int, $2::int)', [AGENDA_LOCK_NS[modulo], profissionalId]);
+    const conflito = await buscarConflitoAgenda(client, modulo, profissionalId, horarioIso);
+    if (conflito) {
+      await client.query('ROLLBACK');
+      return { conflito: true, row: null };
+    }
+    const row = await inserir(client);
+    await client.query('COMMIT');
+    return { conflito: false, row };
+  } catch (e) {
+    try { await client.query('ROLLBACK'); } catch (_) {}
+    throw e;
+  } finally {
+    client.release();
+  }
+}
+
+// Token opaco de acesso ao agendamento (devolvido no /criar). Permite ao
+// checkout ler o status completo sem expor o agendamento a quem só tem o id.
+function criarTokenAcessoAgendamento(modulo, id) {
+  return jwt.sign(payloadTokenAcesso(modulo, id), JWT_SECRET, { expiresIn: '7d' });
+}
+
+function acessoAgendamentoAutorizado(req, modulo, ag) {
+  if (!ag) return false;
+  const t = extrairTokenAcesso(req);
+  if (t) {
+    try { if (tokenAcessoValido(jwt.verify(t, JWT_SECRET), modulo, ag.id)) return true; } catch (_) {}
+  }
+  const bearer = String(req.headers['authorization'] || '').replace(/^Bearer\s+/i, '').trim();
+  if (bearer && ag.paciente_id) {
+    try {
+      const dec = jwt.verify(bearer, JWT_SECRET);
+      if (dec.tipo === 'paciente' && Number(dec.id) === Number(ag.paciente_id)) return true;
+    } catch (_) {}
+  }
+  return false;
+}
+
+// Nunca confia no corpo do webhook PagBank: consulta o pedido na API.
+async function consultarPedidoPagBank(orderId) {
+  const id = String(orderId || '').trim();
+  if (!PAGBANK_TOKEN || !/^[A-Za-z0-9_-]{1,80}$/.test(id)) return null;
+  const r = await fetch(`${PAGBANK_URL}/orders/${encodeURIComponent(id)}`, {
+    headers: { Authorization: `Bearer ${PAGBANK_TOKEN}`, accept: 'application/json' }
+  });
+  if (!r.ok) return null;
+  const d = await r.json().catch(() => null);
+  if (!d) return null;
+  const pagos = (Array.isArray(d.charges) ? d.charges : []).filter(c => c && c.status === 'PAID');
+  return {
+    id: String(d.id || id),
+    pago: pagos.length > 0,
+    referenceId: String(d.reference_id || ''),
+    valorPagoCentavos: pagos.reduce((s, c) => s + (Number(c.amount?.value) || 0), 0),
+  };
+}
+
+// Evita duas cobranças simultâneas de cartão para o mesmo agendamento
+// (duplo clique / reenvio). Escopo do processo — suficiente p/ instância única.
+const cobrancasCartaoEmAndamento = new Set();
+function iniciarCobrancaCartao(chave) {
+  if (cobrancasCartaoEmAndamento.has(chave)) return false;
+  cobrancasCartaoEmAndamento.add(chave);
+  return true;
+}
+function finalizarCobrancaCartao(chave) { cobrancasCartaoEmAndamento.delete(chave); }
+
+const PSI_CONFIRMAR_SET_SQL = `pagamento_status = 'confirmado', pagamento_confirmado_em = NOW(), status = 'confirmado',
+              status_sessao = 'pago',
+              valor_repasse = ROUND(valor_cobrado * (1 - $2::numeric / 100), 2)`;
+const PSI_CONFIRMAR_RETURNING_SQL = `id, psicologo_id, paciente_nome, psicologo_nome, horario_agendado, valor_cobrado, paciente_email, tipo_consulta`;
+
+async function notificarPsiConfirmado(ag) {
+  if (!ag) return;
+  try {
+    const psiRes = ag.psicologo_id
+      ? await pool.query(`SELECT email FROM psicologos WHERE id = $1 LIMIT 1`, [ag.psicologo_id])
+      : await pool.query(`SELECT email FROM psicologos WHERE nome_exibicao=$1 OR nome=$1 LIMIT 1`, [ag.psicologo_nome]);
+    ag.psicologo_email = psiRes.rows[0]?.email || null;
+  } catch (_) { ag.psicologo_email = null; }
+  enviarEmailAdminPsicologia(ag).catch(() => {});
+  enviarEmailConfirmacaoPacientePsi(ag).catch(() => {});
+  enviarEmailNotificacaoPsicologo(ag).catch(() => {});
+  enviarEmailConviteContaGuest({ nome: ag.paciente_nome, email: ag.paciente_email, psicologo: ag.psicologo_nome, horario: ag.horario_agendado }).catch(() => {});
+}
+
+// Confirma agendamento de psicologia pago via PagBank (pedido já verificado).
+async function confirmarPsiPorPedidoPagBank(pedido) {
+  if (!pedido?.pago) return null;
+  let { rows } = await pool.query(
+    `UPDATE agendamentos_psicologia
+        SET ${PSI_CONFIRMAR_SET_SQL}
+      WHERE pagbank_order_id = $1 AND pagamento_status = 'pendente'
+        AND ($3::bigint = 0 OR ROUND(valor_cobrado * 100) <= $3::bigint)
+      RETURNING ${PSI_CONFIRMAR_RETURNING_SQL}`,
+    [pedido.id, PSI_COMISSAO_PCT, pedido.valorPagoCentavos || 0]
+  );
+  const refId = idDeReferencia(pedido.referenceId, 'CJ-PSI');
+  if (!rows.length && refId) {
+    // Pedido antigo cujo order_id foi sobrescrito por um novo PIX do mesmo agendamento.
+    ({ rows } = await pool.query(
+      `UPDATE agendamentos_psicologia
+          SET ${PSI_CONFIRMAR_SET_SQL}, pagbank_order_id = $4
+        WHERE id = $1 AND pagamento_status = 'pendente'
+          AND ($3::bigint = 0 OR ROUND(valor_cobrado * 100) <= $3::bigint)
+        RETURNING ${PSI_CONFIRMAR_RETURNING_SQL}`,
+      [refId, PSI_COMISSAO_PCT, pedido.valorPagoCentavos || 0, pedido.id]
+    ));
+  }
+  return rows[0] || null;
+}
+
+// Idem para especialistas.
+async function confirmarEspPorPedidoPagBank(pedido) {
+  if (!pedido?.pago) return null;
+  const ret = `id, paciente_nome, paciente_email, especialista_nome, especialidade, horario_agendado, valor_cobrado, pagamento_status, status`;
+  let { rows } = await pool.query(
+    `UPDATE agendamentos_especialistas
+        SET pagamento_status = 'confirmado', pagamento_confirmado_em = NOW(), status = 'confirmado'
+      WHERE pagbank_order_id = $1 AND pagamento_status = 'pendente'
+        AND ($2::bigint = 0 OR ROUND(valor_cobrado * 100) <= $2::bigint)
+      RETURNING ${ret}`,
+    [pedido.id, pedido.valorPagoCentavos || 0]
+  );
+  const refId = idDeReferencia(pedido.referenceId, 'CJ-ESP');
+  if (!rows.length && refId) {
+    ({ rows } = await pool.query(
+      `UPDATE agendamentos_especialistas
+          SET pagamento_status = 'confirmado', pagamento_confirmado_em = NOW(), status = 'confirmado',
+              pagbank_order_id = $3
+        WHERE id = $1 AND pagamento_status = 'pendente'
+          AND ($2::bigint = 0 OR ROUND(valor_cobrado * 100) <= $2::bigint)
+        RETURNING ${ret}`,
+      [refId, pedido.valorPagoCentavos || 0, pedido.id]
+    ));
+  }
+  return rows[0] || null;
+}
+
+function idProfissional(valor) { return parseIdAgendamento(valor); }
+
+// Data de expiração do PIX no formato do PagBank com offset de Fortaleza (UTC-3).
+// Antes: toISOString().replace('Z','-03:00') rotulava o horário UTC como -03:00,
+// deixando o QR válido ~3h30 (muito além da reserva de 35 min do horário).
+function expiracaoPixFortaleza(minutos = 30) {
+  const alvo = Date.now() + minutos * 60 * 1000;
+  return new Date(alvo - 3 * 60 * 60 * 1000).toISOString().replace(/\.\d{3}Z$/, '-03:00');
+}
+
+function validarHorarioPsi(slotStart, disponibilidadeRaw, psicologoId) {
+  const v = validarHorarioReserva(slotStart);
+  if (!v.ok) return { ok: false, status: 400, error: v.error === 'Horário inválido' ? 'horario_agendado inválido' : v.error };
+  const semanal = parseDisponibilidadeSemanal(disponibilidadeRaw);
+  if (semanal && !horarioPertenceSemanal(slotStart, semanal)) {
+    console.warn(`[PSI-AGEND] Horário fora da grade semanal (${AGENDA_TZ}) — psicólogo #${psicologoId} ${slotStart.toISOString()}${PSI_EXIGIR_SLOT_DISPONIBILIDADE ? ' (recusado)' : ''}`);
+    if (PSI_EXIGIR_SLOT_DISPONIBILIDADE) {
+      return { ok: false, status: 409, error: 'Este horário não está na agenda do profissional. Escolha outro.' };
+    }
+  }
+  return { ok: true };
+}
+
 // ── PSICOLOGIA: criar agendamento (antes do pagamento) ───────────────────────
 // POST /api/psicologia/agendamento/criar
 // Exige paciente autenticado — token JWT com tipo='paciente' obrigatório
@@ -6213,10 +6457,12 @@ app.post('/api/psicologia/agendamento/criar', rlGeral, async (req, res) => {
     }
 
     // Busca psicólogo e seu valor — feito no BACKEND, nunca confiar no frontend
+    const psiIdNum = idProfissional(psicologoId);
+    if (!psiIdNum) return res.status(400).json({ ok: false, error: 'psicologoId inválido' });
     const psiRes = await pool.query(
-      `SELECT id, nome_exibicao, valor_sessao, valor_avaliacao, tem_avaliacao, ativo, status
+      `SELECT id, nome_exibicao, valor_sessao, valor_avaliacao, tem_avaliacao, ativo, status, disponibilidade
          FROM psicologos WHERE id = $1 LIMIT 1`,
-      [psicologoId]
+      [psiIdNum]
     );
     if (psiRes.rowCount === 0 || !psiRes.rows[0].ativo || psiRes.rows[0].status !== 'aprovado') {
       return res.status(404).json({ ok: false, error: 'Psicólogo não encontrado ou inativo' });
@@ -6231,39 +6477,31 @@ app.post('/api/psicologia/agendamento/criar', rlGeral, async (req, res) => {
       return res.status(400).json({ ok: false, error: 'Valor da sessão inválido para este profissional' });
     }
 
-    // Verifica conflito de horário para este psicólogo
+    // Valida horário (futuro, ≤ 90 dias, grade semanal) e reserva de forma atômica
     const slotStart = new Date(horario_agendado);
-    if (isNaN(slotStart.getTime())) {
-      return res.status(400).json({ ok: false, error: 'horario_agendado inválido' });
-    }
-    const slotEnd = new Date(slotStart.getTime() + 60 * 60 * 1000); // sessão de 1h
-    const conflito = await pool.query(
-      `SELECT id FROM agendamentos_psicologia
-        WHERE psicologo_id = $1
-	          AND horario_agendado >= $2 AND horario_agendado < $3
-	          AND status NOT IN ('cancelado')
-	          AND (pagamento_status = 'confirmado' OR criado_em > NOW() - INTERVAL '35 minutes')
-	        LIMIT 1`,
-      [psicologoId, slotStart.toISOString(), slotEnd.toISOString()]
-    );
-    if (conflito.rowCount > 0) {
+    const validacao = validarHorarioPsi(slotStart, psi.disponibilidade, psiIdNum);
+    if (!validacao.ok) return res.status(validacao.status).json({ ok: false, error: validacao.error });
+
+    const reserva = await reservarSlotAtomico('psicologia', psiIdNum, slotStart.toISOString(), async (db) => {
+      const result = await db.query(
+        `INSERT INTO agendamentos_psicologia
+          (psicologo_id, psicologo_nome, paciente_nome, paciente_email,
+           paciente_tel, paciente_cpf, tipo_consulta, horario_agendado,
+           valor_cobrado, pagamento_status, status, paciente_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pendente','pendente',$10)
+         RETURNING id, valor_cobrado`,
+        [psiIdNum, psi.nome_exibicao, paciente_nome, paciente_email,
+         paciente_tel || '', paciente_cpf || '', tipoFinal,
+         slotStart.toISOString(), valor, pacienteId]
+      );
+      return result.rows[0];
+    });
+    if (reserva.conflito) {
       return res.status(409).json({ ok: false, error: 'Horário indisponível. Escolha outro.' });
     }
-
-    const result = await pool.query(
-      `INSERT INTO agendamentos_psicologia
-        (psicologo_id, psicologo_nome, paciente_nome, paciente_email,
-         paciente_tel, paciente_cpf, tipo_consulta, horario_agendado,
-         valor_cobrado, pagamento_status, status, paciente_id)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pendente','pendente',$10)
-       RETURNING id, valor_cobrado`,
-      [psicologoId, psi.nome_exibicao, paciente_nome, paciente_email,
-       paciente_tel || '', paciente_cpf || '', tipoFinal,
-       slotStart.toISOString(), valor, pacienteId]
-    );
-    const ag = result.rows[0];
+    const ag = reserva.row;
     console.log(`[PSI-AGEND] Criado #${ag.id} — psicólogo:${psi.nome_exibicao} valor:R$${ag.valor_cobrado}`);
-    return res.json({ ok: true, agendamentoId: ag.id, valor: ag.valor_cobrado });
+    return res.json({ ok: true, agendamentoId: ag.id, valor: ag.valor_cobrado, acessoToken: criarTokenAcessoAgendamento('psicologia', ag.id) });
   } catch (err) {
     console.error('[PSI-AGEND] Erro:', err.message);
     return res.status(500).json({ ok: false, error: err.message });
@@ -6291,10 +6529,12 @@ app.post('/api/psicologia/agendamento/criar-guest', rlGeral, async (req, res) =>
     }
 
     // Busca psicólogo e valor no backend
+    const psiIdNum = idProfissional(psicologoId);
+    if (!psiIdNum) return res.status(400).json({ ok: false, error: 'psicologoId inválido' });
     const psiRes = await pool.query(
-      `SELECT id, nome_exibicao, valor_sessao, valor_avaliacao, tem_avaliacao, ativo, status
+      `SELECT id, nome_exibicao, valor_sessao, valor_avaliacao, tem_avaliacao, ativo, status, disponibilidade
          FROM psicologos WHERE id = $1 LIMIT 1`,
-      [psicologoId]
+      [psiIdNum]
     );
     if (psiRes.rowCount === 0 || !psiRes.rows[0].ativo || psiRes.rows[0].status !== 'aprovado') {
       return res.status(404).json({ ok: false, error: 'Psicólogo não encontrado ou inativo' });
@@ -6308,22 +6548,11 @@ app.post('/api/psicologia/agendamento/criar-guest', rlGeral, async (req, res) =>
       return res.status(400).json({ ok: false, error: 'Valor da sessão inválido para este profissional' });
     }
 
-    // Verifica conflito de horário
+    // Valida horário e checa conflito cedo (a checagem definitiva é atômica abaixo)
     const slotStart = new Date(horario_agendado);
-    if (isNaN(slotStart.getTime())) {
-      return res.status(400).json({ ok: false, error: 'horario_agendado inválido' });
-    }
-    const slotEnd = new Date(slotStart.getTime() + 60 * 60 * 1000);
-    const conflito = await pool.query(
-      `SELECT id FROM agendamentos_psicologia
-        WHERE psicologo_id = $1
-	          AND horario_agendado >= $2 AND horario_agendado < $3
-	          AND status NOT IN ('cancelado')
-	          AND (pagamento_status = 'confirmado' OR criado_em > NOW() - INTERVAL '35 minutes')
-	        LIMIT 1`,
-      [psicologoId, slotStart.toISOString(), slotEnd.toISOString()]
-    );
-    if (conflito.rowCount > 0) {
+    const validacao = validarHorarioPsi(slotStart, psi.disponibilidade, psiIdNum);
+    if (!validacao.ok) return res.status(validacao.status).json({ ok: false, error: validacao.error });
+    if (await buscarConflitoAgenda(pool, 'psicologia', psiIdNum, slotStart.toISOString())) {
       return res.status(409).json({ ok: false, error: 'Horário indisponível. Escolha outro.' });
     }
 
@@ -6361,19 +6590,25 @@ app.post('/api/psicologia/agendamento/criar-guest', rlGeral, async (req, res) =>
       pacienteId = null;
     }
 
-    // Cria agendamento
-    const result = await pool.query(
-      `INSERT INTO agendamentos_psicologia
-        (psicologo_id, psicologo_nome, paciente_nome, paciente_email,
-         paciente_tel, paciente_cpf, tipo_consulta, horario_agendado,
-         valor_cobrado, pagamento_status, status, paciente_id)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pendente','pendente',$10)
-       RETURNING id, valor_cobrado`,
-      [psicologoId, psi.nome_exibicao, paciente_nome.trim(), emailNorm,
-       (paciente_tel||'').trim(), (paciente_cpf||'').replace(/\D/g,''),
-       tipoFinal, slotStart.toISOString(), valor, pacienteId]
-    );
-    const ag = result.rows[0];
+    // Cria agendamento (conflito revalidado sob lock do psicólogo)
+    const reserva = await reservarSlotAtomico('psicologia', psiIdNum, slotStart.toISOString(), async (db) => {
+      const result = await db.query(
+        `INSERT INTO agendamentos_psicologia
+          (psicologo_id, psicologo_nome, paciente_nome, paciente_email,
+           paciente_tel, paciente_cpf, tipo_consulta, horario_agendado,
+           valor_cobrado, pagamento_status, status, paciente_id)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pendente','pendente',$10)
+         RETURNING id, valor_cobrado`,
+        [psiIdNum, psi.nome_exibicao, paciente_nome.trim(), emailNorm,
+         (paciente_tel||'').trim(), (paciente_cpf||'').replace(/\D/g,''),
+         tipoFinal, slotStart.toISOString(), valor, pacienteId]
+      );
+      return result.rows[0];
+    });
+    if (reserva.conflito) {
+      return res.status(409).json({ ok: false, error: 'Horário indisponível. Escolha outro.' });
+    }
+    const ag = reserva.row;
 
     // Registra lead
     pool.query(
@@ -6382,8 +6617,8 @@ app.post('/api/psicologia/agendamento/criar-guest', rlGeral, async (req, res) =>
       [paciente_nome.trim(), emailNorm, (paciente_tel||'').trim(), psi.nome_exibicao, slotStart.toISOString()]
     ).catch(() => {});
 
-    console.log(`[GUEST-AGEND] Criado #${ag.id} — ${psi.nome_exibicao} — ${emailNorm} — R$${ag.valor_cobrado}`);
-    return res.json({ ok: true, agendamentoId: ag.id, valor: ag.valor_cobrado });
+    console.log(`[GUEST-AGEND] Criado #${ag.id} — ${psi.nome_exibicao} — R$${ag.valor_cobrado}`);
+    return res.json({ ok: true, agendamentoId: ag.id, valor: ag.valor_cobrado, acessoToken: criarTokenAcessoAgendamento('psicologia', ag.id) });
 
   } catch (err) {
     console.error('[GUEST-AGEND] Erro:', err.message);
@@ -6397,14 +6632,14 @@ app.post('/api/psicologia/agendamento/criar-guest', rlGeral, async (req, res) =>
 // Retorna array de ISO strings com horários já reservados (não cancelados)
 app.get('/api/psicologia/horarios-ocupados/:psicologoId', rlGeral, async (req, res) => {
   try {
-    const psicologoId = parseInt(req.params.psicologoId, 10);
+    const psicologoId = idProfissional(req.params.psicologoId);
     if (!psicologoId) return res.status(400).json({ ok: false, error: 'psicologoId inválido' });
-    const dias = Math.min(parseInt(req.query.dias || '14', 10), 60);
+    const dias = Math.min(Math.max(parseInt(req.query.dias || '14', 10) || 14, 1), AGENDA_HORIZONTE_DIAS);
     const { rows } = await pool.query(
       `SELECT horario_agendado
          FROM agendamentos_psicologia
         WHERE psicologo_id = $1
-	          AND status NOT IN ('cancelado')
+	          AND status NOT IN ('cancelado','cancelada')
 	          AND (pagamento_status = 'confirmado' OR criado_em > NOW() - INTERVAL '35 minutes')
 	          AND horario_agendado >= NOW()
           AND horario_agendado <= NOW() + ($2 || ' days')::interval
@@ -6419,56 +6654,93 @@ app.get('/api/psicologia/horarios-ocupados/:psicologoId', rlGeral, async (req, r
   }
 });
 
+// ── PSICOLOGIA: slots calculados sob demanda ─────────────────────────────────
+// GET /api/psicologia/slots/:psicologoId?inicio=AAAA-MM-DD&dias=7&limite=120
+// Janela de até 14 dias dentro do horizonte de 90 dias (America/Fortaleza).
+// Remove horários passados e ocupados. 2 queries por requisição, sem materializar.
+app.get('/api/psicologia/slots/:psicologoId', rlGeral, async (req, res) => {
+  try {
+    const psicologoId = idProfissional(req.params.psicologoId);
+    if (!psicologoId) return res.status(400).json({ ok: false, error: 'psicologoId inválido' });
+    const agora = new Date();
+    const janela = resolverJanela({ inicio: req.query.inicio, dias: req.query.dias, agora });
+    if (!janela.ok) return res.status(400).json({ ok: false, error: janela.error });
+    const { rows } = await pool.query(
+      `SELECT disponibilidade FROM psicologos
+        WHERE id = $1 AND ativo = true AND status = 'aprovado' AND visivel = true LIMIT 1`,
+      [psicologoId]
+    );
+    if (!rows.length) return res.status(404).json({ ok: false, error: 'Psicólogo não encontrado' });
+    const semanal = parseDisponibilidadeSemanal(rows[0].disponibilidade);
+    let livres = [];
+    if (semanal) {
+      const candidatos = gerarSlotsSemanais(semanal, janela, { agora });
+      if (candidatos.length) {
+        const ocupados = await listarOcupadosAgenda('psicologia', psicologoId, janela.inicioUtc, janela.fimUtc);
+        livres = removerOcupados(candidatos, ocupados, PSI_DURACAO_MIN);
+      }
+    }
+    const pagina = paginarSlotsPorDia(livres, { limite: req.query.limite, proximoInicioJanela: janela.proximoInicio });
+    res.set('Cache-Control', 'no-store');
+    return res.json({
+      ok: true,
+      timezone: AGENDA_TZ,
+      horizonte_dias: AGENDA_HORIZONTE_DIAS,
+      duracao_min: PSI_DURACAO_MIN,
+      disponibilidade_estruturada: !!semanal,
+      inicio: janela.inicio,
+      fim: janela.fim,
+      dias: janela.dias,
+      limite: pagina.limite,
+      truncado: pagina.truncado,
+      proximo_inicio: pagina.proximoInicio,
+      slots: pagina.slots,
+    });
+  } catch (e) {
+    console.error('[PSI-SLOTS] Erro:', e.message);
+    return res.status(500).json({ ok: false, error: 'Não foi possível carregar os horários' });
+  }
+});
+
 // ── PSICOLOGIA: PIX via PagBank com valor dinâmico ───────────────────────────
 // POST /api/psicologia/pagbank/order
 // Reutiliza a mesma integração PagBank existente, porém busca o valor do agendamento
 app.post('/api/psicologia/pagbank/order', rlGeral, async (req, res) => {
   try {
-    const { agendamentoId, nome, email, cpf } = req.body || {};
-    if (!agendamentoId || !nome || !cpf) {
+    const { agendamentoId: agendamentoIdBody, nome, email, cpf } = req.body || {};
+    if (!agendamentoIdBody || !nome || !cpf) {
       return res.status(400).json({ ok: false, error: 'agendamentoId, nome e cpf são obrigatórios' });
+    }
+    if (typeof nome !== 'string' || typeof cpf !== 'string') {
+      return res.status(400).json({ ok: false, error: 'nome e cpf inválidos' });
     }
     if (!PAGBANK_TOKEN) return res.status(503).json({ ok: false, error: 'Gateway de pagamento indisponível' });
 
+    const agIdNum = parseIdAgendamento(agendamentoIdBody);
+    if (!agIdNum) return res.status(400).json({ ok: false, error: 'agendamentoId inválido' });
     // Busca valor real do agendamento — nunca aceita valor do front
     const agRes = await pool.query(
-      `SELECT id, valor_cobrado, pagamento_status, psicologo_nome, paciente_nome, horario_agendado
+      `SELECT id, valor_cobrado, pagamento_status, status, psicologo_id, psicologo_nome, paciente_nome, horario_agendado
          FROM agendamentos_psicologia WHERE id = $1 LIMIT 1`,
-      [agendamentoId]
+      [agIdNum]
     );
-    if (agRes.rowCount === 0) return res.status(404).json({ ok: false, error: 'Agendamento não encontrado' });
     const ag = agRes.rows[0];
-    if (ag.pagamento_status === 'confirmado') {
-      return res.status(409).json({ ok: false, error: 'Este agendamento já foi pago' });
-    }
+    const elegivel = agendamentoAceitaCobranca(ag);
+    if (!elegivel.ok) return res.status(elegivel.status).json({ ok: false, error: elegivel.error });
 
-    // Re-valida conflito de horário antes de gerar o PIX (race condition: outro paciente pode ter agendado entre /criar e /pagbank/order)
+    // Re-valida conflito antes de gerar o PIX (outro paciente pode ter reservado/pago no intervalo)
     const slotStart = new Date(ag.horario_agendado);
-    const slotEnd   = new Date(slotStart.getTime() + 60 * 60 * 1000);
-    const conflitoP = await pool.query(
-      `SELECT id FROM agendamentos_psicologia
-        WHERE psicologo_id = (SELECT psicologo_id FROM agendamentos_psicologia WHERE id = $1)
-          AND horario_agendado >= $2 AND horario_agendado < $3
-	          AND id <> $1
-	          AND status NOT IN ('cancelado')
-	          AND (pagamento_status = 'confirmado' OR criado_em > NOW() - INTERVAL '35 minutes')
-	        LIMIT 1`,
-      [agendamentoId, slotStart.toISOString(), slotEnd.toISOString()]
-    );
-    if (conflitoP.rowCount > 0) {
-      // Cancela o agendamento atual pois o horário foi tomado
-      await pool.query(`UPDATE agendamentos_psicologia SET status='cancelado' WHERE id=$1`, [agendamentoId]);
+    if (slotStart.getTime() <= Date.now()) {
+      return res.status(409).json({ ok: false, error: 'Este horário já passou. Escolha outro.' });
+    }
+    if (await buscarConflitoAgenda(pool, 'psicologia', ag.psicologo_id, slotStart.toISOString(), agIdNum)) {
+      await pool.query(`UPDATE agendamentos_psicologia SET status='cancelado' WHERE id=$1 AND pagamento_status <> 'confirmado'`, [agIdNum]);
       return res.status(409).json({ ok: false, error: 'Horário indisponível. Por favor, escolha outro horário.' });
     }
+    const valorCentavos = elegivel.valorCentavos;
+    const agendamentoId = agIdNum;
 
-    const valorCentavos = Math.round(parseFloat(ag.valor_cobrado) * 100);
-    if (!valorCentavos || valorCentavos < 1) {
-      console.error('[PSI-PAGBANK] valor_cobrado inválido:', ag.valor_cobrado);
-      return res.status(400).json({ ok: false, error: 'Valor do agendamento inválido. Contate o suporte.' });
-    }
-
-    const expiracao = new Date(Date.now() + 30 * 60 * 1000);
-    const expiracaoISO = expiracao.toISOString().replace('Z', '-03:00');
+    const expiracaoISO = expiracaoPixFortaleza(30);
 
     const orderBody = {
       reference_id: `CJ-PSI-${agendamentoId}-${Date.now()}`,
@@ -6528,34 +6800,23 @@ app.post('/api/psicologia/pagbank/webhook', async (req, res) => {
   const charges = event?.data?.charges || event?.charges || [];
   const pago    = charges.some(c => c.status === 'PAID');
 
-  console.log('[PSI-PAGBANK-WH] orderId:', orderId, 'pago:', pago);
+  console.log('[PSI-PAGBANK-WH] orderId:', orderId, 'pago(payload):', pago);
   if (!pago || !orderId) return;
 
   try {
-    const { rows } = await pool.query(
-      `UPDATE agendamentos_psicologia
-          SET pagamento_status = 'confirmado', pagamento_confirmado_em = NOW(), status = 'confirmado',
-              status_sessao = 'pago',
-              valor_repasse = ROUND(valor_cobrado * (1 - $2::numeric / 100), 2)
-        WHERE pagbank_order_id = $1 AND pagamento_status = 'pendente'
-        RETURNING id, paciente_nome, psicologo_nome, horario_agendado, valor_cobrado, paciente_email, tipo_consulta`,
-      [orderId, PSI_COMISSAO_PCT]
-    );
-    if (rows.length === 0) {
+    // O corpo do webhook não é autenticado: confirma somente o que a API do PagBank atesta.
+    const pedido = await consultarPedidoPagBank(orderId);
+    if (!pedido?.pago) {
+      console.warn('[PSI-PAGBANK-WH] Pedido não confirmado na API PagBank — ignorado:', orderId);
+      return;
+    }
+    const ag = await confirmarPsiPorPedidoPagBank(pedido);
+    if (!ag) {
       console.log('[PSI-PAGBANK-WH] Order não encontrada ou já processada:', orderId);
       return;
     }
-    const ag = rows[0];
-    console.log(`[PSI-PAGBANK-WH] Agendamento #${ag.id} confirmado — ${ag.paciente_nome} → ${ag.psicologo_nome}`);
-    // Busca email do psicólogo
-    const psiRes1 = await pool.query(`SELECT email FROM psicologos WHERE nome_exibicao=$1 OR nome=$1 LIMIT 1`, [ag.psicologo_nome]);
-    ag.psicologo_email = psiRes1.rows[0]?.email || null;
-    // Envia emails
-    enviarEmailAdminPsicologia(ag).catch(() => {});
-    enviarEmailConfirmacaoPacientePsi(ag).catch(() => {});
-    enviarEmailNotificacaoPsicologo(ag).catch(() => {});
-    // Convite para criar senha (apenas contas guest sem senha real)
-    enviarEmailConviteContaGuest({ nome: ag.paciente_nome, email: ag.paciente_email, psicologo: ag.psicologo_nome, horario: ag.horario_agendado }).catch(() => {});
+    console.log(`[PSI-PAGBANK-WH] Agendamento #${ag.id} confirmado — ${ag.psicologo_nome}`);
+    await notificarPsiConfirmado(ag);
   } catch (e) {
     console.error('[PSI-PAGBANK-WH] Erro:', e.message);
   }
@@ -6564,11 +6825,16 @@ app.post('/api/psicologia/pagbank/webhook', async (req, res) => {
 // ── PSICOLOGIA: polling status de pagamento ───────────────────────────────────
 app.get('/api/psicologia/agendamento/:id/status', rlGeral, async (req, res) => {
   try {
+    const agId = parseIdAgendamento(req.params.id);
+    if (!agId) return res.status(404).json({ ok: false, error: 'Agendamento não encontrado' });
     const { rows } = await pool.query(
-      `SELECT id, pagamento_status, status, valor_cobrado, psicologo_nome,
-              horario_agendado, tipo_consulta, formulario_url, pagbank_order_id
-         FROM agendamentos_psicologia WHERE id = $1 LIMIT 1`,
-      [req.params.id]
+      `SELECT ap.id, ap.pagamento_status, ap.status, ap.valor_cobrado, ap.psicologo_nome,
+              ap.horario_agendado, ap.tipo_consulta, ap.pagbank_order_id, ap.paciente_id,
+              ps.formulario_url
+         FROM agendamentos_psicologia ap
+         LEFT JOIN psicologos ps ON ps.id = ap.psicologo_id
+        WHERE ap.id = $1 LIMIT 1`,
+      [agId]
     );
     if (rows.length === 0) return res.status(404).json({ ok: false, error: 'Agendamento não encontrado' });
     const ag = rows[0];
@@ -6576,29 +6842,26 @@ app.get('/api/psicologia/agendamento/:id/status', rlGeral, async (req, res) => {
     // Fallback: consulta PagBank diretamente se ainda pendente (webhook pode ter atrasado)
     if (ag.pagamento_status === 'pendente' && ag.pagbank_order_id && PAGBANK_TOKEN) {
       try {
-        const pbRes = await fetch(`${PAGBANK_URL}/orders/${ag.pagbank_order_id}`, {
-          headers: { 'Authorization': `Bearer ${PAGBANK_TOKEN}`, 'accept': 'application/json' }
-        });
-        const pbData = await pbRes.json();
-        const pagoNaPagBank = pbData.charges?.some(c => c.status === 'PAID') || false;
-        if (pagoNaPagBank) {
-          await pool.query(
-            `UPDATE agendamentos_psicologia
-                SET pagamento_status = 'confirmado', pagamento_confirmado_em = NOW(), status = 'confirmado'
-              WHERE id = $1`,
-            [ag.id]
+        const pedido = await consultarPedidoPagBank(ag.pagbank_order_id);
+        if (pedido?.pago) {
+          // Mesma confirmação do webhook (repasse + status_sessao + e-mails), idempotente.
+          const confirmado = await confirmarPsiPorPedidoPagBank(pedido);
+          if (confirmado) notificarPsiConfirmado(confirmado).catch(() => {});
+          const { rows: atual } = await pool.query(
+            `SELECT pagamento_status, status FROM agendamentos_psicologia WHERE id = $1`, [ag.id]
           );
-          ag.pagamento_status = 'confirmado';
-          ag.status = 'confirmado';
+          if (atual[0]) Object.assign(ag, atual[0]);
         }
       } catch (e) {
         console.warn('[PSI-STATUS] Falha ao consultar PagBank:', e.message);
       }
     }
 
-    return res.json({ ok: true, agendamento: ag });
+    const autorizado = acessoAgendamentoAutorizado(req, 'psicologia', ag);
+    res.set('Cache-Control', 'no-store');
+    return res.json({ ok: true, agendamento: serializarStatusAgendamento('psicologia', ag, { autorizado }) });
   } catch (e) {
-    return res.status(500).json({ ok: false, error: e.message });
+    return res.status(500).json({ ok: false, error: 'Não foi possível consultar o agendamento' });
   }
 });
 
@@ -6612,8 +6875,10 @@ function criarLinkSenhaGuest(email) {
 }
 
 async function validarAcessoAgendamentoPsi(id, email, cpf) {
+  const agId = parseIdAgendamento(id);
   const emailNorm = String(email || '').trim().toLowerCase();
   const cpfNorm = String(cpf || '').replace(/\D/g, '');
+  if (!agId || !emailNorm || cpfNorm.length !== 11) return null;
   const { rows } = await pool.query(
     `SELECT ap.id, ap.paciente_email, ap.paciente_cpf, ap.pagamento_status,
             ap.paciente_nome, ap.psicologo_nome, ap.horario_agendado,
@@ -6621,7 +6886,7 @@ async function validarAcessoAgendamentoPsi(id, email, cpf) {
        FROM agendamentos_psicologia ap
        JOIN pacientes p ON p.id = ap.paciente_id
       WHERE ap.id = $1 LIMIT 1`,
-    [id]
+    [agId]
   );
   const ag = rows[0];
   if (!ag || ag.pagamento_status !== 'confirmado') return null;
@@ -6630,25 +6895,60 @@ async function validarAcessoAgendamentoPsi(id, email, cpf) {
   return ag;
 }
 
-// Disponibiliza o acesso somente a quem possui os dados usados no checkout pago.
-app.post('/api/psicologia/agendamento/:id/acesso-paciente', rlGeral, async (req, res) => {
+// Acesso pós-pagamento. O link de criação de senha é um segredo de posse do
+// e-mail: NUNCA é devolvido na resposta HTTP (antes bastava id+e-mail+CPF —
+// dados de terceiros fáceis de obter — para assumir a conta guest). Agora o
+// link vai apenas para o e-mail cadastrado e a resposta aponta para o login.
+const ACESSO_GUEST_COOLDOWN_MS = 60 * 1000;
+const acessoGuestUltimoEnvio = new Map();
+function podeEnviarAcessoGuest(chave) {
+  const agora = Date.now();
+  const ultimo = acessoGuestUltimoEnvio.get(chave) || 0;
+  if (agora - ultimo < ACESSO_GUEST_COOLDOWN_MS) return false;
+  acessoGuestUltimoEnvio.set(chave, agora);
+  if (acessoGuestUltimoEnvio.size > 5000) {
+    for (const [k, t] of acessoGuestUltimoEnvio) if (agora - t > ACESSO_GUEST_COOLDOWN_MS) acessoGuestUltimoEnvio.delete(k);
+  }
+  return true;
+}
+
+app.post('/api/psicologia/agendamento/:id/acesso-paciente', rlLogin, async (req, res) => {
   try {
     const ag = await validarAcessoAgendamentoPsi(req.params.id, req.body?.email, req.body?.cpf);
     if (!ag) return res.status(403).json({ ok: false, error: 'Não foi possível validar este agendamento' });
+    const urlLogin = 'https://consultaja24h.com.br/paciente';
     if (ag.senha_hash !== '__GUEST__') {
-      return res.json({ ok: true, precisa_criar_senha: false, url: 'https://consultaja24h.com.br/paciente' });
+      return res.json({ ok: true, precisa_criar_senha: false, url: urlLogin });
     }
-    return res.json({ ok: true, precisa_criar_senha: true, url: criarLinkSenhaGuest(ag.paciente_email) });
+    let enviado = false;
+    if (podeEnviarAcessoGuest(`psi:${ag.id}`)) {
+      enviado = await enviarEmailConviteContaGuest({
+        nome: ag.paciente_nome,
+        email: ag.paciente_email,
+        psicologo: ag.psicologo_nome,
+        horario: ag.horario_agendado
+      });
+    }
+    return res.json({
+      ok: true,
+      precisa_criar_senha: true,
+      enviado_por_email: !!enviado,
+      mensagem: 'Enviamos o link para criar sua senha no e-mail informado no agendamento.',
+      url: `${urlLogin}?acesso=email`
+    });
   } catch (err) {
     return res.status(500).json({ ok: false, error: 'Não foi possível gerar o acesso' });
   }
 });
 
-app.post('/api/psicologia/agendamento/:id/reenviar-acesso', rlGeral, async (req, res) => {
+app.post('/api/psicologia/agendamento/:id/reenviar-acesso', rlLogin, async (req, res) => {
   try {
     const ag = await validarAcessoAgendamentoPsi(req.params.id, req.body?.email, req.body?.cpf);
     if (!ag) return res.status(403).json({ ok: false, error: 'Não foi possível validar este agendamento' });
     if (ag.senha_hash !== '__GUEST__') return res.json({ ok: true, conta_existente: true });
+    if (!podeEnviarAcessoGuest(`psi:${ag.id}`)) {
+      return res.status(429).json({ ok: false, error: 'Aguarde um minuto antes de pedir um novo envio.' });
+    }
     const enviado = await enviarEmailConviteContaGuest({
       nome: ag.paciente_nome,
       email: ag.paciente_email,
@@ -6666,13 +6966,17 @@ app.post('/api/psicologia/agendamento/:id/reenviar-acesso', rlGeral, async (req,
 // POST /api/psicologia/efi/cartao/cobrar
 // Mesma estrutura do /api/efi/cartao/cobrar existente, mas busca valor do agendamento
 app.post('/api/psicologia/efi/cartao/cobrar', rlGeral, async (req, res) => {
+  let lockCartao = null;
+  let lockAdquirido = false;
   try {
-    const { payment_token, nome, cpf, email, telefone, nascimento, parcelas = 1, agendamentoId } = req.body || {};
+    const { payment_token, nome, cpf, email, telefone, nascimento, parcelas = 1 } = req.body || {};
+    const agendamentoId = parseIdAgendamento(req.body?.agendamentoId);
 
-    if (!payment_token) return res.status(400).json({ ok: false, error: 'payment_token obrigatório' });
-    if (!nome)          return res.status(400).json({ ok: false, error: 'nome obrigatório' });
+    if (!payment_token || typeof payment_token !== 'string') return res.status(400).json({ ok: false, error: 'payment_token obrigatório' });
+    if (!nome || typeof nome !== 'string') return res.status(400).json({ ok: false, error: 'nome obrigatório' });
     if (!cpf)           return res.status(400).json({ ok: false, error: 'cpf obrigatório' });
     if (!agendamentoId) return res.status(400).json({ ok: false, error: 'agendamentoId obrigatório' });
+    lockCartao = `psi:${agendamentoId}`;
 
     const cpfLimpo = String(cpf).replace(/\D/g, '');
     if (cpfLimpo.length !== 11) return res.status(400).json({ ok: false, error: 'CPF inválido' });
@@ -6686,33 +6990,29 @@ app.post('/api/psicologia/efi/cartao/cobrar', rlGeral, async (req, res) => {
 
     // Busca valor real — backend determina, jamais o front
     const agRes = await pool.query(
-      `SELECT id, valor_cobrado, pagamento_status, psicologo_nome, horario_agendado
+      `SELECT id, valor_cobrado, pagamento_status, status, psicologo_id, psicologo_nome, horario_agendado
          FROM agendamentos_psicologia WHERE id = $1 LIMIT 1`,
       [agendamentoId]
     );
-    if (agRes.rowCount === 0) return res.status(404).json({ ok: false, error: 'Agendamento não encontrado' });
     const ag = agRes.rows[0];
-    if (ag.pagamento_status === 'confirmado') return res.status(409).json({ ok: false, error: 'Já pago' });
+    const elegivel = agendamentoAceitaCobranca(ag);
+    if (!elegivel.ok) return res.status(elegivel.status).json({ ok: false, error: elegivel.error });
 
-    // Re-valida conflito de horário antes de cobrar no cartão (race condition)
+    // Re-valida horário/conflito antes de cobrar no cartão (race condition)
     const slotStartE = new Date(ag.horario_agendado);
-    const slotEndE   = new Date(slotStartE.getTime() + 60 * 60 * 1000);
-    const conflitoE  = await pool.query(
-      `SELECT id FROM agendamentos_psicologia
-        WHERE psicologo_id = (SELECT psicologo_id FROM agendamentos_psicologia WHERE id = $1)
-          AND horario_agendado >= $2 AND horario_agendado < $3
-	          AND id <> $1
-	          AND status NOT IN ('cancelado')
-	          AND (pagamento_status = 'confirmado' OR criado_em > NOW() - INTERVAL '35 minutes')
-	        LIMIT 1`,
-      [agendamentoId, slotStartE.toISOString(), slotEndE.toISOString()]
-    );
-    if (conflitoE.rowCount > 0) {
-      await pool.query(`UPDATE agendamentos_psicologia SET status='cancelado' WHERE id=$1`, [agendamentoId]);
+    if (slotStartE.getTime() <= Date.now()) {
+      return res.status(409).json({ ok: false, error: 'Este horário já passou. Escolha outro.' });
+    }
+    if (await buscarConflitoAgenda(pool, 'psicologia', ag.psicologo_id, slotStartE.toISOString(), agendamentoId)) {
+      await pool.query(`UPDATE agendamentos_psicologia SET status='cancelado' WHERE id=$1 AND pagamento_status <> 'confirmado'`, [agendamentoId]);
       return res.status(409).json({ ok: false, error: 'Horário indisponível. Por favor, escolha outro horário.' });
     }
 
-    const valorCentavos = Math.round(parseFloat(ag.valor_cobrado) * 100);
+    const valorCentavos = elegivel.valorCentavos;
+    if (!iniciarCobrancaCartao(lockCartao)) {
+      return res.status(409).json({ ok: false, error: 'Já existe um pagamento em processamento para este agendamento. Aguarde alguns segundos.' });
+    }
+    lockAdquirido = true;
 
     const efiToken   = await efiGetToken();
     const headers    = { Authorization: `Bearer ${efiToken}`, 'Content-Type': 'application/json' };
@@ -6741,7 +7041,7 @@ app.post('/api/psicologia/efi/cartao/cobrar', rlGeral, async (req, res) => {
             phone_number: telefoneLimpoPsi,
             ...(nascimentoEfiPsi ? { birth: nascimentoEfiPsi } : {})
           },
-          installments:  Math.max(1, parseInt(parcelas) || 1),
+          installments:  Math.min(12, Math.max(1, parseInt(parcelas) || 1)),
           payment_token: payment_token.trim(),
           billing_address: { street: 'Rua da Consulta', number: '1', neighborhood: 'Centro', zipcode: '65000000', city: 'São Luís', complement: '', state: 'MA' }
         }
@@ -6759,21 +7059,12 @@ app.post('/api/psicologia/efi/cartao/cobrar', rlGeral, async (req, res) => {
       if (status === 'paid' || status === 'approved') {
         const { rows } = await pool.query(
           `UPDATE agendamentos_psicologia
-              SET pagamento_status = 'confirmado', pagamento_confirmado_em = NOW(), status = 'confirmado',
-                  status_sessao = 'pago',
-                  valor_repasse = ROUND(valor_cobrado * (1 - $2::numeric / 100), 2)
+              SET ${PSI_CONFIRMAR_SET_SQL}
             WHERE id = $1 AND pagamento_status = 'pendente'
-            RETURNING id, paciente_nome, psicologo_nome, horario_agendado, valor_cobrado, paciente_email, tipo_consulta`,
+            RETURNING ${PSI_CONFIRMAR_RETURNING_SQL}`,
           [agendamentoId, PSI_COMISSAO_PCT]
         );
-        if (rows[0]) {
-          const psiRes2 = await pool.query(`SELECT email FROM psicologos WHERE nome_exibicao=$1 OR nome=$1 LIMIT 1`, [rows[0].psicologo_nome]);
-          rows[0].psicologo_email = psiRes2.rows[0]?.email || null;
-          enviarEmailAdminPsicologia(rows[0]).catch(() => {});
-          enviarEmailConfirmacaoPacientePsi(rows[0]).catch(() => {});
-          enviarEmailNotificacaoPsicologo(rows[0]).catch(() => {});
-          enviarEmailConviteContaGuest({ nome: rows[0].paciente_nome, email: rows[0].paciente_email, psicologo: rows[0].psicologo_nome, horario: rows[0].horario_agendado }).catch(() => {});
-        }
+        if (rows[0]) await notificarPsiConfirmado(rows[0]);
       }
       return res.json({ ok: true, charge_id: chargeId, status });
     }
@@ -6782,6 +7073,8 @@ app.post('/api/psicologia/efi/cartao/cobrar', rlGeral, async (req, res) => {
     const msg = e.response?.data?.error_description || e.response?.data?.message || e.message || 'Erro ao processar cartão';
     console.error('[PSI-EFI-CARTAO] Erro:', msg);
     return res.status(500).json({ ok: false, error: msg });
+  } finally {
+    if (lockAdquirido) finalizarCobrancaCartao(lockCartao);
   }
 });
 
@@ -6792,32 +7085,22 @@ app.post('/api/psicologia/efi/cartao/webhook', async (req, res) => {
     const notificationToken = req.body?.notification;
     if (!notificationToken) return;
     const efiToken = await efiGetToken();
-    const notifRes = await axios.get(`${EFI_BASE_URL}/v1/notification/${notificationToken}`, {
+    if (typeof notificationToken !== 'string' || !/^[A-Za-z0-9_-]{1,200}$/.test(notificationToken)) return;
+    const notifRes = await axios.get(`${EFI_BASE_URL}/v1/notification/${encodeURIComponent(notificationToken)}`, {
       httpsAgent: getEfiAgent(),
       headers: { Authorization: `Bearer ${efiToken}`, 'Content-Type': 'application/json' }
     });
-    const charges = notifRes.data?.data || [];
-    for (const charge of charges) {
-      if (charge.status !== 'paid') continue;
-      const chargeId = String(charge.charge_id || charge.id || '');
-      if (!chargeId) continue;
+    for (const chargeId of extrairCobrancasPagasEfi(notifRes.data?.data)) {
       const { rows } = await pool.query(
         `UPDATE agendamentos_psicologia
-            SET pagamento_status = 'confirmado', pagamento_confirmado_em = NOW(), status = 'confirmado',
-                status_sessao = 'pago',
-                valor_repasse = ROUND(valor_cobrado * (1 - $2::numeric / 100), 2)
+            SET ${PSI_CONFIRMAR_SET_SQL}
           WHERE efi_charge_id = $1 AND pagamento_status = 'pendente'
-          RETURNING id, paciente_nome, psicologo_nome, horario_agendado, valor_cobrado, paciente_email, tipo_consulta`,
+          RETURNING ${PSI_CONFIRMAR_RETURNING_SQL}`,
         [chargeId, PSI_COMISSAO_PCT]
       );
       if (rows[0]) {
         console.log(`[PSI-EFI-WH] Agendamento #${rows[0].id} confirmado via webhook`);
-        const psiRes3 = await pool.query(`SELECT email FROM psicologos WHERE nome_exibicao=$1 OR nome=$1 LIMIT 1`, [rows[0].psicologo_nome]);
-        rows[0].psicologo_email = psiRes3.rows[0]?.email || null;
-        enviarEmailAdminPsicologia(rows[0]).catch(() => {});
-        enviarEmailConfirmacaoPacientePsi(rows[0]).catch(() => {});
-        enviarEmailNotificacaoPsicologo(rows[0]).catch(() => {});
-        enviarEmailConviteContaGuest({ nome: rows[0].paciente_nome, email: rows[0].paciente_email, psicologo: rows[0].psicologo_nome, horario: rows[0].horario_agendado }).catch(() => {});
+        await notificarPsiConfirmado(rows[0]);
       }
     }
   } catch (e) {
@@ -7258,6 +7541,8 @@ app.patch('/api/psicologo/disponibilidade', authPsicologo, async (req, res) => {
     if (typeof disponibilidade !== 'string') {
       return res.status(400).json({ ok: false, error: 'disponibilidade deve ser texto' });
     }
+    const tamanhoDispPsi = validarTamanhoDisponibilidade(disponibilidade);
+    if (!tamanhoDispPsi.ok) return res.status(400).json({ ok: false, error: tamanhoDispPsi.error });
     await pool.query(
       `UPDATE psicologos SET disponibilidade = $1 WHERE id = $2`,
       [disponibilidade.trim(), req.psicologoId]
@@ -7561,61 +7846,107 @@ async function obterOuCriarPacienteGuest({ nome, email, tel, cpf }) {
 // ATENÇÃO: rota específica ANTES de /:especialidade para evitar captura pelo wildcard
 app.get('/api/especialistas/horarios-ocupados/:especialistaId', rlGeral, async (req, res) => {
   try {
-    const dias = Math.min(parseInt(req.query.dias || '14', 10), 60);
+    const especialistaId = idProfissional(req.params.especialistaId);
+    if (!especialistaId) return res.status(400).json({ ok: false, error: 'ID inválido' });
+    const dias = Math.min(Math.max(parseInt(req.query.dias || '14', 10) || 14, 1), AGENDA_HORIZONTE_DIAS);
     const { rows } = await pool.query(
       `SELECT horario_agendado FROM agendamentos_especialistas
         WHERE especialista_id = $1
-          AND status NOT IN ('cancelado')
+          AND status NOT IN ('cancelado','cancelada')
           AND (pagamento_status = 'confirmado' OR criado_em > NOW() - INTERVAL '35 minutes')
           AND horario_agendado >= NOW()
           AND horario_agendado <= NOW() + ($2 || ' days')::interval
         ORDER BY horario_agendado`,
-      [req.params.especialistaId, dias]
+      [especialistaId, dias]
     );
     return res.json({ ok: true, ocupados: rows.map(r => new Date(r.horario_agendado).toISOString()) });
-  } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
+  } catch(e) { return res.status(500).json({ ok: false, error: 'Não foi possível carregar os horários' }); }
 });
 
-function normalizarDisponibilidadeEspecialista(disponibilidadeBruta, { recorrenteSemanal = false } = {}) {
-  const arr = Array.isArray(disponibilidadeBruta) ? disponibilidadeBruta : [];
-  const agoraTs = Date.now();
-
-  const datas = arr
-    .map((item) => {
-      const valor = item && typeof item === 'object' ? (item.iso || item.data || item.datetime) : item;
-      const d = new Date(valor);
-      return isNaN(d.getTime()) ? null : d;
-    })
-    .filter(Boolean);
+// Disponibilidade explícita (lista de instantes) ou semanal recorrente (id 10 /
+// endocrinologia: cada instante se repete a cada 7 dias). Sempre limitada ao
+// horizonte de 90 dias e a AGENDA_MAX_ITENS_DISPONIBILIDADE itens — nunca
+// inventa horários além do que foi cadastrado.
+function normalizarDisponibilidadeEspecialista(disponibilidadeBruta, { recorrenteSemanal = false, agora = new Date(), horizonteDias = AGENDA_HORIZONTE_DIAS } = {}) {
+  let bruto = disponibilidadeBruta;
+  if (typeof bruto === 'string') {
+    try { bruto = JSON.parse(bruto); } catch (_) { bruto = []; }
+  }
+  const arr = Array.isArray(bruto) ? bruto.slice(0, AGENDA_MAX_ITENS_DISPONIBILIDADE) : [];
+  const agoraTs = agora.getTime();
+  const limiteTs = agoraTs + horizonteDias * 24 * 60 * 60 * 1000;
+  const datas = arr.map(itemParaData).filter(Boolean);
 
   if (!recorrenteSemanal) {
-    return datas
-      .filter((d) => d.getTime() > agoraTs)
-      .sort((a, b) => a.getTime() - b.getTime())
-      .map((d) => d.toISOString());
+    return [...new Set(
+      datas
+        .filter((d) => d.getTime() > agoraTs && d.getTime() <= limiteTs)
+        .map((d) => d.toISOString())
+    )].sort();
   }
 
-  const limiteTs = agoraTs + 60 * 24 * 60 * 60 * 1000;
+  const SEMANA_MS = 7 * 24 * 60 * 60 * 1000;
   const slots = new Set();
-
   for (const original of datas) {
-    let d = new Date(original);
-    while (d.getTime() <= agoraTs) {
-      d = new Date(d.getTime() + 7 * 24 * 60 * 60 * 1000);
-    }
-    while (d.getTime() <= limiteTs) {
-      slots.add(d.toISOString());
-      d = new Date(d.getTime() + 7 * 24 * 60 * 60 * 1000);
-    }
+    let ts = original.getTime();
+    // Avança direto para a primeira ocorrência futura (sem laço semana a semana).
+    if (ts <= agoraTs) ts += Math.ceil((agoraTs - ts + 1) / SEMANA_MS) * SEMANA_MS;
+    for (; ts <= limiteTs; ts += SEMANA_MS) slots.add(new Date(ts).toISOString());
+    if (slots.size >= AGENDA_MAX_ITENS_DISPONIBILIDADE) break;
   }
+  return [...slots].sort().slice(0, AGENDA_MAX_ITENS_DISPONIBILIDADE);
+}
 
-  return [...slots].sort();
+// Especialidades ainda "em breve" na agenda (não listam nem aceitam reserva,
+// independentemente do que estiver cadastrado). Não afeta o fluxo imediato da fila.
+const AGENDA_ESPECIALIDADES_EM_BREVE = new Set(
+  String(process.env.AGENDA_ESPECIALIDADES_EM_BREVE ?? 'geriatria')
+    .split(',').map((e) => e.trim().toLowerCase()).filter(Boolean)
+);
+function especialidadeEmBreve(especialidade) {
+  return AGENDA_ESPECIALIDADES_EM_BREVE.has(String(especialidade || '').trim().toLowerCase());
+}
+
+function especialistaRecorrenteSemanal(esp) {
+  return Number(esp?.id) === 10 || String(esp?.especialidade || '').toLowerCase() === 'endocrinologia';
+}
+
+// Reservas ativas de vários especialistas numa única query (sem N+1).
+async function mapaOcupadosEspecialistas(ids, inicioUtc, fimUtc) {
+  const mapa = new Map();
+  const lista = [...new Set(ids.map(Number).filter((n) => Number.isInteger(n) && n > 0))];
+  if (!lista.length) return mapa;
+  const { rows } = await pool.query(
+    `SELECT especialista_id, horario_agendado FROM agendamentos_especialistas
+      WHERE especialista_id = ANY($1::int[])
+        AND horario_agendado > ($2::timestamp - make_interval(mins => $4::int))
+        AND horario_agendado < ($3::timestamp + make_interval(mins => $4::int))
+        AND status NOT IN ('cancelado','cancelada')
+        AND (pagamento_status = 'confirmado' OR criado_em > NOW() - INTERVAL '35 minutes')
+      ORDER BY horario_agendado
+      LIMIT 5000`,
+    [lista, inicioUtc.toISOString(), fimUtc.toISOString(), ESP_DURACAO_MIN]
+  );
+  for (const r of rows) {
+    const id = Number(r.especialista_id);
+    if (!mapa.has(id)) mapa.set(id, []);
+    mapa.get(id).push(new Date(r.horario_agendado));
+  }
+  return mapa;
+}
+
+function removerOcupadosIso(isos, ocupados) {
+  if (!ocupados || !ocupados.length) return isos;
+  return removerOcupados(isos.map((i) => new Date(i)), ocupados, ESP_DURACAO_MIN).map((d) => d.toISOString());
 }
 
 // ── ESPECIALISTAS: listar por especialidade ───────────────────────────────────
 // Wildcard — deve ficar DEPOIS das rotas específicas
 app.get('/api/especialistas/:especialidade', rlGeral, async (req, res) => {
   try {
+    if (especialidadeEmBreve(req.params.especialidade)) {
+      return res.json({ ok: true, em_breve: true, especialistas: [] });
+    }
 const { rows } = await pool.query(
       `SELECT id, nome_exibicao, especialidade, crm, rqe, uf, valor_consulta, foto_url, bio, disponibilidade
           FROM especialistas
@@ -7623,12 +7954,30 @@ const { rows } = await pool.query(
          ORDER BY id ASC`,
       [req.params.especialidade]
     );
-    const especialistas = rows.map((esp) => ({
+    const agora = new Date();
+    const normalizados = rows.map((esp) => ({
       ...esp,
-      disponibilidade: normalizarDisponibilidadeEspecialista(esp.disponibilidade, { recorrenteSemanal: esp.id === 10 || String(esp.especialidade || '').toLowerCase() === 'endocrinologia' }),
+      disponibilidade: normalizarDisponibilidadeEspecialista(esp.disponibilidade, { recorrenteSemanal: especialistaRecorrenteSemanal(esp), agora }),
+    }));
+    // Remove horários já reservados (antes o paciente só descobria no 409).
+    let ocupados = new Map();
+    if (normalizados.some((e) => e.disponibilidade.length)) {
+      try {
+        ocupados = await mapaOcupadosEspecialistas(
+          normalizados.filter((e) => e.disponibilidade.length).map((e) => e.id),
+          agora,
+          new Date(agora.getTime() + AGENDA_HORIZONTE_DIAS * 24 * 60 * 60 * 1000)
+        );
+      } catch (e) {
+        console.warn('[ESP-LISTA] Falha ao filtrar ocupados (seguindo sem filtro):', e.message);
+      }
+    }
+    const especialistas = normalizados.map((esp) => ({
+      ...esp,
+      disponibilidade: removerOcupadosIso(esp.disponibilidade, ocupados.get(Number(esp.id))),
     }));
     return res.json({ ok: true, especialistas });
-  } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
+  } catch(e) { return res.status(500).json({ ok: false, error: 'Não foi possível carregar os especialistas' }); }
 });
 
 // ── ESPECIALISTAS: horários ocupados por especialista ────────────────────────
@@ -7641,8 +7990,58 @@ app.get('/api/especialistas/:especialistaId/horarios', rlGeral, async (req, res)
       [espId]
     );
     if (!rows.length) return res.status(404).json({ ok: false, error: 'Especialista não encontrado' });
-    return res.json({ ok: true, disponibilidade: normalizarDisponibilidadeEspecialista(rows[0].disponibilidade, { recorrenteSemanal: espId === 10 || String(rows[0].especialidade || '').toLowerCase() === 'endocrinologia' }) });
-  } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
+    if (especialidadeEmBreve(rows[0].especialidade)) return res.json({ ok: true, em_breve: true, disponibilidade: [] });
+    const agora = new Date();
+    const disp = normalizarDisponibilidadeEspecialista(rows[0].disponibilidade, { recorrenteSemanal: especialistaRecorrenteSemanal({ id: espId, especialidade: rows[0].especialidade }), agora });
+    const ocupados = disp.length
+      ? await listarOcupadosAgenda('especialistas', espId, agora, new Date(agora.getTime() + AGENDA_HORIZONTE_DIAS * 24 * 60 * 60 * 1000))
+      : [];
+    return res.json({ ok: true, disponibilidade: removerOcupadosIso(disp, ocupados) });
+  } catch(e) { return res.status(500).json({ ok: false, error: 'Não foi possível carregar os horários' }); }
+});
+
+// ── ESPECIALISTAS: slots paginados por janela (sob demanda) ─────────────────
+// GET /api/especialistas/slots/:especialistaId?inicio=AAAA-MM-DD&dias=7&limite=120
+app.get('/api/especialistas/slots/:especialistaId', rlGeral, async (req, res) => {
+  try {
+    const espId = idProfissional(req.params.especialistaId);
+    if (!espId) return res.status(400).json({ ok: false, error: 'ID inválido' });
+    const agora = new Date();
+    const janela = resolverJanela({ inicio: req.query.inicio, dias: req.query.dias, agora });
+    if (!janela.ok) return res.status(400).json({ ok: false, error: janela.error });
+    const { rows } = await pool.query(
+      `SELECT id, especialidade, disponibilidade FROM especialistas
+        WHERE id = $1 AND ativo = true AND (visivel = true OR visivel IS NULL) LIMIT 1`,
+      [espId]
+    );
+    if (!rows.length) return res.status(404).json({ ok: false, error: 'Especialista não encontrado' });
+    const emBreve = especialidadeEmBreve(rows[0].especialidade);
+    const disp = emBreve ? [] : normalizarDisponibilidadeEspecialista(rows[0].disponibilidade, { recorrenteSemanal: especialistaRecorrenteSemanal(rows[0]), agora });
+    const candidatos = filtrarSlotsExplicitos(disp, janela, { agora });
+    const ocupados = candidatos.length
+      ? await listarOcupadosAgenda('especialistas', espId, janela.inicioUtc, janela.fimUtc)
+      : [];
+    const livres = removerOcupados(candidatos, ocupados, ESP_DURACAO_MIN);
+    const pagina = paginarSlotsPorDia(livres, { limite: req.query.limite, proximoInicioJanela: janela.proximoInicio });
+    res.set('Cache-Control', 'no-store');
+    return res.json({
+      ok: true,
+      timezone: AGENDA_TZ,
+      horizonte_dias: AGENDA_HORIZONTE_DIAS,
+      duracao_min: ESP_DURACAO_MIN,
+      ...(emBreve ? { em_breve: true } : {}),
+      inicio: janela.inicio,
+      fim: janela.fim,
+      dias: janela.dias,
+      limite: pagina.limite,
+      truncado: pagina.truncado,
+      proximo_inicio: pagina.proximoInicio,
+      slots: pagina.slots,
+    });
+  } catch (e) {
+    console.error('[ESP-SLOTS] Erro:', e.message);
+    return res.status(500).json({ ok: false, error: 'Não foi possível carregar os horários' });
+  }
 });
 
 async function notificarAgendamentoEspecialistaConfirmado(agendamentoId) {
@@ -7667,7 +8066,10 @@ async function notificarAgendamentoEspecialistaConfirmado(agendamentoId) {
     hour: '2-digit',
     minute: '2-digit'
   });
-  const linkPaciente = `${SITE_URL}/paciente.html`;
+  // SITE_URL não existe no escopo do módulo: a ReferenceError abortava todos os
+  // e-mails de confirmação de especialistas (paciente, médico, admin, convite).
+  const siteUrl = String(process.env.SITE_URL || 'https://consultaja24h.com.br').replace(/\/+$/, '');
+  const linkPaciente = `${siteUrl}/paciente.html`;
   await Promise.allSettled([
     enviarEmailConfirmacaoPaciente({
       nome: ag.paciente_nome,
@@ -7725,37 +8127,32 @@ app.post('/api/especialistas/agendamento/criar', rlGeral, async (req, res) => {
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailNorm)) {
       return res.status(400).json({ ok: false, error: 'E-mail inválido' });
     }
+    const espIdNum = idProfissional(especialistaId);
+    if (!espIdNum) return res.status(400).json({ ok: false, error: 'Especialista inválido' });
     const espRes = await pool.query(
       `SELECT id, nome_exibicao, especialidade, valor_consulta, ativo, disponibilidade
          FROM especialistas WHERE id = $1 LIMIT 1`,
-      [especialistaId]
+      [espIdNum]
     );
     if (espRes.rowCount === 0) {
       return res.status(404).json({ ok: false, error: 'Especialista não encontrado. Verifique o ID no HTML.' });
     }
-    if (!espRes.rows[0].ativo) {
+    if (!espRes.rows[0].ativo || especialidadeEmBreve(espRes.rows[0].especialidade)) {
       return res.status(400).json({ ok: false, error: 'Especialista temporariamente indisponível.' });
     }
     const esp = espRes.rows[0];
     const modalidadeFinal = String(modalidade || 'video').toLowerCase() === 'chat' ? 'chat' : 'video';
     const slotStart = new Date(horario_agendado);
     if (isNaN(slotStart.getTime())) return res.status(400).json({ ok: false, error: 'Horário inválido' });
-    const disponibilidade = normalizarDisponibilidadeEspecialista(esp.disponibilidade, { recorrenteSemanal: esp.id === 10 || String(esp.especialidade || '').toLowerCase() === 'endocrinologia' });
+    // Só aceita horário cadastrado, futuro e dentro do horizonte de 90 dias.
+    const disponibilidade = normalizarDisponibilidadeEspecialista(esp.disponibilidade, { recorrenteSemanal: especialistaRecorrenteSemanal(esp) });
     const slotAutorizado = disponibilidade.some(slot => new Date(slot).getTime() === slotStart.getTime());
     if (!slotAutorizado) {
       return res.status(409).json({ ok: false, error: 'Este horário não está mais disponível. Escolha outro.' });
     }
-    const slotEnd = new Date(slotStart.getTime() + 60 * 60 * 1000);
-    const conflito = await pool.query(
-      `SELECT id FROM agendamentos_especialistas
-        WHERE especialista_id = $1
-          AND horario_agendado >= $2 AND horario_agendado < $3
-          AND status NOT IN ('cancelado')
-          AND (pagamento_status = 'confirmado' OR criado_em > NOW() - INTERVAL '35 minutes')
-        LIMIT 1`,
-      [especialistaId, slotStart.toISOString(), slotEnd.toISOString()]
-    );
-    if (conflito.rowCount > 0) return res.status(409).json({ ok: false, error: 'Horário indisponível. Escolha outro.' });
+    if (await buscarConflitoAgenda(pool, 'especialistas', espIdNum, slotStart.toISOString())) {
+      return res.status(409).json({ ok: false, error: 'Horário indisponível. Escolha outro.' });
+    }
     if (!pacienteId) {
       try {
         pacienteId = await obterOuCriarPacienteGuest({
@@ -7769,18 +8166,23 @@ app.post('/api/especialistas/agendamento/criar', rlGeral, async (req, res) => {
         return res.status(500).json({ ok: false, error: 'Não foi possível preparar o acesso do paciente' });
       }
     }
-    const result = await pool.query(
-      `INSERT INTO agendamentos_especialistas
-        (especialista_id, especialista_nome, especialidade, paciente_nome, paciente_email,
-         paciente_tel, paciente_cpf, horario_agendado, valor_cobrado, paciente_id, modalidade)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-       RETURNING id, valor_cobrado`,
-      [especialistaId, esp.nome_exibicao, esp.especialidade, paciente_nome, emailNorm,
-       paciente_tel||'', paciente_cpf||'', slotStart.toISOString(), esp.valor_consulta, pacienteId, modalidadeFinal]
-    );
-    const ag = result.rows[0];
+    // Revalida conflito e insere sob lock do especialista (atômico).
+    const reserva = await reservarSlotAtomico('especialistas', espIdNum, slotStart.toISOString(), async (db) => {
+      const result = await db.query(
+        `INSERT INTO agendamentos_especialistas
+          (especialista_id, especialista_nome, especialidade, paciente_nome, paciente_email,
+           paciente_tel, paciente_cpf, horario_agendado, valor_cobrado, paciente_id, modalidade)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+         RETURNING id, valor_cobrado`,
+        [espIdNum, esp.nome_exibicao, esp.especialidade, paciente_nome, emailNorm,
+         paciente_tel||'', paciente_cpf||'', slotStart.toISOString(), esp.valor_consulta, pacienteId, modalidadeFinal]
+      );
+      return result.rows[0];
+    });
+    if (reserva.conflito) return res.status(409).json({ ok: false, error: 'Horário indisponível. Escolha outro.' });
+    const ag = reserva.row;
     console.log('[ESP-AGEND] Criado #'+ag.id+' — '+esp.especialidade+'/'+esp.nome_exibicao+(pacienteId?' pac#'+pacienteId:''));
-    return res.json({ ok: true, agendamentoId: ag.id, valor: ag.valor_cobrado });
+    return res.json({ ok: true, agendamentoId: ag.id, valor: ag.valor_cobrado, acessoToken: criarTokenAcessoAgendamento('especialistas', ag.id) });
   } catch(e) {
     console.error('[ESP-AGEND]', e.message);
     return res.status(500).json({ ok: false, error: e.message });
@@ -7790,35 +8192,30 @@ app.post('/api/especialistas/agendamento/criar', rlGeral, async (req, res) => {
 // ── ESPECIALISTAS: PIX PagBank ────────────────────────────────────────────────
 app.post('/api/especialistas/pagbank/order', rlGeral, async (req, res) => {
   try {
-    const { agendamentoId, nome, email, cpf } = req.body || {};
+    const { nome, email, cpf } = req.body || {};
+    const agendamentoId = parseIdAgendamento(req.body?.agendamentoId);
     if (!agendamentoId || !nome || !cpf) return res.status(400).json({ ok: false, error: 'Dados obrigatórios faltando' });
+    if (typeof nome !== 'string' || typeof cpf !== 'string') return res.status(400).json({ ok: false, error: 'Dados inválidos' });
     if (!PAGBANK_TOKEN) return res.status(503).json({ ok: false, error: 'Gateway indisponível' });
     const agRes = await pool.query(
-      `SELECT id, valor_cobrado, pagamento_status, especialista_nome, especialidade,
+      `SELECT id, valor_cobrado, pagamento_status, status, especialista_nome, especialidade,
               horario_agendado, especialista_id
          FROM agendamentos_especialistas WHERE id = $1 LIMIT 1`,
       [agendamentoId]
     );
-    if (agRes.rowCount === 0) return res.status(404).json({ ok: false, error: 'Agendamento não encontrado' });
     const ag = agRes.rows[0];
-    if (ag.pagamento_status === 'confirmado') return res.status(409).json({ ok: false, error: 'Já pago' });
-    // Re-verifica conflito (race condition)
+    const elegivel = agendamentoAceitaCobranca(ag);
+    if (!elegivel.ok) return res.status(elegivel.status).json({ ok: false, error: elegivel.status === 409 && ag?.pagamento_status === 'confirmado' ? 'Já pago' : elegivel.error });
+    // Re-verifica horário/conflito (race condition)
     const slotStart = new Date(ag.horario_agendado);
-    const slotEnd   = new Date(slotStart.getTime() + 60 * 60 * 1000);
-    const conflito  = await pool.query(
-      `SELECT id FROM agendamentos_especialistas
-        WHERE especialista_id = $1 AND horario_agendado >= $2 AND horario_agendado < $3
-          AND id <> $4 AND status NOT IN ('cancelado')
-          AND (pagamento_status = 'confirmado' OR criado_em > NOW() - INTERVAL '35 minutes')
-        LIMIT 1`,
-      [ag.especialista_id, slotStart.toISOString(), slotEnd.toISOString(), agendamentoId]
-    );
-    if (conflito.rowCount > 0) {
-      await pool.query(`UPDATE agendamentos_especialistas SET status='cancelado' WHERE id=$1`, [agendamentoId]);
+    if (slotStart.getTime() <= Date.now()) {
+      return res.status(409).json({ ok: false, error: 'Este horário já passou. Escolha outro.' });
+    }
+    if (await buscarConflitoAgenda(pool, 'especialistas', ag.especialista_id, slotStart.toISOString(), agendamentoId)) {
+      await pool.query(`UPDATE agendamentos_especialistas SET status='cancelado' WHERE id=$1 AND pagamento_status <> 'confirmado'`, [agendamentoId]);
       return res.status(409).json({ ok: false, error: 'Horário indisponível. Escolha outro.' });
     }
-    const valorCentavos = Math.round(parseFloat(ag.valor_cobrado) * 100);
-    const expiracao = new Date(Date.now() + 30 * 60 * 1000);
+    const valorCentavos = elegivel.valorCentavos;
     const orderBody = {
       reference_id: 'CJ-ESP-'+agendamentoId+'-'+Date.now(),
       customer: {
@@ -7827,7 +8224,7 @@ app.post('/api/especialistas/pagbank/order', rlGeral, async (req, res) => {
         tax_id: cpf.replace(/\D/g, '')
       },
       items: [{ name: 'Consulta '+ag.especialidade+' — '+ag.especialista_nome, quantity: 1, unit_amount: valorCentavos }],
-      qr_codes: [{ amount: { value: valorCentavos }, expiration_date: expiracao.toISOString().replace('Z', '-03:00') }],
+      qr_codes: [{ amount: { value: valorCentavos }, expiration_date: expiracaoPixFortaleza(30) }],
       notification_urls: [`${process.env.API_URL || 'https://triagem-api.onrender.com'}/api/especialistas/pagbank/webhook`]
     };
     const response = await fetch(`${PAGBANK_URL}/orders`, {
@@ -7866,16 +8263,11 @@ app.post('/api/especialistas/pagbank/webhook', async (req, res) => {
   const pago    = charges.some(c => c.status === 'PAID');
   if (!pago || !orderId) return;
   try {
-    const { rows } = await pool.query(
-      `UPDATE agendamentos_especialistas
-          SET pagamento_status = 'confirmado', pagamento_confirmado_em = NOW(), status = 'confirmado'
-        WHERE pagbank_order_id = $1 AND pagamento_status = 'pendente'
-        RETURNING id, paciente_nome, paciente_email, especialista_nome, especialidade,
-                  horario_agendado, valor_cobrado`,
-      [orderId]
-    );
-    if (rows.length === 0) { console.log('[ESP-WH] Order não encontrada ou já processada:', orderId); return; }
-    const ag = rows[0];
+    // O corpo do webhook não é autenticado: confirma somente o que a API do PagBank atesta.
+    const pedido = await consultarPedidoPagBank(orderId);
+    if (!pedido?.pago) { console.warn('[ESP-WH] Pedido não confirmado na API PagBank — ignorado:', orderId); return; }
+    const ag = await confirmarEspPorPedidoPagBank(pedido);
+    if (!ag) { console.log('[ESP-WH] Order não encontrada ou já processada:', orderId); return; }
     console.log('[ESP-WH] Confirmado #'+ag.id+' — '+ag.especialidade+'/'+ag.especialista_nome);
     const agora = new Date().toLocaleString('pt-BR', { timeZone: 'America/Fortaleza' });
     appendToSheet('Especialistas_Confirmados', [
@@ -7891,32 +8283,22 @@ app.post('/api/especialistas/pagbank/webhook', async (req, res) => {
 // ── ESPECIALISTAS: polling status ─────────────────────────────────────────────
 app.get('/api/especialistas/agendamento/:id/status', rlGeral, async (req, res) => {
   try {
+    const agId = parseIdAgendamento(req.params.id);
+    if (!agId) return res.status(404).json({ ok: false, error: 'Não encontrado' });
     const { rows } = await pool.query(
       `SELECT id, pagamento_status, status, valor_cobrado, especialista_nome, especialidade,
-              horario_agendado, pagbank_order_id
+              horario_agendado, pagbank_order_id, paciente_id
          FROM agendamentos_especialistas WHERE id = $1 LIMIT 1`,
-      [req.params.id]
+      [agId]
     );
     if (rows.length === 0) return res.status(404).json({ ok: false, error: 'Não encontrado' });
     const ag = rows[0];
     if (ag.pagamento_status === 'pendente' && ag.pagbank_order_id && PAGBANK_TOKEN) {
       try {
-        const pbRes = await fetch(`${PAGBANK_URL}/orders/${ag.pagbank_order_id}`, {
-          headers: { Authorization: `Bearer ${PAGBANK_TOKEN}`, accept: 'application/json' }
-        });
-        const pbData = await pbRes.json();
-        const pago = pbData.charges?.some(c => c.status === 'PAID') || false;
-        if (pago) {
-          const up = await pool.query(
-            `UPDATE agendamentos_especialistas
-                SET pagamento_status = 'confirmado', pagamento_confirmado_em = NOW(), status = 'confirmado'
-              WHERE id = $1 AND pagamento_status = 'pendente'
-              RETURNING id, paciente_nome, paciente_email, especialista_nome, especialidade,
-                        horario_agendado, valor_cobrado, pagamento_status, status, pagbank_order_id`,
-            [ag.id]
-          );
-          if (up.rows[0]) {
-            const confirmado = up.rows[0];
+        const pedido = await consultarPedidoPagBank(ag.pagbank_order_id);
+        if (pedido?.pago) {
+          const confirmado = await confirmarEspPorPedidoPagBank(pedido);
+          if (confirmado) {
             appendToSheet('Especialistas_Confirmados', [
               new Date().toLocaleString('pt-BR', { timeZone: 'America/Fortaleza' }),
               confirmado.id, confirmado.paciente_nome, confirmado.paciente_email || '',
@@ -7926,18 +8308,20 @@ app.get('/api/especialistas/agendamento/:id/status', rlGeral, async (req, res) =
               'pix_status_fallback'
             ]).catch(()=>{});
             notificarAgendamentoEspecialistaConfirmado(confirmado.id).catch(e => console.error('[ESP-NOTIFY]', e.message));
-            Object.assign(ag, {
-              pagamento_status: confirmado.pagamento_status,
-              status: confirmado.status,
-            });
           }
+          const { rows: atual } = await pool.query(
+            `SELECT pagamento_status, status FROM agendamentos_especialistas WHERE id = $1`, [ag.id]
+          );
+          if (atual[0]) Object.assign(ag, atual[0]);
         }
       } catch (e) {
         console.warn('[ESP-STATUS] Falha ao consultar PagBank:', e.message);
       }
     }
-    return res.json({ ok: true, agendamento: ag });
-  } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
+    const autorizado = acessoAgendamentoAutorizado(req, 'especialistas', ag);
+    res.set('Cache-Control', 'no-store');
+    return res.json({ ok: true, agendamento: serializarStatusAgendamento('especialistas', ag, { autorizado }) });
+  } catch(e) { return res.status(500).json({ ok: false, error: 'Não foi possível consultar o agendamento' }); }
 });
 
 // ── ESPECIALISTAS: admin — cadastrar especialista ─────────────────────────────
@@ -8040,11 +8424,16 @@ const authEspecialista = async (req, res, next) => {
 app.post('/api/especialista/login', rlLogin, async (req, res) => {
   try {
     const { email, senha } = req.body || {};
-    if (!email || !senha) return res.status(400).json({ ok: false, error: 'Email e senha obrigatórios' });
+    if (!email || !senha || typeof email !== 'string' || typeof senha !== 'string') {
+      return res.status(400).json({ ok: false, error: 'Email e senha obrigatórios' });
+    }
+    // LOWER(email): cadastros antigos/importados podem ter maiúsculas — o
+    // "esqueci senha" já comparava assim e o login falhava para essas contas.
     const { rows } = await pool.query(
       `SELECT id, nome, nome_exibicao, especialidade, crm, uf,
               email, senha_hash, precisa_trocar_senha, ativo
-         FROM especialistas WHERE email = $1 LIMIT 1`,
+         FROM especialistas WHERE LOWER(email) = LOWER($1)
+        ORDER BY ativo DESC, id ASC LIMIT 1`,
       [email.toLowerCase().trim()]
     );
     if (!rows.length) return res.status(401).json({ ok: false, error: 'Credenciais inválidas' });
@@ -8052,7 +8441,7 @@ app.post('/api/especialista/login', rlLogin, async (req, res) => {
     if (!esp.ativo) return res.status(403).json({ ok: false, error: 'Seu cadastro está inativo' });
     if (medicoBloqueado(esp)) return res.status(403).json({ ok: false, error: 'Acesso desativado.' });
     if (!esp.senha_hash) return res.status(401).json({ ok: false, error: 'Senha não configurada. Use "Esqueci minha senha".' });
-    const match = await bcrypt.compare(senha, esp.senha_hash);
+    const match = await bcrypt.compare(senha, esp.senha_hash).catch(() => false);
     if (!match) return res.status(401).json({ ok: false, error: 'Credenciais inválidas' });
     const tok = jwt.sign({ id: esp.id, tipo: 'especialista', email: esp.email }, JWT_SECRET, { expiresIn: '7d' });
     return res.json({
@@ -8067,7 +8456,10 @@ app.post('/api/especialista/login', rlLogin, async (req, res) => {
       },
       precisa_trocar_senha: !!esp.precisa_trocar_senha,
     });
-  } catch(e) { return res.status(500).json({ ok: false, error: e.message }); }
+  } catch(e) {
+    console.error('[ESP-LOGIN] Erro:', e.message);
+    return res.status(500).json({ ok: false, error: 'Erro interno no login' });
+  }
 });
 
 // ── ESPECIALISTA: esqueci senha ──────────────────────────────────────────────
@@ -8075,21 +8467,21 @@ app.post('/api/especialista/esqueci-senha', rlLogin, async (req, res) => {
   // Sempre responde ok=true — não expõe se e-mail existe
   try {
     const { email } = req.body || {};
-    if (!email) return res.json({ ok: true });
+    if (!email || typeof email !== 'string') return res.json({ ok: true });
     const { rows } = await pool.query(
       `SELECT id, nome, nome_exibicao, email FROM especialistas
         WHERE LOWER(email) = LOWER($1) AND ativo = true LIMIT 1`,
       [email.trim()]
     );
     if (!rows.length) {
-      console.warn(`[ESP-RECOVERY] E-mail nao encontrado/ativo: ${String(email).trim().toLowerCase()}`);
+      console.warn('[ESP-RECOVERY] E-mail nao encontrado/ativo');
       return res.json({ ok: true });
     }
     const esp = rows[0];
     if (medicoBloqueado(esp)) return res.json({ ok: true });
     const chars = 'abcdefghjkmnpqrstuvwxyz23456789';
     let senhaTemp = '';
-    for (let i = 0; i < 8; i++) senhaTemp += chars[Math.floor(Math.random() * chars.length)];
+    for (let i = 0; i < 10; i++) senhaTemp += chars[randomInt(chars.length)];
     const hash = await bcrypt.hash(senhaTemp, 10);
     await pool.query(
       `UPDATE especialistas SET senha_hash = $1, precisa_trocar_senha = true WHERE id = $2`,
@@ -8113,8 +8505,7 @@ app.post('/api/especialista/esqueci-senha', rlLogin, async (req, res) => {
         <p style="color:#999;font-size:.78rem;margin-top:16px">Se você não solicitou este acesso, ignore este e-mail.</p>
       </div>
     </div>`;
-    console.log(`[ESP-RECOVERY] Tentando enviar email para: ${esp.email}`);
-    console.log(`[ESP-RECOVERY] SENHA TEMP (debug): ${senhaTemp}`);
+    console.log(`[ESP-RECOVERY] Enviando senha temporária para especialista #${esp.id}`);
     const resendRes = await fetch('https://api.resend.com/emails', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${RESEND_KEY}` },
@@ -8173,6 +8564,8 @@ app.patch('/api/admin/especialista/:id/disponibilidade', checkAdmin, async (req,
     if (!id || isNaN(id)) return res.status(400).json({ ok: false, error: 'ID inválido' });
     const { disponibilidade } = req.body || {};
     if (!Array.isArray(disponibilidade)) return res.status(400).json({ ok: false, error: 'Disponibilidade deve ser um array' });
+    const tamanhoDispAdmin = validarTamanhoDisponibilidade(disponibilidade);
+    if (!tamanhoDispAdmin.ok) return res.status(400).json({ ok: false, error: tamanhoDispAdmin.error });
     const { rows } = await pool.query(
       `UPDATE especialistas SET disponibilidade = $1::jsonb WHERE id = $2 RETURNING id, nome_exibicao`,
       [JSON.stringify(disponibilidade), id]
@@ -8205,10 +8598,21 @@ app.patch('/api/especialista/perfil', authEspecialista, async (req, res) => {
     let idx = 1;
     if (nome_exibicao !== undefined) { updates.push(`nome_exibicao = $${idx++}`); params.push(nome_exibicao.trim()); }
     if (bio !== undefined) { updates.push(`bio = $${idx++}`); params.push(bio.trim()); }
-    if (valor_consulta !== undefined) { updates.push(`valor_consulta = $${idx++}`); params.push(parseFloat(valor_consulta)); }
-    if (crm !== undefined) { updates.push(`crm = $${idx++}`); params.push(crm.trim().toUpperCase()); }
-    if (rqe !== undefined) { updates.push(`rqe = $${idx++}`); params.push(rqe.trim() || null); }
-    if (uf !== undefined) { updates.push(`uf = $${idx++}`); params.push(uf.trim().toUpperCase()); }
+    for (const [campo, valor] of Object.entries({ nome_exibicao, bio, crm, rqe, uf })) {
+      if (valor !== undefined && valor !== null && typeof valor !== 'string') {
+        return res.status(400).json({ ok: false, error: `Campo ${campo} inválido` });
+      }
+    }
+    if (valor_consulta !== undefined) {
+      const valorNum = parseFloat(String(valor_consulta).replace(',', '.'));
+      if (!Number.isFinite(valorNum) || valorNum <= 0 || valorNum > 10000) {
+        return res.status(400).json({ ok: false, error: 'Valor da consulta inválido' });
+      }
+      updates.push(`valor_consulta = $${idx++}`); params.push(valorNum);
+    }
+    if (crm !== undefined) { updates.push(`crm = $${idx++}`); params.push(String(crm || '').trim().toUpperCase()); }
+    if (rqe !== undefined) { updates.push(`rqe = $${idx++}`); params.push(String(rqe || '').trim() || null); }
+    if (uf !== undefined) { updates.push(`uf = $${idx++}`); params.push(String(uf || '').trim().toUpperCase()); }
     if (!updates.length) return res.status(400).json({ ok: false, error: 'Nenhum campo para atualizar' });
     params.push(req.especialistaId);
     const { rows } = await pool.query(`UPDATE especialistas SET ${updates.join(', ')} WHERE id = $${idx} RETURNING id, nome_exibicao, especialidade`, params);
@@ -8223,6 +8627,8 @@ app.patch('/api/especialista/disponibilidade', authEspecialista, async (req, res
     if (!Array.isArray(disponibilidade)) {
       return res.status(400).json({ ok: false, error: 'Disponibilidade inválida' });
     }
+    const tamanhoDisp = validarTamanhoDisponibilidade(disponibilidade);
+    if (!tamanhoDisp.ok) return res.status(400).json({ ok: false, error: tamanhoDisp.error });
     await pool.query(`UPDATE especialistas SET disponibilidade = $1::jsonb WHERE id = $2`, [JSON.stringify(disponibilidade), req.especialistaId]);
     console.log(`[ESP-DISP] Especialista #${req.especialistaId} atualizou disponibilidade`);
     return res.json({ ok: true });
@@ -8486,10 +8892,13 @@ app.post('/api/consulta/:agendamentoId/upload', authPaciente, uploadConsulta, as
 
 // ── ESPECIALISTAS: cartão EFI ─────────────────────────────────────────────────
 app.post('/api/especialistas/efi/cartao/cobrar', rlGeral, async (req, res) => {
+  let lockCartao = null;
+  let lockAdquirido = false;
   try {
-    const { payment_token, nome, cpf, email, telefone, nascimento, parcelas = 1, agendamentoId } = req.body || {};
-    if (!payment_token) return res.status(400).json({ ok: false, error: 'payment_token obrigatório' });
-    if (!nome)          return res.status(400).json({ ok: false, error: 'nome obrigatório' });
+    const { payment_token, nome, cpf, email, telefone, nascimento, parcelas = 1 } = req.body || {};
+    const agendamentoId = parseIdAgendamento(req.body?.agendamentoId ?? req.body?.agendamento_id);
+    if (!payment_token || typeof payment_token !== 'string') return res.status(400).json({ ok: false, error: 'payment_token obrigatório' });
+    if (!nome || typeof nome !== 'string') return res.status(400).json({ ok: false, error: 'nome obrigatório' });
     if (!cpf)           return res.status(400).json({ ok: false, error: 'cpf obrigatório' });
     if (!agendamentoId) return res.status(400).json({ ok: false, error: 'agendamentoId obrigatório' });
     const cpfLimpo = String(cpf).replace(/\D/g, '');
@@ -8499,30 +8908,29 @@ app.post('/api/especialistas/efi/cartao/cobrar', rlGeral, async (req, res) => {
     const telLimpo = String(telefone || '').replace(/\D/g, '');
     if (telLimpo.length < 10)
       return res.status(400).json({ ok: false, error: 'Telefone com DDD obrigatório para cartão' });
+    lockCartao = `esp:${agendamentoId}`;
     const agRes = await pool.query(
-      `SELECT id, valor_cobrado, pagamento_status, especialista_nome, especialidade,
+      `SELECT id, valor_cobrado, pagamento_status, status, especialista_nome, especialidade,
               horario_agendado, especialista_id
          FROM agendamentos_especialistas WHERE id = $1 LIMIT 1`,
       [agendamentoId]
     );
-    if (agRes.rowCount === 0) return res.status(404).json({ ok: false, error: 'Agendamento não encontrado' });
     const ag = agRes.rows[0];
-    if (ag.pagamento_status === 'confirmado') return res.status(409).json({ ok: false, error: 'Já pago' });
+    const elegivel = agendamentoAceitaCobranca(ag);
+    if (!elegivel.ok) return res.status(elegivel.status).json({ ok: false, error: elegivel.status === 409 && ag?.pagamento_status === 'confirmado' ? 'Já pago' : elegivel.error });
     const slotStart = new Date(ag.horario_agendado);
-    const slotEnd   = new Date(slotStart.getTime() + 60 * 60 * 1000);
-    const conflito  = await pool.query(
-      `SELECT id FROM agendamentos_especialistas
-        WHERE especialista_id = $1 AND horario_agendado >= $2 AND horario_agendado < $3
-          AND id <> $4 AND status NOT IN ('cancelado')
-          AND (pagamento_status = 'confirmado' OR criado_em > NOW() - INTERVAL '35 minutes')
-        LIMIT 1`,
-      [ag.especialista_id, slotStart.toISOString(), slotEnd.toISOString(), agendamentoId]
-    );
-    if (conflito.rowCount > 0) {
-      await pool.query(`UPDATE agendamentos_especialistas SET status='cancelado' WHERE id=$1`, [agendamentoId]);
+    if (slotStart.getTime() <= Date.now()) {
+      return res.status(409).json({ ok: false, error: 'Este horário já passou. Escolha outro.' });
+    }
+    if (await buscarConflitoAgenda(pool, 'especialistas', ag.especialista_id, slotStart.toISOString(), agendamentoId)) {
+      await pool.query(`UPDATE agendamentos_especialistas SET status='cancelado' WHERE id=$1 AND pagamento_status <> 'confirmado'`, [agendamentoId]);
       return res.status(409).json({ ok: false, error: 'Horário indisponível. Escolha outro.' });
     }
-    const valorCentavos = Math.round(parseFloat(ag.valor_cobrado) * 100);
+    const valorCentavos = elegivel.valorCentavos;
+    if (!iniciarCobrancaCartao(lockCartao)) {
+      return res.status(409).json({ ok: false, error: 'Já existe um pagamento em processamento para este agendamento. Aguarde alguns segundos.' });
+    }
+    lockAdquirido = true;
     const efiToken   = await efiGetToken();
     const headers    = { Authorization: `Bearer ${efiToken}`, 'Content-Type': 'application/json' };
     const httpsAgent = getEfiAgent();
@@ -8556,12 +8964,15 @@ app.post('/api/especialistas/efi/cartao/cobrar', rlGeral, async (req, res) => {
         [String(chargeId), agendamentoId]
       );
       if (status === 'paid' || status === 'approved') {
-        await pool.query(
+        const conf = await pool.query(
           `UPDATE agendamentos_especialistas
               SET pagamento_status='confirmado', pagamento_confirmado_em=NOW(), status='confirmado'
-            WHERE id=$1 AND pagamento_status='pendente'`,
+            WHERE id=$1 AND pagamento_status='pendente'
+            RETURNING id`,
           [agendamentoId]
         );
+        // Só notifica quem efetivamente confirmou (evita e-mail duplicado com o webhook).
+        if (!conf.rowCount) return res.json({ ok: true, charge_id: chargeId, status, confirmed: true });
         const agora = new Date().toLocaleString('pt-BR', { timeZone: 'America/Fortaleza' });
         appendToSheet('Especialistas_Confirmados', [
           agora, agendamentoId, nome, email||'', ag.especialidade, ag.especialista_nome,
@@ -8577,6 +8988,8 @@ app.post('/api/especialistas/efi/cartao/cobrar', rlGeral, async (req, res) => {
     const msg = e.response?.data?.error_description || e.response?.data?.message || e.message || 'Erro ao processar cartão';
     console.error('[ESP-EFI-CARTAO]', msg);
     return res.status(500).json({ ok: false, error: msg });
+  } finally {
+    if (lockAdquirido) finalizarCobrancaCartao(lockCartao);
   }
 });
 
@@ -8587,13 +9000,11 @@ app.post('/api/especialistas/efi/cartao/webhook', async (req, res) => {
     const notificationToken = req.body?.notification;
     if (!notificationToken) return;
     const efiToken  = await efiGetToken();
-    const notifRes  = await axios.get(`${EFI_BASE_URL}/v1/notification/${notificationToken}`, {
+    if (typeof notificationToken !== 'string' || !/^[A-Za-z0-9_-]{1,200}$/.test(notificationToken)) return;
+    const notifRes  = await axios.get(`${EFI_BASE_URL}/v1/notification/${encodeURIComponent(notificationToken)}`, {
       httpsAgent: getEfiAgent(), headers: { Authorization: `Bearer ${efiToken}`, 'Content-Type': 'application/json' }
     });
-    for (const charge of (notifRes.data?.data || [])) {
-      if (charge.status !== 'paid') continue;
-      const chargeId = String(charge.charge_id || charge.id || '');
-      if (!chargeId) continue;
+    for (const chargeId of extrairCobrancasPagasEfi(notifRes.data?.data)) {
       const { rows } = await pool.query(
         `UPDATE agendamentos_especialistas
             SET pagamento_status='confirmado', pagamento_confirmado_em=NOW(), status='confirmado'
