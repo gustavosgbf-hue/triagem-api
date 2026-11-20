@@ -12800,7 +12800,6 @@ app.post("/api/renovacao/stripe/checkout-session", rlGeral, async (req, res) => 
     }
     const session = await stripe.checkout.sessions.create({
       ui_mode: "embedded_page", mode: "payment",
-      payment_method_types: ["card"],
       line_items: [{ price_data: { currency: "brl", product_data: { name: "Avaliação de renovação de receita — ConsultaJá24h" }, unit_amount: expectedAmount }, quantity: 1 }],
       ...(at.email && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(at.email) ? { customer_email: at.email } : {}),
       redirect_on_completion: "if_required",
