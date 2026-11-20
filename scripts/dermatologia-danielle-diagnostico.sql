@@ -38,19 +38,54 @@ SELECT e.id, COUNT(*) AS horarios_futuros_90d, MIN(t.ts) AS primeiro, MAX(t.ts) 
    AND t.ts <= NOW() + INTERVAL '90 days'
  GROUP BY e.id;
 
--- 3) Proposta mínima — SOMENTE se a consulta 1 mostrar ativo=false/visivel=false
---    E a médica tiver confirmado que deve aparecer no site. Ajuste o id.
--- BEGIN;
--- UPDATE especialistas
---    SET ativo = true, visivel = true
---  WHERE id = <ID_DA_DRA_DANIELLE>
---    AND LOWER(especialidade) = 'dermatologia';
--- -- Conferir 1 linha afetada antes do COMMIT.
--- COMMIT;
+-- 3) Situação atual (20/11/2026): cadastro JÁ ATIVO no banco, agenda antiga
+--    (todos os horários do seed estão no passado). NÃO é preciso ativar nada.
+--    Resultado esperado no site: card visível com "Consultar disponibilidade"
+--    e /api/especialistas/slots/:id devolvendo slots = [] (nenhum horário inventado).
 
--- 4) Agenda — SOMENTE com horários confirmados pela médica (UTC; Fortaleza = UTC-3).
---    Ex.: 18:00 em Fortaleza = 21:00Z. Preferível usar o painel do especialista
---    ou PATCH /api/admin/especialista/:id/disponibilidade (valida tamanho).
+-- 3a) Agendamentos existentes (somente leitura, sem dados pessoais)
+SELECT a.id, a.horario_agendado, a.pagamento_status, a.status
+  FROM agendamentos_especialistas a
+  JOIN especialistas e ON e.id = a.especialista_id
+ WHERE LOWER(e.especialidade) = 'dermatologia'
+   AND a.horario_agendado > NOW() - INTERVAL '30 days'
+ ORDER BY a.horario_agendado;
+
+-- 4) Agenda nova — SOMENTE com grade CONFIRMADA PELA MÉDICA (dias/horários).
+--    Proposta: gerar instantes a partir da grade confirmada para as próximas
+--    semanas (máx. 90 dias), em horário de Fortaleza, convertendo para UTC.
+--    Preencher os placeholders e rodar em transação; conferir antes do COMMIT.
+--    Atenção: ESP_DURACAO_MIN (padrão 60) define o bloqueio de conflito; se a
+--    consulta dela for de 30 min, ajustar a variável de ambiente antes de
+--    publicar horários de 30 em 30 min (senão um horário ocupa o seguinte).
+--
+-- BEGIN;
+-- WITH grade(dow, hora) AS (
+--   VALUES  -- dow: 0=domingo … 6=sábado; hora local de Fortaleza
+--     (<DOW_CONFIRMADO>, TIME '<HH:MM_CONFIRMADO>')
+--  -- , (<DOW>, TIME '<HH:MM>')
+-- ),
+-- dias AS (
+--   SELECT d::date AS dia
+--     FROM generate_series((NOW() AT TIME ZONE 'America/Fortaleza')::date + 1,
+--                          (NOW() AT TIME ZONE 'America/Fortaleza')::date + <SEMANAS_CONFIRMADAS> * 7,
+--                          INTERVAL '1 day') AS d
+-- ),
+-- instantes AS (
+--   SELECT ((dias.dia + grade.hora) AT TIME ZONE 'America/Fortaleza') AS ts
+--     FROM dias JOIN grade ON EXTRACT(DOW FROM dias.dia) = grade.dow
+--    WHERE (dias.dia + grade.hora) AT TIME ZONE 'America/Fortaleza' <= NOW() + INTERVAL '90 days'
+-- )
 -- UPDATE especialistas
---    SET disponibilidade = '[ "<ISO_UTC_CONFIRMADO_1>", "<ISO_UTC_CONFIRMADO_2>" ]'::jsonb
---  WHERE id = <ID_DA_DRA_DANIELLE>;
+--    SET disponibilidade = (
+--      SELECT COALESCE(jsonb_agg(to_char(ts AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS".000Z"') ORDER BY ts), '[]'::jsonb)
+--        FROM instantes)
+--  WHERE id = <ID_DA_DRA_DANIELLE>
+--    AND LOWER(especialidade) = 'dermatologia'
+--  RETURNING id, jsonb_array_length(disponibilidade) AS qtd;
+-- -- Conferir 1 linha e a quantidade; depois COMMIT (ou ROLLBACK).
+-- COMMIT;
+--
+-- Alternativa sem SQL: a própria médica cadastra pelo painel do especialista
+-- (PATCH /api/especialista/disponibilidade) ou o admin via
+-- PATCH /api/admin/especialista/:id/disponibilidade (valida tamanho).

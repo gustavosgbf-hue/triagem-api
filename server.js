@@ -12,7 +12,7 @@ import bcrypt from "bcrypt";
 import jwt from "jsonwebtoken";
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import multer from "multer";
-import { createHash, randomInt, randomUUID, timingSafeEqual } from "crypto";
+import { createHash, randomUUID, timingSafeEqual } from "crypto";
 import rateLimit from "express-rate-limit";
 import {
   codigoErroMemed,
@@ -50,6 +50,20 @@ import {
   tokenAcessoValido,
 } from "./agendamento-acesso.js";
 import { registrarRotasRepasses } from "./medico-repasses-admin.js";
+import {
+  registrarRotasRecuperacaoEspecialista,
+  MIGRACOES_RESET_ESPECIALISTA,
+  tokenSessaoRevogado,
+} from "./especialista-senha-reset.js";
+import {
+  criarDeduplicadorPedidos,
+  expiracaoPixFortaleza,
+  idFilaDeReferenciaPagBank,
+  orderIdPagBankValido,
+  pagbankOrderPago,
+  resumirPedidoPagBank,
+  tokenNotificacaoEfiValido,
+} from "./pagbank-verificacao.js";
 const { Pool } = pg;
 
 const pool = new Pool({
@@ -65,17 +79,9 @@ const stripe = process.env.STRIPE_SECRET_KEY ? new Stripe(process.env.STRIPE_SEC
 // existente permanece no banco; a correção definitiva será feita após a limpeza
 // dos duplicados e criação de uma restrição idempotente adequada.
 
-// Ajuste pontual de preço do Dr. Paulo Almeida (especialista #10).
-// Condicionado ao valor antigo para não sobrescrever alterações futuras.
-pool.query(
-  `UPDATE especialistas
-      SET valor_consulta = 230
-    WHERE id = 10
-      AND LOWER(COALESCE(nome_exibicao, nome, '')) LIKE '%paulo%almeida%'
-      AND valor_consulta = 350`
-).then(({ rowCount }) => {
-  if (rowCount) console.log('[ESP-MIGRATION] Dr. Paulo Almeida: valor atualizado para R$ 230');
-}).catch(e => console.warn('[ESP-MIGRATION] Falha ao atualizar valor do Dr. Paulo Almeida:', e.message));
+// Preço do Dr. Paulo Almeida (especialista #10): NÃO é mais ajustado no boot.
+// O UPDATE automático (350 → 230) rodava a cada reinício e conflitava com o novo
+// valor (R$ 250). Ajuste manual, idempotente: scripts/paulo-almeida-preco-250.sql.
 
 // Attribution schema is intentionally additive/backward-compatible.
 // It gives us immutable first-touch, mutable last-touch and conversion-touch
@@ -3186,7 +3192,7 @@ app.post("/api/pagbank/order", async (req, res) => {
     }
 
     const expiracao    = new Date(Date.now() + 30 * 60 * 1000);
-    const expiracaoISO = expiracao.toISOString().replace("Z", "-03:00");
+    const expiracaoISO = expiracaoPixFortaleza(30);
 
     const nomeClean = (nome || '').trim();
     if (!nomeClean || nomeClean === '-' || nomeClean.length < 2) {
@@ -3270,28 +3276,8 @@ app.post("/api/pagbank/order", async (req, res) => {
   }
 });
 
-app.post("/api/pagbank/webhook", async (req, res) => {
-  const event = req.body;
-  if (!event || typeof event !== "object") {
-    console.warn("[PAGBANK-WEBHOOK] Payload invalido recebido");
-    return res.status(400).end();
-  }
-
-  const orderId  = String(event?.data?.id || event?.id || "");
-  const orderRef = String(event?.data?.reference_id ?? event?.reference_id ?? "");
-  const charges  = event?.data?.charges || event?.charges || [];
-  const pago     = charges.some(c => c.status === "PAID");
-
-  console.log("[PAGBANK-WEBHOOK] Recebido — orderId:", orderId, "ref:", orderRef, "pago:", pago);
-
-  res.sendStatus(200);
-
-  if (!pago || !orderId) return;
-
-  try {
-    const { rowCount, rows } = await pool.query(
-      `UPDATE fila_atendimentos
-          SET pagamento_status        = 'confirmado',
+// SET compartilhado pela confirmação de PIX da fila (webhook e fallback por referência).
+const FILA_CONFIRMAR_PIX_SET_SQL = `pagamento_status        = 'confirmado',
               pagamento_confirmado_em = NOW(),
               status = CASE
                 WHEN status = 'pagamento_pendente' THEN 'triagem'
@@ -3313,100 +3299,89 @@ app.post("/api/pagbank/webhook", async (req, res) => {
                     ELSE 'triagem'
                   END
                 ELSE status
-              END
-        WHERE pagbank_order_id = $1
-          AND pagamento_status  = 'pendente'
-        RETURNING id, nome, tel, cpf, tipo, triagem, status`,
-      [orderId]
-    );
+              END`;
+const pagbankWebhookPodeConsultar = criarDeduplicadorPedidos({ janelaMs: 5000 });
 
-    if (rowCount === 0) {
-      console.log("[PAGBANK-WEBHOOK] Order " + orderId + " nao encontrado pelo pagbank_order_id — tentando fallback por fila_atendimentos.");
+app.post("/api/pagbank/webhook", async (req, res) => {
+  const event = req.body;
+  if (!event || typeof event !== "object") {
+    console.warn("[PAGBANK-WEBHOOK] Payload invalido recebido");
+    return res.status(400).end();
+  }
 
-      const fbFila = await pool.query(
-        `WITH candidato AS (
-           SELECT id
-             FROM fila_atendimentos
-            WHERE pagbank_order_id IS NULL
-              AND pagamento_status = 'pendente'
-              AND criado_em > NOW() - INTERVAL '2 hours'
-            ORDER BY criado_em DESC
-            LIMIT 1
-         )
-         UPDATE fila_atendimentos
-            SET pagamento_status        = 'confirmado',
-                pagamento_confirmado_em = NOW(),
-                pagbank_order_id        = $1,
-                status = CASE
-                  WHEN status = 'pagamento_pendente' THEN 'triagem'
-                  WHEN status = 'triagem' THEN
-                    CASE
-                      WHEN LOWER(TRIM(triagem)) NOT IN (
-                        '(aguardando pagamento)',
-                        '(pagamento confirmado — aguardando triagem)',
-                        '(triagem em andamento)',
-                        '(aguardando triagem de agendamento)',
-                        '(aguardando resposta)'
-                      )
-                      AND LOWER(TRIM(triagem)) NOT LIKE '(aguardando pagamento)%'
-                      AND LOWER(TRIM(triagem)) NOT LIKE '(pagamento confirmado%'
-                      AND LOWER(TRIM(triagem)) NOT LIKE '(triagem em andamento)%'
-                      AND LOWER(TRIM(triagem)) NOT LIKE '(aguardando triagem de agendamento)%'
-                      AND LOWER(TRIM(triagem)) NOT LIKE '(aguardando resposta)%'
-                      THEN 'aguardando'
-                      ELSE 'triagem'
-                    END
-                  ELSE status
-                END
-          FROM candidato
-         WHERE fila_atendimentos.id = candidato.id
-          RETURNING id, nome, tel, cpf, tipo, triagem, status`,
-        [orderId]
-      ).catch(e => { console.warn("[PAGBANK-WEBHOOK] Fallback fila_atendimentos:", e.message); return { rowCount: 0, rows: [] }; });
+  const orderId  = String(event?.data?.id || event?.id || "");
+  const charges  = event?.data?.charges || event?.charges || [];
+  const pagoPayload = Array.isArray(charges) && charges.some(c => c?.status === "PAID");
 
-      if (fbFila.rowCount > 0) {
-        const atFb = fbFila.rows[0];
-        console.log("[PAGBANK-WEBHOOK] Fallback fila_atendimentos: atendimento #" + atFb.id + " atualizado via race-condition recovery.");
-        console.log("PAGAMENTO_CONFIRMADO_REDIRECT_CONFIRMADO", { consultaId: String(atFb.id), tipo: atFb.tipo || "chat", metodo: "pix" });
-        await logarCandidatoConversaoOffline(atFb.id, "pix", "pagbank_webhook_fallback", orderId);
-        await juliePromoverAtendimento(atFb, orderId);
-        return;
-      }
+  console.log("[PAGBANK-WEBHOOK] Recebido — orderId:", orderId, "pago(payload):", pagoPayload);
 
-      console.warn("[PAGBANK-WEBHOOK] Order " + orderId + " nao encontrada em nenhum atendimento — ignorando.");
+  res.sendStatus(200);
+
+  if (!pagoPayload || !orderIdPagBankValido(orderId)) return;
+  if (!pagbankWebhookPodeConsultar(orderId)) return;
+
+  try {
+    // O corpo do webhook não é autenticado: só confirma o que a API do PagBank atesta.
+    // (Antes, um POST forjado com qualquer id confirmava o atendimento pendente mais
+    // recente das últimas 2 h — consulta grátis.)
+    const pedido = await consultarPedidoPagBank(orderId);
+    if (!pedido?.pago) {
+      console.warn("[PAGBANK-WEBHOOK] Pedido não confirmado na API PagBank — ignorado:", orderId);
       return;
     }
 
+    let { rowCount, rows } = await pool.query(
+      `UPDATE fila_atendimentos
+          SET ${FILA_CONFIRMAR_PIX_SET_SQL}
+        WHERE pagbank_order_id = $1
+          AND pagamento_status  = 'pendente'
+        RETURNING id, nome, tel, cpf, tipo, triagem, status`,
+      [pedido.id]
+    );
+    let origem = "pagbank_webhook";
+
+    if (rowCount === 0) {
+      // Pedido pago ainda não vinculado (corrida no WhatsApp) ou substituído por um PIX
+      // mais novo do MESMO atendimento: localiza pelo reference_id que nós geramos.
+      const refId = idFilaDeReferenciaPagBank(pedido.referenceId);
+      if (!refId) {
+        console.warn("[PAGBANK-WEBHOOK] Order " + orderId + " sem atendimento correspondente — ignorando.");
+        return;
+      }
+      ({ rowCount, rows } = await pool.query(
+        `UPDATE fila_atendimentos
+            SET ${FILA_CONFIRMAR_PIX_SET_SQL},
+                pagbank_order_id = $2
+          WHERE id = $1
+            AND pagamento_status = 'pendente'
+            AND COALESCE(tipo, '') NOT LIKE 'renovacao_%'
+          RETURNING id, nome, tel, cpf, tipo, triagem, status`,
+        [refId, pedido.id]
+      ).catch(e => { console.warn("[PAGBANK-WEBHOOK] Fallback por referência:", e.message); return { rowCount: 0, rows: [] }; }));
+      if (!rowCount) {
+        console.log("[PAGBANK-WEBHOOK] Order " + orderId + " já processada ou atendimento não pendente.");
+        return;
+      }
+      origem = "pagbank_webhook_referencia";
+    }
+
     const at = rows[0];
-    console.log("[PAGBANK-WEBHOOK] Pagamento confirmado — atendimento #" + at.id + " status:" + at.status);
+    console.log("[PAGBANK-WEBHOOK] Pagamento confirmado — atendimento #" + at.id + " status:" + at.status + " via " + origem);
     console.log("PAGAMENTO_CONFIRMADO_REDIRECT_CONFIRMADO", { consultaId: String(at.id), tipo: at.tipo || "chat", metodo: "pix" });
-    await logarCandidatoConversaoOffline(at.id, "pix", "pagbank_webhook", orderId);
-    await juliePromoverAtendimento(at, orderId);
+    await logarCandidatoConversaoOffline(at.id, "pix", origem, pedido.id);
+    await juliePromoverAtendimento(at, pedido.id);
 
   } catch (e) {
     console.error("[PAGBANK-WEBHOOK] Erro no processamento:", e.message);
   }
 });
 
-function pagbankOrderPago(data) {
-  const statusPago = new Set(["PAID", "COMPLETED"]);
-  const status = String(data?.status || "").toUpperCase();
-  if (statusPago.has(status)) return true;
-  const charges = Array.isArray(data?.charges) ? data.charges : [];
-  if (charges.some(c => statusPago.has(String(c?.status || "").toUpperCase()))) return true;
-  const qrCodes = Array.isArray(data?.qr_codes) ? data.qr_codes : [];
-  return qrCodes.some(qr => {
-    if (statusPago.has(String(qr?.status || "").toUpperCase())) return true;
-    const payments = Array.isArray(qr?.payments) ? qr.payments : [];
-    return payments.some(p => statusPago.has(String(p?.status || "").toUpperCase()));
-  });
-}
-
 // Consultar status de uma order PagBank — usado como fallback de polling
 app.get("/api/pagbank/order/:id", async (req, res) => {
   try {
     if (!PAGBANK_TOKEN) return res.status(503).json({ ok: false, error: "Gateway indisponivel" });
-    const response = await fetch(`${PAGBANK_URL}/orders/${req.params.id}`, {
+    if (!orderIdPagBankValido(req.params.id)) return res.status(400).json({ ok: false, error: "Pedido inválido" });
+    const response = await fetch(`${PAGBANK_URL}/orders/${encodeURIComponent(req.params.id)}`, {
       headers: { "Authorization": `Bearer ${PAGBANK_TOKEN}`, "accept": "application/json" }
     });
     const data = await response.json();
@@ -3447,7 +3422,8 @@ app.get("/api/admin/pagbank/order/:id", checkAdmin, async (req, res) => {
     if (!PAGBANK_TOKEN) {
       return res.status(503).json({ ok: false, error: "Gateway indisponível." });
     }
-    const response = await fetch(`${PAGBANK_URL}/orders/${req.params.id}`, {
+    if (!orderIdPagBankValido(req.params.id)) return res.status(400).json({ ok: false, error: "Pedido inválido" });
+    const response = await fetch(`${PAGBANK_URL}/orders/${encodeURIComponent(req.params.id)}`, {
       headers: { Authorization: `Bearer ${PAGBANK_TOKEN}`, accept: "application/json" }
     });
     const data = await response.json().catch(() => ({}));
@@ -6310,31 +6286,69 @@ function acessoAgendamentoAutorizado(req, modulo, ag) {
 // Nunca confia no corpo do webhook PagBank: consulta o pedido na API.
 async function consultarPedidoPagBank(orderId) {
   const id = String(orderId || '').trim();
-  if (!PAGBANK_TOKEN || !/^[A-Za-z0-9_-]{1,80}$/.test(id)) return null;
+  if (!PAGBANK_TOKEN || !orderIdPagBankValido(id)) return null;
   const r = await fetch(`${PAGBANK_URL}/orders/${encodeURIComponent(id)}`, {
-    headers: { Authorization: `Bearer ${PAGBANK_TOKEN}`, accept: 'application/json' }
+    headers: { Authorization: `Bearer ${PAGBANK_TOKEN}`, accept: 'application/json' },
+    signal: AbortSignal.timeout(15000),
   });
   if (!r.ok) return null;
   const d = await r.json().catch(() => null);
-  if (!d) return null;
-  const pagos = (Array.isArray(d.charges) ? d.charges : []).filter(c => c && c.status === 'PAID');
-  return {
-    id: String(d.id || id),
-    pago: pagos.length > 0,
-    referenceId: String(d.reference_id || ''),
-    valorPagoCentavos: pagos.reduce((s, c) => s + (Number(c.amount?.value) || 0), 0),
-  };
+  const pedido = resumirPedidoPagBank(d, id);
+  // A API precisa devolver o MESMO pedido consultado.
+  if (!pedido || pedido.id !== id) return null;
+  return pedido;
 }
 
 // Evita duas cobranças simultâneas de cartão para o mesmo agendamento
-// (duplo clique / reenvio). Escopo do processo — suficiente p/ instância única.
+// (duplo clique / reenvio / mais de uma instância). Duas camadas:
+//   1. Set em memória (barra o duplo clique na mesma instância sem ir ao banco);
+//   2. "lease" no banco (cartao_lock_ate) adquirido por UPDATE condicional —
+//      vale entre instâncias e expira sozinho se o processo morrer.
+// Se a coluna ainda não existir (migração pendente), segue só com a camada 1.
 const cobrancasCartaoEmAndamento = new Set();
-function iniciarCobrancaCartao(chave) {
+const TABELA_LOCK_CARTAO = { psi: 'agendamentos_psicologia', esp: 'agendamentos_especialistas' };
+const CARTAO_LOCK_SEGUNDOS = 180;
+(async () => {
+  for (const tabela of Object.values(TABELA_LOCK_CARTAO)) {
+    await pool.query(`ALTER TABLE ${tabela} ADD COLUMN IF NOT EXISTS cartao_lock_ate TIMESTAMPTZ`)
+      .catch(e => console.warn('[CARTAO-LOCK-MIGRATION]', e.message));
+  }
+})();
+function partesChaveCartao(chave) {
+  const [prefixo, idStr] = String(chave).split(':');
+  const tabela = TABELA_LOCK_CARTAO[prefixo];
+  const id = parseIdAgendamento(idStr);
+  return tabela && id ? { tabela, id } : null;
+}
+async function iniciarCobrancaCartao(chave) {
   if (cobrancasCartaoEmAndamento.has(chave)) return false;
   cobrancasCartaoEmAndamento.add(chave);
-  return true;
+  const p = partesChaveCartao(chave);
+  if (!p) return true;
+  try {
+    const { rowCount } = await pool.query(
+      `UPDATE ${p.tabela}
+          SET cartao_lock_ate = NOW() + make_interval(secs => $2::int)
+        WHERE id = $1 AND pagamento_status <> 'confirmado'
+          AND (cartao_lock_ate IS NULL OR cartao_lock_ate < NOW())`,
+      [p.id, CARTAO_LOCK_SEGUNDOS]
+    );
+    if (rowCount === 1) return true;
+    cobrancasCartaoEmAndamento.delete(chave);
+    return false;
+  } catch (e) {
+    if (/cartao_lock_ate/.test(String(e.message))) return true; // coluna ainda não migrada
+    cobrancasCartaoEmAndamento.delete(chave);
+    throw e;
+  }
 }
-function finalizarCobrancaCartao(chave) { cobrancasCartaoEmAndamento.delete(chave); }
+async function finalizarCobrancaCartao(chave) {
+  cobrancasCartaoEmAndamento.delete(chave);
+  const p = partesChaveCartao(chave);
+  if (!p) return;
+  await pool.query(`UPDATE ${p.tabela} SET cartao_lock_ate = NULL WHERE id = $1`, [p.id])
+    .catch(e => { if (!/cartao_lock_ate/.test(String(e.message))) console.warn('[CARTAO-LOCK] Falha ao liberar:', e.message); });
+}
 
 const PSI_CONFIRMAR_SET_SQL = `pagamento_status = 'confirmado', pagamento_confirmado_em = NOW(), status = 'confirmado',
               status_sessao = 'pago',
@@ -6413,10 +6427,6 @@ function idProfissional(valor) { return parseIdAgendamento(valor); }
 // Data de expiração do PIX no formato do PagBank com offset de Fortaleza (UTC-3).
 // Antes: toISOString().replace('Z','-03:00') rotulava o horário UTC como -03:00,
 // deixando o QR válido ~3h30 (muito além da reserva de 35 min do horário).
-function expiracaoPixFortaleza(minutos = 30) {
-  const alvo = Date.now() + minutos * 60 * 1000;
-  return new Date(alvo - 3 * 60 * 60 * 1000).toISOString().replace(/\.\d{3}Z$/, '-03:00');
-}
 
 function validarHorarioPsi(slotStart, disponibilidadeRaw, psicologoId) {
   const v = validarHorarioReserva(slotStart);
@@ -7009,7 +7019,7 @@ app.post('/api/psicologia/efi/cartao/cobrar', rlGeral, async (req, res) => {
     }
 
     const valorCentavos = elegivel.valorCentavos;
-    if (!iniciarCobrancaCartao(lockCartao)) {
+    if (!(await iniciarCobrancaCartao(lockCartao))) {
       return res.status(409).json({ ok: false, error: 'Já existe um pagamento em processamento para este agendamento. Aguarde alguns segundos.' });
     }
     lockAdquirido = true;
@@ -7074,7 +7084,7 @@ app.post('/api/psicologia/efi/cartao/cobrar', rlGeral, async (req, res) => {
     console.error('[PSI-EFI-CARTAO] Erro:', msg);
     return res.status(500).json({ ok: false, error: msg });
   } finally {
-    if (lockAdquirido) finalizarCobrancaCartao(lockCartao);
+    if (lockAdquirido) await finalizarCobrancaCartao(lockCartao);
   }
 });
 
@@ -8411,9 +8421,18 @@ const authEspecialista = async (req, res, next) => {
   try {
     const dec = jwt.verify(tok, JWT_SECRET);
     if (dec.tipo !== 'especialista') return res.status(403).json({ ok: false, error: 'Acesso negado' });
-    const { rows } = await pool.query('SELECT id, nome_exibicao, especialidade, email, ativo FROM especialistas WHERE id = $1 AND ativo = true', [dec.id]);
+    // to_jsonb(...)->> tolera a coluna ainda não migrada.
+    const { rows } = await pool.query(
+      `SELECT id, nome_exibicao, especialidade, email, ativo,
+              (to_jsonb(especialistas)->>'senha_alterada_em') AS senha_alterada_em
+         FROM especialistas WHERE id = $1 AND ativo = true`, [dec.id]);
     if (!rows.length) return res.status(403).json({ ok: false, error: 'Especialista inativo ou não encontrado' });
     if (medicoBloqueado(rows[0])) return res.status(403).json({ ok: false, error: 'Acesso desativado.' });
+    // Sessões abertas antes de uma redefinição de senha por token deixam de valer.
+    if (tokenSessaoRevogado(dec.iat, rows[0].senha_alterada_em)) {
+      return res.status(401).json({ ok: false, error: 'Sessão expirada. Entre novamente.' });
+    }
+    delete rows[0].senha_alterada_em;
     req.especialistaId = rows[0].id;
     req.especialista = rows[0];
     next();
@@ -8462,72 +8481,31 @@ app.post('/api/especialista/login', rlLogin, async (req, res) => {
   }
 });
 
-// ── ESPECIALISTA: esqueci senha ──────────────────────────────────────────────
-app.post('/api/especialista/esqueci-senha', rlLogin, async (req, res) => {
-  // Sempre responde ok=true — não expõe se e-mail existe
-  try {
-    const { email } = req.body || {};
-    if (!email || typeof email !== 'string') return res.json({ ok: true });
-    const { rows } = await pool.query(
-      `SELECT id, nome, nome_exibicao, email FROM especialistas
-        WHERE LOWER(email) = LOWER($1) AND ativo = true LIMIT 1`,
-      [email.trim()]
-    );
-    if (!rows.length) {
-      console.warn('[ESP-RECOVERY] E-mail nao encontrado/ativo');
-      return res.json({ ok: true });
-    }
-    const esp = rows[0];
-    if (medicoBloqueado(esp)) return res.json({ ok: true });
-    const chars = 'abcdefghjkmnpqrstuvwxyz23456789';
-    let senhaTemp = '';
-    for (let i = 0; i < 10; i++) senhaTemp += chars[randomInt(chars.length)];
-    const hash = await bcrypt.hash(senhaTemp, 10);
-    await pool.query(
-      `UPDATE especialistas SET senha_hash = $1, precisa_trocar_senha = true WHERE id = $2`,
-      [hash, esp.id]
-    );
-    const nome = esp.nome_exibicao || esp.nome;
+// ── ESPECIALISTA: recuperação de senha por token de uso único ───────────────
+// (ver especialista-senha-reset.js). A senha só muda quando o token enviado
+// por e-mail é apresentado em /api/especialista/redefinir-senha.
+(async () => {
+  for (const sql of MIGRACOES_RESET_ESPECIALISTA) {
+    await pool.query(sql).catch(e => console.warn('[ESP-RESET-MIGRATION]', e.message));
+  }
+})();
+registrarRotasRecuperacaoEspecialista(app, {
+  pool,
+  rlLogin,
+  medicoBloqueado,
+  hashSenha: (senha) => bcrypt.hash(String(senha), 10),
+  enviarEmail: async ({ to, subject, html }) => {
     const RESEND_KEY = process.env.RESEND_API_KEY;
-    if (!RESEND_KEY) {
-      console.error('[ESP-RECOVERY] RESEND_API_KEY ausente; senha atualizada, email nao enviado.');
-      return res.json({ ok: true });
-    }
-    const adminBcc = process.env.ESPECIALISTA_RECOVERY_BCC || process.env.RENOVACAO_ADMIN_EMAIL || 'gustavosgbf@gmail.com';
-    const html = `<div style="background:#f5f5f5;padding:32px;font-family:sans-serif">
-      <div style="max-width:480px;margin:0 auto;background:#fff;border-radius:12px;padding:28px">
-        <h2 style="color:#1a1612;margin:0 0 12px">Acesso ao Painel do Especialista</h2>
-        <p style="color:#555;font-size:.9rem;margin-bottom:20px">Olá, ${nome}. Sua senha temporária de acesso é:</p>
-        <div style="background:#f0fdf4;border:1px solid #bbf7d0;border-radius:8px;padding:16px;text-align:center;margin-bottom:20px">
-          <span style="font-family:monospace;font-size:1.4rem;font-weight:700;color:#166534;letter-spacing:.12em">${senhaTemp}</span>
-        </div>
-        <p style="color:#555;font-size:.85rem">Acesse o painel e você será solicitado a criar uma nova senha permanente.</p>
-        <p style="color:#999;font-size:.78rem;margin-top:16px">Se você não solicitou este acesso, ignore este e-mail.</p>
-      </div>
-    </div>`;
-    console.log(`[ESP-RECOVERY] Enviando senha temporária para especialista #${esp.id}`);
-    const resendRes = await fetch('https://api.resend.com/emails', {
+    if (!RESEND_KEY) { console.error('[ESP-RECOVERY] RESEND_API_KEY ausente; e-mail não enviado.'); return; }
+    const r = await fetch('https://api.resend.com/emails', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${RESEND_KEY}` },
-      body: JSON.stringify({
-        from: 'ConsultaJá24h <contato@consultaja24h.com.br>',
-        to: [esp.email],
-        bcc: adminBcc && adminBcc !== esp.email ? [adminBcc] : undefined,
-        subject: 'Sua senha temporária — ConsultaJá24h',
-        html,
-      }),
+      body: JSON.stringify({ from: 'ConsultaJá24h <contato@consultaja24h.com.br>', to: [to], subject, html }),
     });
-    const resendData = await resendRes.json().catch(() => ({}));
-    if (resendRes.ok) {
-      console.log(`[ESP-RECOVERY] Email enviado com sucesso. ID: ${resendData.id}`);
-    } else {
-      console.error(`[ESP-RECOVERY] ERRO Resend status ${resendRes.status}:`, JSON.stringify(resendData));
-    }
-    return res.json({ ok: true });
-  } catch (e) {
-    console.error('[ESP-RECOVERY] Erro (silencioso):', e.message);
-    return res.json({ ok: true });
-  }
+    if (!r.ok) console.error('[ESP-RECOVERY] Resend recusou o envio. HTTP', r.status);
+  },
+  apiBaseUrl: (process.env.API_URL || 'https://triagem-api.onrender.com').replace(/\/+$/, ''),
+  painelUrl: process.env.PAINEL_ESPECIALISTA_URL || 'https://painel.consultaja24h.com.br/especialista.html',
 });
 
 // ── ADMIN: atualizar especialista ──────────────────────────────────────────
@@ -8927,7 +8905,7 @@ app.post('/api/especialistas/efi/cartao/cobrar', rlGeral, async (req, res) => {
       return res.status(409).json({ ok: false, error: 'Horário indisponível. Escolha outro.' });
     }
     const valorCentavos = elegivel.valorCentavos;
-    if (!iniciarCobrancaCartao(lockCartao)) {
+    if (!(await iniciarCobrancaCartao(lockCartao))) {
       return res.status(409).json({ ok: false, error: 'Já existe um pagamento em processamento para este agendamento. Aguarde alguns segundos.' });
     }
     lockAdquirido = true;
@@ -8989,7 +8967,7 @@ app.post('/api/especialistas/efi/cartao/cobrar', rlGeral, async (req, res) => {
     console.error('[ESP-EFI-CARTAO]', msg);
     return res.status(500).json({ ok: false, error: msg });
   } finally {
-    if (lockAdquirido) finalizarCobrancaCartao(lockCartao);
+    if (lockAdquirido) await finalizarCobrancaCartao(lockCartao);
   }
 });
 
@@ -11566,32 +11544,27 @@ app.post("/api/efi/cartao/webhook", async (req, res) => {
     // Estrutura do webhook Efí Cobranças: { "notification": "<token>" }
     // Para obter o status real: GET /v1/notification/:token
     const notificationToken = evento?.notification;
-    if (!notificationToken) {
-      console.log("[EFI-WEBHOOK] Evento sem notification token — ignorando");
+    if (!tokenNotificacaoEfiValido(notificationToken)) {
+      console.log("[EFI-WEBHOOK] Evento sem notification token válido — ignorando");
       return;
     }
 
-    console.log("[EFI-WEBHOOK] Token recebido:", notificationToken);
-
     const efiToken = await efiGetToken();
     const notifRes = await axios.get(
-      `${EFI_BASE_URL}/v1/notification/${notificationToken}`,
+      `${EFI_BASE_URL}/v1/notification/${encodeURIComponent(notificationToken)}`,
       {
         httpsAgent: getEfiAgent(),
         headers: { Authorization: `Bearer ${efiToken}`, "Content-Type": "application/json" }
       }
     );
 
-    const charges = notifRes.data?.data || [];
-    console.log("[EFI-WEBHOOK] Cobranças notificadas:", charges.length);
+    // Formato documentado da Efí ({ status: { current }, identifiers: { charge_id } })
+    // e o legado ({ charge_id, status: 'paid' }); considera o status MAIS RECENTE.
+    const pagas = extrairCobrancasPagasEfi(notifRes.data?.data);
+    console.log("[EFI-WEBHOOK] Cobranças pagas na notificação:", pagas.length);
 
-    for (const charge of charges) {
-      const chargeId = String(charge.charge_id || charge.id || "");
-      const status   = charge.status;
-
-      console.log(`[EFI-WEBHOOK] charge_id: ${chargeId} status: ${status}`);
-
-      if (status !== "paid" || !chargeId) continue;
+    for (const chargeId of pagas) {
+      console.log(`[EFI-WEBHOOK] charge_id: ${chargeId} status: paid`);
 
       // Busca o atendimento vinculado a este charge_id — idempotente
       const { rows: atRows } = await pool.query(
@@ -13039,7 +13012,7 @@ async function confirmarRenovacao(at) {
 }
 
 async function pagBankOrderEstaPaga(orderId) {
-  if (!orderId || !PAGBANK_TOKEN) return false;
+  if (!orderId || !PAGBANK_TOKEN || !orderIdPagBankValido(String(orderId))) return false;
   const response = await fetch(`${PAGBANK_URL}/orders/${encodeURIComponent(String(orderId))}`, {
     headers: { Authorization: `Bearer ${PAGBANK_TOKEN}`, accept: "application/json" }
   });
@@ -13283,15 +13256,13 @@ app.post("/api/renovacao/pagbank/webhook", async (req, res) => {
   res.sendStatus(200);
   try {
     const orderId = String(req.body?.data?.id || req.body?.id || "");
-    const charges = req.body?.data?.charges || req.body?.charges || [];
-    let pago = charges.some(c => c.status === "PAID");
-    if (orderId && !pago) {
-      pago = await pagBankOrderEstaPaga(orderId).catch(e => {
-        console.warn("[RENOVACAO-PIX-WH] Consulta direta PagBank falhou:", e.message);
-        return false;
-      });
-    }
-    if (!orderId || !pago) return;
+    if (!orderIdPagBankValido(orderId) || !pagbankWebhookPodeConsultar("renov:" + orderId)) return;
+    // Sempre confirma na API: antes bastava o corpo trazer charges[].status = PAID.
+    const pago = await pagBankOrderEstaPaga(orderId).catch(e => {
+      console.warn("[RENOVACAO-PIX-WH] Consulta direta PagBank falhou:", e.message);
+      return false;
+    });
+    if (!pago) return;
     const at = await pool.query(
       `SELECT id
          FROM fila_atendimentos
@@ -13372,13 +13343,11 @@ app.post("/api/renovacao/efi/cartao/webhook", async (req, res) => {
   res.sendStatus(200);
   try {
     const notificationToken = req.body?.notification;
-    if (!notificationToken) return;
+    if (!tokenNotificacaoEfiValido(notificationToken)) return;
     const efiToken = await efiGetToken();
-    const notifRes = await axios.get(`${EFI_BASE_URL}/v1/notification/${notificationToken}`, { httpsAgent: getEfiAgent(), headers: { Authorization: `Bearer ${efiToken}`, "Content-Type": "application/json" } });
-    const charges = notifRes.data?.data || [];
-    for (const charge of charges) {
-      const chargeId = String(charge.charge_id || charge.id || "");
-      if (charge.status !== "paid" || !chargeId) continue;
+    const notifRes = await axios.get(`${EFI_BASE_URL}/v1/notification/${encodeURIComponent(notificationToken)}`, { httpsAgent: getEfiAgent(), headers: { Authorization: `Bearer ${efiToken}`, "Content-Type": "application/json" } });
+    // Formato documentado (status.current / identifiers.charge_id) e legado.
+    for (const chargeId of extrairCobrancasPagasEfi(notifRes.data?.data)) {
       const upd = await pool.query(
         `UPDATE fila_atendimentos SET pagamento_status='confirmado', pagamento_confirmado_em=NOW(), status='aguardando'
          WHERE efi_charge_id=$1 AND tipo LIKE 'renovacao_%' AND pagamento_status='pendente'
@@ -13753,8 +13722,7 @@ Histórico: [resumo breve da queixa]`;
   const atendimentoId = insertResult.rows[0]?.id;
   if (!atendimentoId) throw new Error("Falha ao criar atendimento");
 
-  const expiracao    = new Date(Date.now() + 30 * 60 * 1000);
-  const expiracaoISO = expiracao.toISOString().replace("Z", "-03:00");
+  const expiracaoISO = expiracaoPixFortaleza(30);
 
   const orderBody = {
     reference_id: "CJ-WA-" + atendimentoId + "-" + Date.now(),
