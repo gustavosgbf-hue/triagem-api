@@ -209,6 +209,10 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
     if (["checkout.session.completed", "checkout.session.async_payment_succeeded"].includes(event.type)) {
       const session = event.data.object;
       if (session.payment_status === "paid") {
+        if (['psicologia_agendamento','especialista_agendamento'].includes(session.metadata?.origem)) {
+          await confirmarStripeAgendamento(session);
+          return res.json({received:true});
+        }
         const atendimentoId = Number.parseInt(String(session.metadata?.atendimento_id || ""), 10) || null;
         if (atendimentoId) {
           if (session.metadata?.origem === "renovacao_receita") {
@@ -252,6 +256,29 @@ app.post("/api/stripe/webhook", express.raw({ type: "application/json" }), async
 });
 
 app.use(express.json({ limit: "1mb" }));
+
+// Stripe para agendamentos: valor sempre obtido da reserva, nunca do cliente.
+async function confirmarStripeAgendamento(session) {
+  const tipo = session.metadata?.origem;
+  if (!['psicologia_agendamento', 'especialista_agendamento'].includes(tipo)) return false;
+  const id = Number(session.metadata?.agendamento_id);
+  if (!Number.isSafeInteger(id) || id <= 0 || session.payment_status !== 'paid' || session.currency !== 'brl') return false;
+  const psi = tipo === 'psicologia_agendamento';
+  const tabela = psi ? 'agendamentos_psicologia' : 'agendamentos_especialistas';
+  const { rows } = await pool.query(`SELECT id,valor_cobrado,stripe_checkout_session_id,pagamento_status FROM ${tabela} WHERE id=$1`, [id]);
+  const ag = rows[0];
+  if (!ag || ag.stripe_checkout_session_id !== session.id || Math.round(Number(ag.valor_cobrado)*100) !== session.amount_total) return false;
+  if (psi) {
+    const { rows: confirmados } = await pool.query(`UPDATE agendamentos_psicologia SET ${PSI_CONFIRMAR_SET_SQL}, pagamento_metodo='cartao' WHERE id=$1 AND pagamento_status='pendente' AND stripe_checkout_session_id=$3 RETURNING ${PSI_CONFIRMAR_RETURNING_SQL}`, [id, PSI_COMISSAO_PCT, session.id]);
+    if (confirmados[0]) await notificarPsiConfirmado(confirmados[0]);
+  } else {
+    const { rows: confirmados } = await pool.query(`UPDATE agendamentos_especialistas SET pagamento_status='confirmado', pagamento_confirmado_em=NOW(), status='confirmado', pagamento_metodo='cartao' WHERE id=$1 AND pagamento_status='pendente' AND stripe_checkout_session_id=$2 RETURNING id`, [id, session.id]);
+    if (confirmados[0]) await notificarAgendamentoEspecialistaConfirmado(id);
+  }
+  return true;
+}
+
+
 
 app.get("/api/build-info", (_req, res) => {
   res.json({ ok: true, version: "queue-fair-distribution-v1" });
@@ -2006,6 +2033,7 @@ async function initDB() {
       observacoes       TEXT,
       criado_em         TIMESTAMP DEFAULT NOW()
     )`).catch(()=>{});
+    await pool.query(`ALTER TABLE agendamentos_psicologia ADD COLUMN IF NOT EXISTS stripe_checkout_session_id TEXT`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_ag_psi_psicologo ON agendamentos_psicologia(psicologo_id)`).catch(()=>{});
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_ag_psi_paciente_email ON agendamentos_psicologia(paciente_email)`).catch(()=>{});
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_ag_psi_status ON agendamentos_psicologia(pagamento_status)`).catch(()=>{});
@@ -2124,6 +2152,7 @@ async function initDB() {
       created_at TIMESTAMP DEFAULT NOW()
     )`).catch(()=>{});
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_consulta_msgs ON consulta_mensagens(agendamento_id, agendamento_type)`).catch(()=>{});
+    await pool.query(`ALTER TABLE agendamentos_especialistas ADD COLUMN IF NOT EXISTS stripe_checkout_session_id TEXT`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_ag_esp_paciente ON agendamentos_especialistas(paciente_id)`).catch(()=>{});
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_ag_esp_efi ON agendamentos_especialistas(efi_charge_id)`).catch(()=>{});
     // ── LEADS ──────────────────────────────────────────────────────────────────
@@ -7001,6 +7030,48 @@ app.post('/api/psicologia/agendamento/:id/reenviar-acesso', rlLogin, async (req,
   } catch (err) {
     return res.status(500).json({ ok: false, error: 'Não foi possível reenviar o acesso' });
   }
+});
+
+app.post('/api/agendamentos/stripe/checkout-session', rlGeral, async (req,res) => {
+  try {
+    if (!stripeCartaoProntoProducao()) return res.status(503).json({ok:false,error:'Cartão indisponível'});
+    const tipo = req.body?.tipo;
+    if (!['psicologia','especialista'].includes(tipo)) return res.status(400).json({ok:false,error:'Tipo inválido'});
+    const id = Number(req.body?.agendamentoId);
+    if (!Number.isSafeInteger(id) || id <= 0) return res.status(400).json({ok:false,error:'Agendamento inválido'});
+    const tabela = tipo === 'psicologia' ? 'agendamentos_psicologia' : 'agendamentos_especialistas';
+    const {rows} = await pool.query(`SELECT id,valor_cobrado,paciente_email,pagamento_status,stripe_checkout_session_id FROM ${tabela} WHERE id=$1`,[id]);
+    const ag=rows[0];
+    if (!ag || ag.pagamento_status !== 'pendente') return res.status(409).json({ok:false,error:'Agendamento indisponível'});
+    if (ag.stripe_checkout_session_id) {
+      const antiga=await stripe.checkout.sessions.retrieve(ag.stripe_checkout_session_id);
+      if (antiga.status==='open' && antiga.url) return res.json({ok:true,url:antiga.url});
+      if (antiga.payment_status==='paid') return res.status(409).json({ok:false,error:'Pagamento já realizado; aguarde confirmação'});
+    }
+    const valor=Math.round(Number(ag.valor_cobrado)*100);
+    if (!Number.isSafeInteger(valor) || valor < 100) return res.status(422).json({ok:false,error:'Valor inválido'});
+    const origem=tipo==='psicologia'?'psicologia_agendamento':'especialista_agendamento';
+    const destino=tipo==='psicologia'?'psicologo-online/':`especialistas/${String(req.body?.especialidade||'').toLowerCase().replace(/[^a-z-]/g,'')}/`;
+    const retorno=`https://consultaja24h.com.br/${destino}?stripe_agendamento=${id}&stripe_tipo=${tipo}&session_id={CHECKOUT_SESSION_ID}`;
+    const session=await stripe.checkout.sessions.create({mode:'payment',line_items:[{price_data:{currency:'brl',product_data:{name:tipo==='psicologia'?'Sessão de psicologia':'Consulta com especialista'},unit_amount:valor},quantity:1}],customer_email:ag.paciente_email,success_url:retorno,cancel_url:`https://consultaja24h.com.br/${destino}`,metadata:{origem,agendamento_id:String(id)}});
+    await pool.query(`UPDATE ${tabela} SET stripe_checkout_session_id=$2,pagamento_metodo='cartao' WHERE id=$1 AND pagamento_status='pendente'`,[id,session.id]);
+    return res.json({ok:true,url:session.url});
+  } catch(e) { console.error('[AG-STRIPE]',e.message); return res.status(500).json({ok:false,error:'Não foi possível iniciar o cartão'}); }
+});
+app.get('/api/agendamentos/stripe/session-status',rlGeral,async(req,res)=>{
+  try {
+    const tipo=req.query.tipo;
+    if (!['psicologia','especialista'].includes(tipo)) return res.status(400).json({ok:false});
+    const id=Number(req.query.agendamentoId);
+    if (!Number.isSafeInteger(id)||id<=0) return res.status(400).json({ok:false});
+    const tabela=tipo==='psicologia'?'agendamentos_psicologia':'agendamentos_especialistas';
+    const {rows}=await pool.query(`SELECT stripe_checkout_session_id,pagamento_status FROM ${tabela} WHERE id=$1`,[id]);
+    const ag=rows[0];
+    if (!ag || !ag.stripe_checkout_session_id || ag.stripe_checkout_session_id!==req.query.session_id) return res.status(404).json({ok:false});
+    const session=await stripe.checkout.sessions.retrieve(ag.stripe_checkout_session_id);
+    if (session.payment_status==='paid') await confirmarStripeAgendamento(session);
+    return res.json({ok:true,confirmed:session.payment_status==='paid'});
+  } catch(e){return res.status(500).json({ok:false});}
 });
 
 // ── PSICOLOGIA: cartão EFI com valor dinâmico ─────────────────────────────────
