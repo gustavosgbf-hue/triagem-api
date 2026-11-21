@@ -2155,6 +2155,10 @@ async function initDB() {
     await pool.query(`ALTER TABLE agendamentos_especialistas ADD COLUMN IF NOT EXISTS stripe_checkout_session_id TEXT`);
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_ag_esp_paciente ON agendamentos_especialistas(paciente_id)`).catch(()=>{});
     await pool.query(`CREATE INDEX IF NOT EXISTS idx_ag_esp_efi ON agendamentos_especialistas(efi_charge_id)`).catch(()=>{});
+    // Ajuste solicitado pelo proprietário: somente cadastro ativo do Dr. Paulo (id 10).
+    await pool.query(`UPDATE especialistas SET valor_consulta = 250.00
+      WHERE id = 10 AND nome_exibicao = 'Dr. Paulo Almeida'
+        AND especialidade = 'psiquiatria' AND valor_consulta = 230.00`);
     // ── LEADS ──────────────────────────────────────────────────────────────────
     await pool.query(`CREATE TABLE IF NOT EXISTS leads_agendamento (
       id            SERIAL PRIMARY KEY,
