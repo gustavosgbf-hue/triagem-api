@@ -234,7 +234,8 @@ express.application.init = function (...args) {
     res.set('Cache-Control','no-store').type('html').send(`<!doctype html><html lang="pt-BR"><meta name="viewport" content="width=device-width, initial-scale=1"><body style="background:#07100f;color:#fff;font:16px Arial;padding:12vh 20px;text-align:center"><h2>Consulta<span style="color:#16c783">Já</span>24h</h2><p>Deseja deixar de receber lembretes de pagamentos não concluídos?</p><form method="POST" action="/api/payment-recovery/unsubscribe?token=${encodeURIComponent(req.query.token)}"><button style="background:#16c783;border:0;border-radius:12px;padding:15px 24px;font-weight:bold">Cancelar estes lembretes</button></form></body></html>`);
   });
   // A URL é removida do navegador antes dos scripts de anúncios. Nunca expor token em logs.
-  this.post('/api/payment-recovery/restore', async (req,res) => {
+  this.post('/api/payment-recovery/restore', express.json({limit:'2kb'}), async (req,res) => {
+    res.set('Access-Control-Allow-Origin',SITE_URL).set('Vary','Origin');
     res.set('Cache-Control','no-store').set('Referrer-Policy','no-referrer');
     const valid = verifyRecoveryToken(req.body?.token);
     if (!valid) return res.status(400).json({ok:false,error:'Link inválido ou expirado. Abra um novo atendimento.'});
@@ -265,7 +266,8 @@ express.application.init = function (...args) {
       return res.status(503).json({ok:false,error:'Não foi possível recuperar agora.'});
     }
   });
-  this.post('/api/payment-recovery/checkout-opened',async(req,res)=>{
+  this.post('/api/payment-recovery/checkout-opened',express.json({limit:'2kb'}),async(req,res)=>{
+    res.set('Access-Control-Allow-Origin',SITE_URL).set('Vary','Origin');
     res.set('Cache-Control','no-store');
     const valid=verifyRecoveryToken(req.body?.token);
     if (!valid) return res.status(400).json({ok:false});
