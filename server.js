@@ -7042,6 +7042,10 @@ app.post('/api/agendamentos/stripe/checkout-session', rlGeral, async (req,res) =
     const tabela = tipo === 'psicologia' ? 'agendamentos_psicologia' : 'agendamentos_especialistas';
     const {rows} = await pool.query(`SELECT id,valor_cobrado,paciente_email,pagamento_status,stripe_checkout_session_id FROM ${tabela} WHERE id=$1`,[id]);
     const ag=rows[0];
+    const acesso=String(req.body?.acessoToken || '');
+    let autorizado=false;
+    try { autorizado=tokenAcessoValido(jwt.verify(acesso,JWT_SECRET),tipo==='psicologia'?'psicologia':'especialistas',id); } catch(_) {}
+    if (!autorizado) return res.status(403).json({ok:false,error:'Acesso ao agendamento não autorizado'});
     if (!ag || ag.pagamento_status !== 'pendente') return res.status(409).json({ok:false,error:'Agendamento indisponível'});
     if (ag.stripe_checkout_session_id) {
       const antiga=await stripe.checkout.sessions.retrieve(ag.stripe_checkout_session_id);
