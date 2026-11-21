@@ -13374,9 +13374,15 @@ app.post("/api/renovacao/pagbank/order", rlGeral, async (req, res) => {
     const { atendimentoId, nome, email, cpf } = req.body || {};
     if (!atendimentoId || !nome || !cpf) return res.status(400).json({ ok: false, error: "Dados obrigatórios faltando" });
     if (!PAGBANK_TOKEN) return res.status(503).json({ ok: false, error: "Gateway de pagamento indisponível" });
-    const q = await pool.query(`SELECT id,tipo,frete_valor FROM fila_atendimentos WHERE id=$1 AND tipo LIKE 'renovacao_%'`, [atendimentoId]);
+    const q = await pool.query(`SELECT id,tipo,frete_valor,pagamento_status,pagbank_order_id,pagbank_qr_text,pagbank_qr_expira_em FROM fila_atendimentos WHERE id=$1 AND tipo LIKE 'renovacao_%'`, [atendimentoId]);
     if (!q.rowCount) return res.status(404).json({ ok: false, error: "Renovação não encontrada" });
-    const valorCentavos = renovacaoValorCentavos(q.rows[0]);
+    const renovacao=q.rows[0];
+    if (renovacao.pagamento_status!=='pendente') return res.status(409).json({ok:false,error:'Pagamento já confirmado ou solicitação indisponível'});
+    if (renovacao.pagbank_order_id && renovacao.pagbank_qr_text && renovacao.pagbank_qr_expira_em &&
+        new Date(renovacao.pagbank_qr_expira_em).getTime()>Date.now()+30000) {
+      return res.json({ok:true,order_id:renovacao.pagbank_order_id,qr_code_text:renovacao.pagbank_qr_text,reused:true,valor:renovacaoValorCentavos(renovacao)/100});
+    }
+    const valorCentavos = renovacaoValorCentavos(renovacao);
     const expiracaoISO = new Date(Date.now() + 30 * 60 * 1000).toISOString();
     const orderBody = {
       reference_id: `RENOV-${atendimentoId}-${Date.now()}`,
@@ -13393,7 +13399,11 @@ app.post("/api/renovacao/pagbank/order", rlGeral, async (req, res) => {
     }
     const qr = data.qr_codes?.[0];
     if (!qr?.text) return res.status(502).json({ ok: false, error: "PagBank não retornou QR Code" });
-    await pool.query(`UPDATE fila_atendimentos SET pagbank_order_id=$1, pagamento_metodo='pix' WHERE id=$2`, [data.id, atendimentoId]);
+    const vinculo=await pool.query(`UPDATE fila_atendimentos
+      SET pagbank_order_id=$1,pagbank_qr_text=$3,pagbank_qr_expira_em=$4,pagamento_metodo='pix'
+      WHERE id=$2 AND pagamento_status='pendente' RETURNING id`,
+      [data.id,atendimentoId,qr.text,new Date(Date.now()+30*60*1000)]);
+    if (!vinculo.rowCount) return res.status(409).json({ok:false,error:'Pagamento já confirmado. Verifique o status da solicitação.'});
     return res.json({ ok: true, order_id: data.id, qr_code_text: qr.text, valor: valorCentavos / 100 });
   } catch (e) {
     console.error("[RENOVACAO-PIX]", e.message);
