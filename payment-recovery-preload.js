@@ -66,6 +66,8 @@ async function ensureSchema() {
       UNIQUE (atendimento_id, canal)
     );
     CREATE TABLE IF NOT EXISTS pagamento_recuperacao_optout (email_hash TEXT PRIMARY KEY, criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW());
+    CREATE TABLE IF NOT EXISTS pagamento_recuperacao_acessos (id BIGSERIAL PRIMARY KEY, atendimento_id BIGINT NOT NULL, evento TEXT NOT NULL CHECK (evento IN ('aberto','checkout_reaberto')), criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW());
+    CREATE INDEX IF NOT EXISTS idx_pagamento_recuperacao_acessos_atendimento ON pagamento_recuperacao_acessos (atendimento_id,criado_em);
     CREATE INDEX IF NOT EXISTS idx_pagamento_recuperacao_eventos_atendimento
       ON pagamento_recuperacao_eventos(atendimento_id);
   `);
@@ -87,7 +89,7 @@ function identityMatchSql(alias = 'x') {
 
 async function candidates(minutes, canal) {
   const { rows } = await pool.query(`
-    SELECT f.id,f.nome,f.tel,f.cpf,f.pagador_cpf,f.email,f.pagador_email,
+    SELECT f.id,f.nome,f.tel,f.cpf,f.pagador_cpf,f.email,f.pagador_email,f.tipo,
            f.criado_em,f.pagbank_order_id,f.pagbank_qr_text,f.efi_charge_id
       FROM fila_atendimentos f
      WHERE f.pagamento_status = 'pendente'
@@ -195,12 +197,88 @@ function validateUnsubscribeToken(token) {
   const expected=crypto.createHmac('sha256',process.env.JWT_SECRET).update(`${hash}.${exp}`).digest('hex');
   return crypto.timingSafeEqual(Buffer.from(expected,'hex'), Buffer.from(sig,'hex')) ? hash : null;
 }
+// O email é a prova de posse: link individual, assinado e temporário (48h).
+const RECOVERY_LIFETIME_SECONDS = 48 * 60 * 60;
+function recoveryToken(atendimentoId, email) {
+  if (!process.env.JWT_SECRET) return '';
+  const id = String(atendimentoId);
+  const exp = String(Math.floor(Date.now() / 1000) + RECOVERY_LIFETIME_SECONDS);
+  const recipient = emailHash(email);
+  const data = `v1.${id}.${exp}.${recipient}`;
+  const sig = crypto.createHmac('sha256', process.env.JWT_SECRET).update(data).digest('hex');
+  return `${data}.${sig}`;
+}
+function verifyRecoveryToken(token) {
+  if (!process.env.JWT_SECRET || String(token || '').length > 300) return null;
+  const fields = String(token || '').split('.');
+  if (fields.length !== 5 || fields[0] !== 'v1') return null;
+  const [, id, exp, recipient, sig] = fields;
+  const now = Math.floor(Date.now() / 1000);
+  if (!/^[1-9]\d{0,17}$/.test(id) || !/^\d{10}$/.test(exp) ||
+      Number(exp) < now || Number(exp) > now + RECOVERY_LIFETIME_SECONDS ||
+      !/^[a-f0-9]{64}$/.test(recipient) || !/^[a-f0-9]{64}$/.test(sig)) return null;
+  const payload = fields.slice(0, 4).join('.');
+  const expected = crypto.createHmac('sha256', process.env.JWT_SECRET).update(payload).digest('hex');
+  if (!crypto.timingSafeEqual(Buffer.from(expected,'hex'),Buffer.from(sig,'hex'))) return null;
+  return { id, recipient };
+}
+async function logRecoveryAccess(id, evento) {
+  await pool.query('INSERT INTO pagamento_recuperacao_acessos (atendimento_id,evento) VALUES ($1,$2)',[id,evento]);
+}
+
 const originalRecoveryInit = express.application.init;
 express.application.init = function (...args) {
   const result = originalRecoveryInit.apply(this,args);
   this.get('/api/payment-recovery/unsubscribe', (req,res) => {
     if (!validateUnsubscribeToken(req.query.token)) return res.status(400).send('Este link expirou ou não é válido.');
     res.set('Cache-Control','no-store').type('html').send(`<!doctype html><html lang="pt-BR"><meta name="viewport" content="width=device-width, initial-scale=1"><body style="background:#07100f;color:#fff;font:16px Arial;padding:12vh 20px;text-align:center"><h2>Consulta<span style="color:#16c783">Já</span>24h</h2><p>Deseja deixar de receber lembretes de pagamentos não concluídos?</p><form method="POST" action="/api/payment-recovery/unsubscribe?token=${encodeURIComponent(req.query.token)}"><button style="background:#16c783;border:0;border-radius:12px;padding:15px 24px;font-weight:bold">Cancelar estes lembretes</button></form></body></html>`);
+  });
+  // A URL é removida do navegador antes dos scripts de anúncios. Nunca expor token em logs.
+  this.post('/api/payment-recovery/restore', async (req,res) => {
+    res.set('Cache-Control','no-store').set('Referrer-Policy','no-referrer');
+    const valid = verifyRecoveryToken(req.body?.token);
+    if (!valid) return res.status(400).json({ok:false,error:'Link inválido ou expirado. Abra um novo atendimento.'});
+    try {
+      const {rows}=await pool.query(`SELECT id,tipo,status,pagamento_status,nome,tel,cpf,email,
+        pagador_nome,pagador_cpf,pagador_email,atendimento_para_terceiro,
+        especialidade_solicitada,anexos_urls,pagbank_order_id
+        FROM fila_atendimentos WHERE id=$1 LIMIT 1`,[valid.id]);
+      const at=rows[0];
+      if (!at || ![validEmail(at.pagador_email),validEmail(at.email)].some(email=>email && emailHash(email)===valid.recipient)) {
+        return res.status(404).json({ok:false,error:'Atendimento não localizado.'});
+      }
+      await logRecoveryAccess(at.id,'aberto');
+      if (at.pagamento_status==='confirmado') return res.json({ok:true,estado:'pago'});
+      if (at.pagamento_status!=='pendente' || ['cancelado','expirado','arquivado'].includes(at.status)) {
+        return res.json({ok:true,estado:'indisponivel'});
+      }
+      return res.json({ok:true,estado:'pendente',atendimento:{
+        id:at.id,tipo:at.tipo,nome:at.nome||'',tel:at.tel||'',
+        cpf:at.cpf||'',email:at.email||'',pagador_nome:at.pagador_nome||'',
+        pagador_cpf:at.pagador_cpf||'',pagador_email:at.pagador_email||'',
+        atendimento_para_terceiro:!!at.atendimento_para_terceiro,
+        especialidade_solicitada:at.especialidade_solicitada||'',
+        anexo_receita_ok:!!at.anexos_urls?.receita_anterior
+      }});
+    } catch(err) {
+      console.warn('[PAYMENT-RECOVERY] restore:',err.message);
+      return res.status(503).json({ok:false,error:'Não foi possível recuperar agora.'});
+    }
+  });
+  this.post('/api/payment-recovery/checkout-opened',async(req,res)=>{
+    res.set('Cache-Control','no-store');
+    const valid=verifyRecoveryToken(req.body?.token);
+    if (!valid) return res.status(400).json({ok:false});
+    try {
+      const {rows}=await pool.query('SELECT email,pagador_email,pagamento_status FROM fila_atendimentos WHERE id=$1',[valid.id]);
+      const at=rows[0];
+      if (!at || at.pagamento_status!=='pendente' ||
+        ![validEmail(at.email),validEmail(at.pagador_email)].some(v=>v&&emailHash(v)===valid.recipient)) {
+        return res.status(409).json({ok:false});
+      }
+      await logRecoveryAccess(valid.id,'checkout_reaberto');
+      return res.json({ok:true});
+    } catch { return res.status(503).json({ok:false}); }
   });
   this.post('/api/payment-recovery/unsubscribe', async (req,res) => {
     const hash=validateUnsubscribeToken(req.query.token);
@@ -210,20 +288,23 @@ express.application.init = function (...args) {
   });
   return result;
 };
-function emailContent(firstName, unsubscribeUrl) {
+function emailContent(firstName, unsubscribeUrl, url, isRenewal = false) {
   const greeting=firstName ? `Olá, ${htmlEscape(firstName)}!` : 'Olá!';
-  const url=`${SITE_URL}/consulta/`;
-  const subject='Sua consulta pode continuar de onde parou';
-  const html=`<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head><body style="margin:0;background:#07100f;font-family:Arial,sans-serif;color:#14201d"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#07100f"><tr><td align="center" style="padding:28px 12px"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;background:#fff;border-radius:18px;overflow:hidden"><tr><td align="center" style="background:#0b211a;padding:32px 24px"><span style="font:bold italic 29px Georgia,serif;color:#f4f3e9">Consulta</span><span style="font:bold italic 29px Georgia,serif;color:#78f25f">Já</span><span style="font:14px Arial;color:#a0ada7">24h</span><p style="color:#b5c9be;font-size:12px;margin:12px 0 0">Atendimento médico online, no seu tempo.</p></td></tr><tr><td style="padding:34px 30px"><p style="color:#65736d;margin:0 0 16px;font-size:15px">${greeting}</p><h1 style="color:#14201d;font-size:26px;line-height:1.25;margin:0 0 20px">Sua consulta pode continuar de onde parou.</h1><p style="color:#4b5563;font-size:15px;line-height:1.7">Você iniciou um atendimento na ConsultaJá24h, mas o pagamento ainda não foi confirmado.</p><p style="color:#4b5563;font-size:15px;line-height:1.7;margin-bottom:28px">Se ainda precisar de atendimento, estamos à disposição para ajudar.</p><table role="presentation" width="100%"><tr><td align="center" bgcolor="#16c783" style="border-radius:12px"><a href="${url}" style="display:block;padding:17px;color:#07100f;text-decoration:none;font:bold 16px Arial">Continuar minha consulta</a></td></tr></table><p style="color:#718077;font-size:12px;text-align:center">Se possível, volte pelo mesmo dispositivo.</p><p style="border-top:1px solid #e8ede9;padding-top:20px;margin-top:25px;color:#66736e;font-size:13px">Precisa de ajuda? <a href="mailto:contato@consultaja24h.com.br" style="color:#0b8f61">Fale com o suporte</a>.</p></td></tr><tr><td style="background:#f7fbf8;text-align:center;padding:24px 22px"><p style="color:#314439;font-size:13px;font-weight:bold">ConsultaJá24h</p><p style="color:#8a97a6;font-size:11px;line-height:1.5">Este lembrete não contém informações clínicas. Se você já pagou, desconsidere.</p><a href="${unsubscribeUrl}" style="font:12px Arial;color:#678177;text-decoration:underline">Não quero receber estes lembretes</a></td></tr></table><p style="color:#8ca19a;font-size:11px;text-align:center">ConsultaJá24h · São Luís, MA · Brasil</p></td></tr></table></body></html>`;
-  const text=`${firstName ? `Olá, ${firstName}!` : 'Olá!'}\n\nSua consulta pode continuar de onde parou. Você iniciou um atendimento na ConsultaJá24h, mas o pagamento ainda não foi confirmado.\n\nContinuar: ${url}\nSuporte: contato@consultaja24h.com.br\nCancelar lembretes: ${unsubscribeUrl}`;
+  const subject=isRenewal ? 'Sua renovação de receita pode continuar' : 'Sua consulta pode continuar de onde parou';
+  const html=`<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head><body style="margin:0;background:#07100f;font-family:Arial,sans-serif;color:#14201d"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#07100f"><tr><td align="center" style="padding:28px 12px"><table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;background:#fff;border-radius:18px;overflow:hidden"><tr><td align="center" style="background:#0b211a;padding:32px 24px"><span style="font:bold italic 29px Georgia,serif;color:#f4f3e9">Consulta</span><span style="font:bold italic 29px Georgia,serif;color:#78f25f">Já</span><span style="font:14px Arial;color:#a0ada7">24h</span><p style="color:#b5c9be;font-size:12px;margin:12px 0 0">Atendimento médico online, no seu tempo.</p></td></tr><tr><td style="padding:34px 30px"><p style="color:#65736d;margin:0 0 16px;font-size:15px">${greeting}</p><h1 style="color:#14201d;font-size:26px;line-height:1.25;margin:0 0 20px">Sua ${isRenewal ? 'renovação de receita' : 'consulta'} pode continuar de onde parou.</h1><p style="color:#4b5563;font-size:15px;line-height:1.7">Você iniciou ${isRenewal ? 'uma renovação de receita' : 'um atendimento'} na ConsultaJá24h, mas o pagamento ainda não foi confirmado.</p><p style="color:#4b5563;font-size:15px;line-height:1.7;margin-bottom:28px">Se ainda precisar de atendimento, estamos à disposição para ajudar.</p><table role="presentation" width="100%"><tr><td align="center" bgcolor="#16c783" style="border-radius:12px"><a href="${url}" style="display:block;padding:17px;color:#07100f;text-decoration:none;font:bold 16px Arial">Continuar ${isRenewal ? 'minha renovação' : 'minha consulta'}</a></td></tr></table><p style="color:#718077;font-size:12px;text-align:center">Se possível, volte pelo mesmo dispositivo.</p><p style="border-top:1px solid #e8ede9;padding-top:20px;margin-top:25px;color:#66736e;font-size:13px">Precisa de ajuda? <a href="mailto:contato@consultaja24h.com.br" style="color:#0b8f61">Fale com o suporte</a>.</p></td></tr><tr><td style="background:#f7fbf8;text-align:center;padding:24px 22px"><p style="color:#314439;font-size:13px;font-weight:bold">ConsultaJá24h</p><p style="color:#8a97a6;font-size:11px;line-height:1.5">Este lembrete não contém informações clínicas. Se você já pagou, desconsidere.</p><a href="${unsubscribeUrl}" style="font:12px Arial;color:#678177;text-decoration:underline">Não quero receber estes lembretes</a></td></tr></table><p style="color:#8ca19a;font-size:11px;text-align:center">ConsultaJá24h · São Luís, MA · Brasil</p></td></tr></table></body></html>`;
+  const text=`${firstName ? `Olá, ${firstName}!` : 'Olá!'}\n\nSua ${isRenewal ? 'renovação de receita' : 'consulta'} pode continuar de onde parou. Você iniciou ${isRenewal ? 'uma renovação de receita' : 'um atendimento'} na ConsultaJá24h, mas o pagamento ainda não foi confirmado.\n\nContinuar: ${url}\nSuporte: contato@consultaja24h.com.br\nCancelar lembretes: ${unsubscribeUrl}`;
   return {subject, html, text};
 }
-async function sendResend(to, firstName='') {
+async function sendResend(to, firstName='', atendimentoId, tipo='chat') {
   const apiKey=String(process.env.RESEND_API_KEY || '').trim();
   if (!apiKey) return {sent:false,reason:'resend_nao_configurado'};
   if (!process.env.JWT_SECRET) return {sent:false,reason:'chave_descadastro_nao_configurada'};
   const unsubscribeUrl=`${API_URL}/api/payment-recovery/unsubscribe?token=${unsubscribeToken(to)}`;
-  const content=emailContent(firstName, unsubscribeUrl);
+  const token=recoveryToken(atendimentoId,to);
+  if (!token) return {sent:false,reason:'chave_recuperacao_nao_configurada'};
+  const base=String(tipo||'').startsWith('renovacao_') ? '/renovacao-de-receita/' : '/consulta/';
+  const recoveryUrl=`${SITE_URL}${base}?recuperar=${encodeURIComponent(token)}`;
+  const content=emailContent(firstName, unsubscribeUrl, recoveryUrl,base.includes('renovacao'));
   const response=await fetch('https://api.resend.com/emails',{method:'POST',headers:{'Content-Type':'application/json',Authorization:`Bearer ${apiKey}`},body:JSON.stringify({from:RESEND_FROM,to:[to],...content,headers:{'List-Unsubscribe':`<${unsubscribeUrl}>`,'List-Unsubscribe-Post':'List-Unsubscribe=One-Click'},tags:[{name:'tipo',value:'pagamento_recuperacao'}]})});
   const payload=await response.json().catch(()=>({}));
   return response.ok && payload?.id ? {sent:true,reason:'enviado'} : {sent:false,reason:`resend_${response.status}:${JSON.stringify(payload).slice(0,180)}`};
@@ -253,7 +334,7 @@ async function processEmail() {
     const optout=await pool.query('SELECT 1 FROM pagamento_recuperacao_optout WHERE email_hash=$1',[emailHash(email)]);
     if(optout.rowCount){await record(row.id,'email','ignorado','descadastrado');continue;}
     const firstName=(email===validEmail(row.email) && String(row.nome||'').trim().split(/\s+/).length>=2) ? String(row.nome).trim().split(/\s+/)[0] : '';
-    const result = await sendResend(email,firstName).catch((e) => ({ sent: false, reason: e?.message || 'erro_email' }));
+    const result = await sendResend(email,firstName,row.id,row.tipo).catch((e) => ({ sent: false, reason: e?.message || 'erro_email' }));
     if (!result.sent && ['resend_nao_configurado','chave_descadastro_nao_configurada'].includes(result.reason)) {
       continue;
     }
