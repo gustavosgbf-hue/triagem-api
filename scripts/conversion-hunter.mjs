@@ -57,7 +57,10 @@ async function main() {
           OR NULLIF(BTRIM(COALESCE(stripe_checkout_session_id,'')),'') IS NOT NULL
         ))::int AS pendentes_com_cobranca,
         COUNT(*) FILTER (WHERE pagamento_status='pendente'
-          AND criado_em < NOW() - INTERVAL '30 minutes')::int AS pendentes_mais_30min
+          AND criado_em < NOW() - INTERVAL '30 minutes'
+          AND (NULLIF(BTRIM(COALESCE(pagbank_order_id,'')),'') IS NOT NULL
+               OR NULLIF(BTRIM(COALESCE(efi_charge_id::text,'')),'') IS NOT NULL
+               OR NULLIF(BTRIM(COALESCE(stripe_checkout_session_id,'')),'') IS NOT NULL))::int AS pendentes_mais_30min
       FROM fila_atendimentos
       WHERE tipo IN ('chat','video','renovacao_digital')
         AND criado_em >= NOW() - ($1::integer * INTERVAL '1 hour')
