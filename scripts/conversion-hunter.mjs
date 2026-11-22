@@ -62,7 +62,10 @@ async function main() {
       WHERE tipo IN ('chat','video','renovacao_digital')
         AND criado_em >= NOW() - ($1::integer * INTERVAL '1 hour')
     `, [HOURS]);
-    const { rows: [rec] } = await client.query(`
+    const { rows: [{ has_events, has_accesses }] } = await client.query(
+      "SELECT to_regclass('public.pagamento_recuperacao_eventos') IS NOT NULL AS has_events, to_regclass('public.pagamento_recuperacao_acessos') IS NOT NULL AS has_accesses"
+    );
+    const { rows: [rec] } = has_events ? await client.query(`
       SELECT
         COUNT(*) FILTER (WHERE e.canal='push' AND e.status='enviado')::int AS push_enviado,
         COUNT(*) FILTER (WHERE e.canal='email' AND e.status='enviado')::int AS email_enviado,
@@ -70,20 +73,14 @@ async function main() {
         COUNT(*) FILTER (WHERE e.canal='email' AND e.status='ignorado')::int AS email_ignorado
       FROM pagamento_recuperacao_eventos e
       WHERE e.criado_em >= NOW() - ($1::integer * INTERVAL '1 hour')
-    `, [HOURS]).catch(error => {
-      if (error.code === '42P01') return { rows: [{ push_enviado: 0, email_enviado: 0, email_erro: 0, email_ignorado: 0 }] };
-      throw error;
-    });
-    const { rows: [access] } = await client.query(`
+    `, [HOURS]) : { rows: [{ push_enviado: 0, email_enviado: 0, email_erro: 0, email_ignorado: 0 }] };
+    const { rows: [access] } = has_accesses ? await client.query(`
       SELECT
         COUNT(*) FILTER (WHERE evento='aberto')::int AS links_abertos,
         COUNT(*) FILTER (WHERE evento='checkout_reaberto')::int AS checkouts_reabertos
       FROM pagamento_recuperacao_acessos
       WHERE criado_em >= NOW() - ($1::integer * INTERVAL '1 hour')
-    `, [HOURS]).catch(error => {
-      if (error.code === '42P01') return { rows: [{ links_abertos: 0, checkouts_reabertos: 0 }] };
-      throw error;
-    });
+    `, [HOURS]) : { rows: [{ links_abertos: 0, checkouts_reabertos: 0 }] };
     await client.query('COMMIT');
     const f = Object.fromEntries(Object.entries(raw).map(([k,v]) => [k,number(v)]));
     f.taxa_confirmacao_pct = pct(f.confirmados_com_cobranca,f.com_pagamento_iniciado);
