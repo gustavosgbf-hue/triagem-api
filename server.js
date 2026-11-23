@@ -13097,6 +13097,7 @@ async function enviarEmailRenovacaoAdmin(at) {
   const esc = (v) => String(v || "").replace(/</g, "&lt;").replace(/>/g, "&gt;");
   const tipoLabel = at.questionario?.origem_pedido === "tratamento_peso_glp1" ? "GLP-1 / CONTROLE DO PESO" : at.tipo === "renovacao_fisica" ? "FÍSICA" : "DIGITAL";
   const labelsQuestionario = {
+    tipo_receita: "Tipo de receita informado",
     condicao_diagnostico: "Condição/diagnóstico",
     tempo_uso: "Tempo de uso",
     mudanca_dose: "Mudança de dose",
