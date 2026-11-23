@@ -222,6 +222,9 @@ function installChatExperience(app) {
       if (!['confirmado','isento_admin'].includes(String(atendimento.pagamento_status || '').toLowerCase())) {
         return res.status(402).json({ ok: false, error: 'Pagamento confirmado é necessário para acessar esta consulta.' });
       }
+      if (String(atendimento.tipo || '').toLowerCase().startsWith('renovacao_')) {
+        return res.status(403).json({ ok: false, error: 'Renovação de receita não possui chat. A solicitação será analisada com a documentação enviada.' });
+      }
       if (String(atendimento.status || '').toLowerCase() !== 'assumido' || !atendimento.medico_id) {
         return res.status(409).json({ ok: false, error: 'Este atendimento não está mais disponível para novas mensagens.' });
       }
