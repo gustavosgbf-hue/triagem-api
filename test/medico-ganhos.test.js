@@ -35,6 +35,9 @@ test('classificação de faixa por nome/e-mail', () => {
   assert.equal(classificarFaixaMedico({ nome: 'X', nome_exibicao: 'Dra. Victoria' }, ADMIN), 'reduzida');
   assert.equal(classificarFaixaMedico({ nome: 'Gabriel Bomfim' }, ADMIN), 'reduzida');
   assert.equal(classificarFaixaMedico({ nome: 'Gabriel Santos' }, ADMIN), 'padrao');
+  assert.equal(classificarFaixaMedico({ nome: 'Gabriela Coutinho Amorim Carneiro', nome_exibicao: 'Dra. Gabriela Coutinho A. Carneiro' }, ADMIN), 'reduzida');
+  assert.equal(classificarFaixaMedico({ nome: 'Dra. Gabriela Coutinho' }, ADMIN), 'reduzida');
+  assert.equal(classificarFaixaMedico({ nome: 'Gabriela Lima' }, ADMIN), 'padrao');
   assert.equal(classificarFaixaMedico({ nome: 'Ana', email: ' Admin@Example.test ' }, ADMIN), 'admin');
   assert.equal(classificarFaixaMedico({ nome: 'Ana' }, ADMIN), 'padrao');
 });

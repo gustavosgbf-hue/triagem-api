@@ -3,7 +3,7 @@
 // Regra autorizada pelo dono em 17/11/2026:
 //   - vigência: atendimentos encerrados a partir de 2026-11-16 00:00 America/Fortaleza;
 //   - base: preço da consulta clínica R$ 49,90 (4990 centavos);
-//   - faixa "reduzida" (Kivia, Victoria/Victória, Gabriel Bomfim): 55% → 2745 centavos (half-up);
+//   - faixa "reduzida" (Kivia, Victoria/Victória, Gabriel Bomfim, Gabriela Coutinho): 55% → 2745 centavos (half-up);
 //   - faixa "padrão" (demais médicos): 70% → 3493 centavos;
 //   - médico admin: 4990 centavos (bruto integral).
 //
@@ -49,6 +49,7 @@ export function classificarFaixaMedico(medico, adminEmail) {
   if (palavras.has("kivia")) return "reduzida";
   if (palavras.has("victoria")) return "reduzida";
   if (palavras.has("gabriel") && palavras.has("bomfim")) return "reduzida";
+  if (palavras.has("gabriela") && palavras.has("coutinho")) return "reduzida";
   return "padrao";
 }
 
