@@ -5034,13 +5034,15 @@ app.post("/api/chat/upload", rlUpload, upload.single("arquivo"), async (req, res
     const { atendimentoId, autor, autorId } = req.body || {};
     if (!atendimentoId || !autor) return res.status(400).json({ ok: false, error: "atendimentoId e autor obrigatorios" });
     if (!["paciente","medico"].includes(autor)) return res.status(400).json({ ok: false, error: "autor deve ser paciente ou medico" });
-    const atendimento = await pool.query(`SELECT id,status,medico_id FROM fila_atendimentos WHERE id=$1`, [atendimentoId]);
+    const atendimento = await pool.query(`SELECT id,status,medico_id,tipo FROM fila_atendimentos WHERE id=$1`, [atendimentoId]);
     if (!atendimento.rowCount) return res.status(404).json({ ok: false, error: "Atendimento nao encontrado" });
     if (autor === "medico") {
       const med = decodificarMedicoRequest(req);
       if (!med) return res.status(401).json({ ok: false, error: "Token de medico obrigatorio" });
       if (!medicoPodeEscreverNoAtendimento(med, atendimento.rows[0])) return res.status(403).json({ ok: false, error: "Medico nao vinculado ao atendimento" });
       req.body.autorId = med.id;
+    } else if (String(atendimento.rows[0].tipo || "").startsWith("renovacao_")) {
+      return res.status(403).json({ ok: false, error: "Renovação de receita não possui chat. Sua receita anterior e as informações do formulário serão avaliadas pelo médico." });
     } else if (atendimento.rows[0].status !== "assumido") {
       return res.status(403).json({ ok: false, error: "Chat indisponivel para envio neste atendimento" });
     } else if (!origemPacientePermitida(req)) {
@@ -5071,7 +5073,7 @@ app.post("/api/chat/enviar", rlMensagem, async (req, res) => {
     const { atendimentoId, autor, autorId, texto, arquivo_url, arquivo_tipo } = req.body || {};
     if (!atendimentoId||!autor||(!texto&&!arquivo_url)) return res.status(400).json({ ok: false, error: "Campos obrigatorios: atendimentoId, autor, texto ou arquivo" });
     if (!["paciente","medico"].includes(autor)) return res.status(400).json({ ok: false, error: "autor deve ser paciente ou medico" });
-    const atendimento = await pool.query(`SELECT id,status,medico_id FROM fila_atendimentos WHERE id=$1`, [atendimentoId]);
+    const atendimento = await pool.query(`SELECT id,status,medico_id,tipo FROM fila_atendimentos WHERE id=$1`, [atendimentoId]);
     if (!atendimento.rowCount) return res.status(404).json({ ok: false, error: "Atendimento nao encontrado" });
     let autorIdSeguro = autorId || null;
     if (autor === "medico") {
@@ -5079,6 +5081,8 @@ app.post("/api/chat/enviar", rlMensagem, async (req, res) => {
       if (!med) return res.status(401).json({ ok: false, error: "Token de medico obrigatorio" });
       if (!medicoPodeEscreverNoAtendimento(med, atendimento.rows[0])) return res.status(403).json({ ok: false, error: "Medico nao vinculado ao atendimento" });
       autorIdSeguro = med.id;
+    } else if (String(atendimento.rows[0].tipo || "").startsWith("renovacao_")) {
+      return res.status(403).json({ ok: false, error: "Renovação de receita não possui chat. Sua receita anterior e as informações do formulário serão avaliadas pelo médico." });
     } else if (atendimento.rows[0].status !== "assumido") {
       return res.status(403).json({ ok: false, error: "Chat indisponivel para envio neste atendimento" });
     } else if (!origemPacientePermitida(req)) {
@@ -13089,10 +13093,11 @@ async function enviarEmailRenovacaoAdmin(at) {
   if (!RESEND_KEY) return;
   const anexos = at.anexos_urls || {};
   const endereco = at.endereco_envio || {};
-  const questionario = at.questionario || {};
+  const questionario = normalizarObjetoJson(at.questionario);
   const esc = (v) => String(v || "").replace(/</g, "&lt;").replace(/>/g, "&gt;");
   const tipoLabel = at.questionario?.origem_pedido === "tratamento_peso_glp1" ? "GLP-1 / CONTROLE DO PESO" : at.tipo === "renovacao_fisica" ? "FÍSICA" : "DIGITAL";
   const labelsQuestionario = {
+    tipo_receita: "Tipo de receita informado",
     condicao_diagnostico: "Condição/diagnóstico",
     tempo_uso: "Tempo de uso",
     mudanca_dose: "Mudança de dose",
@@ -13110,7 +13115,7 @@ async function enviarEmailRenovacaoAdmin(at) {
     declara_avaliacao: "Ciente da avaliação médica"
   };
   const linhasQuestionario = Object.entries(labelsQuestionario)
-    .filter(([key]) => questionario[key])
+    .filter(([key]) => questionario[key] !== null && questionario[key] !== undefined && questionario[key] !== "")
     .map(([key, label]) => `<div style="margin:6px 0"><strong>${label}:</strong> ${esc(typeof questionario[key] === "boolean" ? (questionario[key] ? "Sim" : "Não") : questionario[key])}</div>`)
     .join("");
   const html = `
@@ -13118,13 +13123,11 @@ async function enviarEmailRenovacaoAdmin(at) {
       <div style="max-width:640px;margin:auto;background:white;border-radius:12px;padding:24px">
         <div style="display:inline-block;background:#0c4a30;color:white;padding:6px 12px;border-radius:6px;font-weight:700;font-size:12px">RENOVAÇÃO ${tipoLabel}</div>
         <h2 style="margin:16px 0 6px;color:#111">${at.nome || "Paciente"}</h2>
-        <p style="color:#555;margin:0 0 16px">Tel: ${at.tel || ""} · CPF: ${at.cpf || ""} · ID #${at.id}</p>
+        <p style="color:#555;margin:0 0 16px">Tel: ${esc(at.tel)} · CPF: ${esc(at.cpf)} · ID #${at.id}<br>E-mail para prescrição: ${esc(at.email || "Não informado")}<br>Nascimento: ${esc(at.data_nascimento || "Não informado")}</p>
         <h3 style="margin:18px 0 6px;color:#111">Medicamentos solicitados</h3>
         <div style="white-space:pre-wrap;background:#f3f4f6;border-radius:8px;padding:12px;color:#222">${esc(at.medicacoes)}</div>
-        ${linhasQuestionario ? `
-          <h3 style="margin:18px 0 6px;color:#111">Questionário clínico</h3>
-          <div style="background:#f0fdf4;border-left:4px solid #16a34a;border-radius:8px;padding:12px;color:#222;line-height:1.5">${linhasQuestionario}</div>
-        ` : ""}
+        <h3 style="margin:18px 0 6px;color:#111">Questionário clínico</h3>
+        <div style="background:#f0fdf4;border-left:4px solid #16a34a;border-radius:8px;padding:12px;color:#222;line-height:1.5">${linhasQuestionario || "Não recebido do formulário. Conferir receita anterior e informações disponíveis antes da decisão clínica."}</div>
         <h3 style="margin:18px 0 6px;color:#111">Anexos</h3>
         <p>${anexos.receita_anterior ? `<a href="${anexos.receita_anterior}">Receita anterior</a>` : "Receita anterior não encontrada"}</p>
         ${anexos.documento ? `<p><a href="${anexos.documento}">Documento com foto</a></p>` : ""}
@@ -13181,7 +13184,7 @@ async function confirmarRenovacaoPorId(id, origem = "manual") {
       WHERE id=$1
         AND tipo LIKE 'renovacao_%'
         AND pagamento_status='pendente'
-      RETURNING id,nome,tel,cpf,tipo,medicacoes,questionario,anexos_urls,endereco_envio,frete_modalidade,frete_valor,email`,
+      RETURNING id,nome,tel,cpf,tipo,medicacoes,questionario,anexos_urls,endereco_envio,frete_modalidade,frete_valor,email,data_nascimento`,
     [id]
   );
   if (upd.rowCount) {
