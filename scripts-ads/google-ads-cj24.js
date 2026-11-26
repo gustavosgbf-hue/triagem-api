@@ -48,7 +48,7 @@ function main() {
       passo_orcamento: MAX_PASSO_ORCAMENTO, tcpa_min: TCPA_MIN, tcpa_max: TCPA_MAX, passo_tcpa: MAX_PASSO_TCPA },
     gasto: coletarGasto(dia(DIAS_GASTO - 1), dia(0), cid),
     campanhas: coletarCampanhas(dia(13), dia(0)),
-    mudancas: coletarMudancas(dia(29)),
+    mudancas: coletarMudancas(dia(29), dia(-1)),
     conversoes: coletar('SELECT conversion_action.id, conversion_action.name, conversion_action.status, conversion_action.primary_for_goal, ' +
       "conversion_action.category, conversion_action.click_through_lookback_window_days FROM conversion_action WHERE conversion_action.status = 'ENABLED'", function (r) {
         return { id: String(r.conversionAction.id), nome: r.conversionAction.name, principal: !!r.conversionAction.primaryForGoal,
@@ -160,9 +160,9 @@ function coletarPalavras(de, ate) {
 
 // Histórico de alterações (30 dias) em campanha e orçamento: o Autopilot respeita o ciclo de aprendizado
 // também quando a mudança foi feita manualmente por você.
-function coletarMudancas(desde) {
+function coletarMudancas(desde, ate) {
   return coletar('SELECT change_event.change_date_time, change_event.change_resource_type, change_event.changed_fields, ' +
-    "change_event.client_type, campaign.id FROM change_event WHERE change_event.change_date_time >= '" + desde + "' " +
+    "change_event.client_type, campaign.id FROM change_event WHERE change_event.change_date_time >= '" + desde + "' AND change_event.change_date_time <= '" + ate + "' " +
     "AND change_event.change_resource_type IN ('CAMPAIGN', 'CAMPAIGN_BUDGET', 'AD_GROUP_CRITERION') " +
     'ORDER BY change_event.change_date_time DESC LIMIT 500', function (r) {
       return { quando: r.changeEvent.changeDateTime, recurso: r.changeEvent.changeResourceType,
