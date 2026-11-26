@@ -19,6 +19,16 @@ const LEGACY_APP_REVIEW_PHONE = '98991344646';
 const APP_REVIEW_CODE = '246810';
 const APP_REVIEW_NAME = 'Apple Review Patient';
 const JSON_BODY = express.json({ limit: '32kb' });
+// These routes are installed before the application's global middleware.
+function otpWebCors(req, res, next) {
+  const origin = req.get('Origin');
+  if (origin === 'https://consultaja24h.com.br' || origin === 'https://www.consultaja24h.com.br') {
+    res.set('Access-Control-Allow-Origin', origin);
+    res.vary('Origin');
+  }
+  res.set('Cache-Control', 'no-store');
+  next();
+}
 
 function digits(value) {
   return String(value || '').replace(/\D/g, '');
@@ -320,7 +330,7 @@ function installMobileOtpRoutes(app) {
   if (app.locals.__mobileOtpInstalled) return;
   app.locals.__mobileOtpInstalled = true;
 
-  app.post('/api/paciente/otp/solicitar', JSON_BODY, async (req, res) => {
+  app.post('/api/paciente/otp/solicitar', otpWebCors, JSON_BODY, async (req, res) => {
     try {
       await otpTableReady();
       const phone = normalizePhone(req.body?.telefone);
@@ -369,7 +379,7 @@ function installMobileOtpRoutes(app) {
     }
   });
 
-  app.post('/api/paciente/otp/verificar', JSON_BODY, async (req, res) => {
+  app.post('/api/paciente/otp/verificar', otpWebCors, JSON_BODY, async (req, res) => {
     try {
       await otpTableReady();
       const challengeId = String(req.body?.challenge_id || '').trim();
