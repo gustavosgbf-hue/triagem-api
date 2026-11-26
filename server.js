@@ -1345,6 +1345,12 @@ async function enviarConversaoDataManagerGoogleAds(at, valor, currency, opts = {
   return { ok: true, requestId: data.requestId || "", validated: !!body.validateOnly, response: data };
 }
 
+// Valor efetivamente cobrado (mesmo valor que a tag do navegador envia); cai no padrão se ausente.
+function valorConversaoGoogleAds(at, padrao) {
+  const centavos = Number(at?.valor_cobrado_centavos || 0);
+  return centavos > 0 ? Math.round(centavos) / 100 : padrao;
+}
+
 async function enviarConversaoOfflineGoogleAds(at, metodo, origem, externalId, opts = {}) {
   if (!at || !at.id) return { ok: false, skipped: "sem_atendimento" };
   if (at.google_ads_offline_enviado_em && !opts.force) {
@@ -1369,7 +1375,7 @@ async function enviarConversaoOfflineGoogleAds(at, metodo, origem, externalId, o
   const dmCfg = googleDataManagerConfig();
   if (dmCfg.enabled) {
     try {
-      const dm = await enviarConversaoDataManagerGoogleAds(at, cfg.value, cfg.currency, { validateOnly: dmCfg.validateOnly });
+      const dm = await enviarConversaoDataManagerGoogleAds(at, valorConversaoGoogleAds(at, cfg.value), cfg.currency, { validateOnly: dmCfg.validateOnly });
       if (dm.ok && !dm.validated) {
         await marcarGoogleAdsOffline(at.id, "sent", { jobId: dm.requestId, orderId: String(at.id), error: "" });
         console.log("GOOGLE_DATA_MANAGER_CONVERSION_OK", { consultaId: String(at.id), requestId: dm.requestId || "" });
@@ -1396,7 +1402,7 @@ async function enviarConversaoOfflineGoogleAds(at, metodo, origem, externalId, o
     ...click.payload,
     conversionAction: cfg.actionResource,
     conversionDateTime: formatarGoogleAdsDateTime(at.pagamento_confirmado_em || new Date()),
-    conversionValue: cfg.value,
+    conversionValue: valorConversaoGoogleAds(at, cfg.value),
     currencyCode: cfg.currency,
     orderId,
     conversionEnvironment: "WEB"
@@ -1470,7 +1476,8 @@ async function logarCandidatoConversaoOffline(atendimentoId, metodo, origem, ext
   const id = parseInt(atendimentoId, 10);
   if (!id) return;
   const { rows } = await pool.query(
-    `SELECT id, tipo, nome, tel, cpf, email, pagamento_confirmado_em,
+    `SELECT id, tipo, nome, tel, cpf, email, pagamento_confirmado_em, criado_em,
+            valor_cobrado_centavos, origem_plataforma,
             ads_gclid, ads_gbraid, ads_wbraid, ads_utm, ads_checkout_session_id,
             confirmado_pageview_em, confirmado_has_ads_id,
             google_ads_offline_enviado_em
@@ -1548,6 +1555,55 @@ async function sendWhatsAppMessage(to, text) {
     console.log("Resposta enviada para", to);
   }
 }
+
+// REENVIO AUTOMATICO -- conversões de servidor (Google Ads) que ficaram pendentes.
+// Só pagamentos confirmados com identificador de clique do Google, dos últimos 30 dias.
+// Nenhum dado pessoal é enviado (GOOGLE_DATA_MANAGER_SEND_USER_DATA continua desligado);
+// o número do atendimento vai como transactionId, o que impede duplicidade no Google.
+async function reenviarConversoesServidorPendentes() {
+  const dmCfg = googleDataManagerConfig();
+  if (!dmCfg.configured || dmCfg.validateOnly) return;
+  const conexaoTrava = await pool.connect();
+  let travado = false;
+  let enviados = 0;
+  try {
+    const lock = await conexaoTrava.query("SELECT pg_try_advisory_lock(10077) AS ok");
+    travado = !!lock.rows[0]?.ok;
+    if (!travado) return;
+    const { rows } = await pool.query(
+      `SELECT id, tipo, nome, tel, cpf, email, pagamento_confirmado_em, criado_em,
+              valor_cobrado_centavos, origem_plataforma,
+              ads_gclid, ads_gbraid, ads_wbraid, google_ads_offline_enviado_em
+         FROM fila_atendimentos
+        WHERE pagamento_status = 'confirmado'
+          AND google_ads_offline_enviado_em IS NULL
+          AND pagamento_confirmado_em >= NOW() - INTERVAL '30 days'
+          AND pagamento_confirmado_em <= NOW() - INTERVAL '10 minutes'
+          AND (COALESCE(ads_gclid,'') <> '' OR COALESCE(ads_gbraid,'') <> '' OR COALESCE(ads_wbraid,'') <> '')
+          AND COALESCE(google_ads_offline_status,'') NOT IN ('sent','validated','no_match_data')
+          AND COALESCE(google_ads_offline_tentativas,0) < 5
+        ORDER BY pagamento_confirmado_em ASC
+        LIMIT 25`
+    );
+    for (const at of rows) {
+      const r = await enviarConversaoOfflineGoogleAds(at, "reenvio", "reenvio_automatico", "")
+        .catch(e => ({ ok: false, error: e.message }));
+      if (r?.ok) { enviados++; continue; }
+      if (/oauth/i.test(String(r?.error || ""))) {
+        console.warn("GOOGLE_ADS_REENVIO_PAUSADO_AUTENTICACAO", { pendentes: rows.length });
+        break;
+      }
+    }
+    if (rows.length) console.log("GOOGLE_ADS_REENVIO_RESUMO", { candidatos: rows.length, enviados });
+  } catch (e) {
+    console.warn("GOOGLE_ADS_REENVIO_ERRO", String(e?.message || e).slice(0, 200));
+  } finally {
+    if (travado) await conexaoTrava.query("SELECT pg_advisory_unlock(10077)").catch(() => {});
+    conexaoTrava.release();
+  }
+}
+setTimeout(() => reenviarConversoesServidorPendentes().catch(() => {}), 90_000).unref?.();
+setInterval(() => reenviarConversoesServidorPendentes().catch(() => {}), 30 * 60_000).unref?.();
 
 // LIMPEZA AUTOMATICA -- atendimentos travados em 'assumido' por mais de 48h
 setInterval(async () => {
