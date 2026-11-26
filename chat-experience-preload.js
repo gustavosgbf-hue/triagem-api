@@ -1,6 +1,7 @@
 import express from 'express';
 import pg from 'pg';
 import jwt from 'jsonwebtoken';
+import { ehTokenMedico } from './auth-tokens.js';
 
 const { Pool } = pg;
 const pool = new Pool({
@@ -141,7 +142,7 @@ function installChatExperience(app) {
       }
       if (!autorizado) return res.status(403).json({ ok: false, error: 'Acesso negado' });
 
-      if (decoded?.id && decoded?.tipo !== 'paciente') {
+      if (ehTokenMedico(decoded)) {
         await pool.query(
           `UPDATE mensagens
               SET lido_medico_em = COALESCE(lido_medico_em, NOW())

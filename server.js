@@ -24,6 +24,7 @@ import {
   validarDadosPrescritor,
 } from "./memed-utils.js";
 import { registrarRotaGanhosMedico } from "./medico-ganhos.js";
+import { ehTokenMedico, ehTokenPrescritor, criarVerificadorMedicoAtivo } from "./auth-tokens.js";
 import {
   AGENDA_HORIZONTE_DIAS,
   AGENDA_TZ,
@@ -2787,20 +2788,36 @@ async function atualizarRevogacoesSessaoMedico() {
 }
 setInterval(atualizarRevogacoesSessaoMedico, 60_000).unref?.();
 
-function checkMedico(req, res, next) {
+const medicoAtivoNoBanco = criarVerificadorMedicoAtivo(pool);
+
+// Rotas do painel médico: token do login médico, de médico ativo.
+async function checkMedico(req, res, next) {
   const auth = req.headers["authorization"] || "";
   const token = auth.replace(/^Bearer\s+/i, "").trim();
   if (!token) return res.status(401).json({ ok: false, error: "Token nao fornecido" });
+  let decoded;
   try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    if (medicoBloqueado(decoded)) return res.status(403).json({ ok: false, error: "Acesso desativado." });
-    if (decoded?.tipo !== "especialista" && revogacoesSessaoMedico.revogado(decoded?.id, decoded?.iat)) {
-      return res.status(401).json({ ok: false, error: "Sessão expirada. Entre novamente." });
-    }
-    req.medico = decoded; req.medicoId = decoded.id; next();
+    decoded = jwt.verify(token, JWT_SECRET);
   } catch(e) {
     return res.status(401).json({ ok: false, error: "Token invalido ou expirado" });
   }
+  if (!ehTokenMedico(decoded)) {
+    console.warn("[AUTH] Token não médico recusado em rota médica", { path: req.path, tipo: String(decoded?.tipo || "sem_tipo").slice(0, 30) });
+    return res.status(401).json({ ok: false, error: "Token invalido ou expirado" });
+  }
+  if (medicoBloqueado(decoded)) return res.status(403).json({ ok: false, error: "Acesso desativado." });
+  if (revogacoesSessaoMedico.revogado(decoded?.id, decoded?.iat)) {
+    return res.status(401).json({ ok: false, error: "Sessão expirada. Entre novamente." });
+  }
+  try {
+    if (!(await medicoAtivoNoBanco(decoded))) {
+      return res.status(401).json({ ok: false, error: "Sessão expirada. Entre novamente." });
+    }
+  } catch (e) {
+    console.error("[AUTH] Falha ao verificar médico:", e.message);
+    return res.status(503).json({ ok: false, error: "Serviço indisponível. Tente novamente." });
+  }
+  req.medico = decoded; req.medicoId = decoded.id; next();
 }
 
 const autenticarMedico = checkMedico;
@@ -2811,8 +2828,9 @@ function decodificarMedicoRequest(req) {
   if (!token) return null;
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
+    if (!ehTokenMedico(decoded)) return null;
     if (medicoBloqueado(decoded)) return null;
-    if (decoded?.tipo !== "especialista" && revogacoesSessaoMedico.revogado(decoded?.id, decoded?.iat)) return null;
+    if (revogacoesSessaoMedico.revogado(decoded?.id, decoded?.iat)) return null;
     return decoded;
   } catch {
     return null;
@@ -9490,6 +9508,9 @@ function checkMedicoOuEspecialista(req, res, next) {
   if (!token) return res.status(401).json({ ok: false, error: 'Token não fornecido' });
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
+    if (!ehTokenPrescritor(decoded)) {
+      return res.status(401).json({ ok: false, error: 'Token inválido ou expirado' });
+    }
     if (decoded.tipo === 'especialista') {
       // Monta req.medico compatível com o handler existente usando dados do especialista
       req.medico = { id: decoded.id, tipo: 'especialista' };
@@ -10598,10 +10619,16 @@ app.post("/api/atendimento/assumir", checkMedico, async (req, res) => {
   } catch (err) { return res.status(500).json({ ok: false, error: "Erro ao assumir atendimento" }); }
 });
 
-app.post("/api/atendimento/meet", async (req, res) => {
+app.post("/api/atendimento/meet", checkMedico, async (req, res) => {
   try {
     const { filaId, meetLink } = req.body || {};
     if (!filaId||!meetLink) return res.status(400).json({ ok: false, error: "filaId e meetLink obrigatorios" });
+    const vinculo = await pool.query(`SELECT id,medico_id FROM fila_atendimentos WHERE id=$1`,[filaId]);
+    if (!vinculo.rowCount) return res.status(404).json({ ok: false, error: "Atendimento nao encontrado" });
+    const souAdminMeet = String(req.medico?.email || "").trim().toLowerCase() === ADMIN_MEDICO_EMAIL;
+    if (!souAdminMeet && !medicoPodeEscreverNoAtendimento(req.medico, vinculo.rows[0])) {
+      return res.status(403).json({ ok: false, error: "Medico nao vinculado ao atendimento" });
+    }
     const result = await pool.query(`UPDATE fila_atendimentos SET meet_link=$1 WHERE id=$2 RETURNING id,meet_link`,[meetLink.trim(),filaId]);
     if (result.rowCount===0) return res.status(404).json({ ok: false, error: "Atendimento nao encontrado" });
     return res.json({ ok: true, meet_link: result.rows[0].meet_link });
@@ -10761,12 +10788,12 @@ app.get("/api/aprovacao/cancelar", async (req, res) => {
   }
 });
 
-app.post("/api/atendimento/encerrar", async (req, res) => {
+app.post("/api/atendimento/encerrar", checkMedico, async (req, res) => {
   try {
     const { filaId, status, documentos_emitidos, mostrar_avaliacao_google } = req.body || {};
     if (!filaId) return res.status(400).json({ ok: false, error: "filaId e obrigatorio" });
     const responsavel = await pool.query(
-      `SELECT LOWER(TRIM(COALESCE(m.email,''))) AS medico_email
+      `SELECT LOWER(TRIM(COALESCE(m.email,''))) AS medico_email, f.medico_id
          FROM fila_atendimentos f
          LEFT JOIN medicos m ON m.id=f.medico_id
         WHERE f.id=$1`,
@@ -10774,6 +10801,11 @@ app.post("/api/atendimento/encerrar", async (req, res) => {
     );
     if (responsavel.rowCount === 0) {
       return res.status(404).json({ ok: false, error: "Atendimento nao encontrado" });
+    }
+    // Encerrar: o médico responsável ou o administrador (encerrar travados e renovações).
+    const souAdminEncerrar = String(req.medico?.email || "").trim().toLowerCase() === ADMIN_MEDICO_EMAIL;
+    if (!souAdminEncerrar && !medicoPodeEscreverNoAtendimento(req.medico, responsavel.rows[0])) {
+      return res.status(403).json({ ok: false, error: "Medico nao vinculado ao atendimento" });
     }
     const medicoEmail = responsavel.rows[0].medico_email;
     const exibirAvaliacao = medicoEmail === ADMIN_MEDICO_EMAIL
@@ -10911,6 +10943,7 @@ app.post("/api/plantao/entrar", async (req, res) => {
   try {
     const auth = req.headers["authorization"]||"";
     const decoded = jwt.verify(auth.replace("Bearer ",""), JWT_SECRET);
+    if (!ehTokenMedico(decoded)) return res.status(401).json({ ok: false, error: "Token invalido" });
     await pool.query("UPDATE medicos SET status_online=true WHERE id=$1",[decoded.id]);
     return res.json({ ok: true });
   } catch (e) { return res.json({ ok: true }); }
@@ -10920,6 +10953,7 @@ app.post("/api/plantao/sair", async (req, res) => {
   try {
     const auth = req.headers["authorization"]||"";
     const decoded = jwt.verify(auth.replace("Bearer ",""), JWT_SECRET);
+    if (!ehTokenMedico(decoded)) return res.status(401).json({ ok: false, error: "Token invalido" });
     await pool.query("UPDATE medicos SET status_online=false WHERE id=$1",[decoded.id]);
     return res.json({ ok: true });
   } catch (e) { return res.json({ ok: true }); }
@@ -11093,7 +11127,7 @@ app.post("/api/agendamento/:id/iniciar", async (req, res) => {
   try {
     const auth=req.headers["authorization"]||"";
     let medicoId, medicoNome;
-    try { const d=jwt.verify(auth.replace("Bearer ",""),JWT_SECRET); medicoId=d.id; medicoNome=d.nome; }
+    try { const d=jwt.verify(auth.replace("Bearer ",""),JWT_SECRET); if(!ehTokenMedico(d)) throw new Error("tipo"); medicoId=d.id; medicoNome=d.nome; }
     catch(e) { return res.status(401).json({ok:false,error:"Token invalido"}); }
     // Lock: tenta marcar como 'iniciado' atomicamente — só funciona se ainda estiver 'confirmado'
     const lock = await pool.query(

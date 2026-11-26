@@ -1,6 +1,7 @@
 import express from 'express';
 import pg from 'pg';
 import jwt from 'jsonwebtoken';
+import { ehTokenMedico } from './auth-tokens.js';
 
 const { Pool } = pg;
 const pool = new Pool({
@@ -66,7 +67,7 @@ function authPaciente(req, res, next) {
 async function authAdmin(req, res, next) {
   try {
     const decoded = jwt.verify(bearer(req), process.env.JWT_SECRET || '');
-    if (!decoded?.id || decoded?.tipo === 'paciente') return res.status(401).json({ ok: false, error: 'Sessão inválida' });
+    if (!ehTokenMedico(decoded)) return res.status(401).json({ ok: false, error: 'Sessão inválida' });
     const { rows } = await pool.query('SELECT id,email FROM medicos WHERE id=$1 LIMIT 1', [Number(decoded.id)]);
     const medico = rows[0];
     if (!medico || String(medico.email || '').trim().toLowerCase() !== ADMIN_EMAIL) {
