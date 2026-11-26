@@ -53,6 +53,7 @@ import {
   tokenAcessoValido,
 } from "./agendamento-acesso.js";
 import { registrarRotasRepasses } from "./medico-repasses-admin.js";
+import { registrarRotasFinanceiro } from "./financeiro-marketing.js";
 import {
   registrarRotasRecuperacaoEspecialista,
   registrarRotasRecuperacaoMedico,
@@ -865,6 +866,22 @@ async function obterGoogleAdsAccessToken() {
     expiresAt: agora + Math.max(60, Number(data.expires_in || 3600) - 30) * 1000
   };
   return googleAdsTokenCache.token;
+}
+
+// Consulta GAQL genérica (somente leitura) usada pelo financeiro.
+async function consultarGoogleAdsGaql(query) {
+  const cfg = googleAdsOfflineConfig();
+  const token = await obterGoogleAdsAccessToken();
+  const headers = { Authorization: `Bearer ${token}`, "Content-Type": "application/json" };
+  if (process.env.GOOGLE_ADS_DEVELOPER_TOKEN) headers["developer-token"] = process.env.GOOGLE_ADS_DEVELOPER_TOKEN;
+  if (cfg.loginCustomerId) headers["login-customer-id"] = cfg.loginCustomerId;
+  const res = await fetch(`https://googleads.googleapis.com/${cfg.apiVersion}/customers/${cfg.customerId}/googleAds:searchStream`,
+    { method: "POST", headers, body: JSON.stringify({ query }) });
+  const text = await res.text();
+  let data = {};
+  try { data = text ? JSON.parse(text) : {}; } catch (_) { data = { raw: text }; }
+  if (!res.ok) throw new Error((Array.isArray(data) ? data[0]?.error?.message : data?.error?.message) || `HTTP ${res.status}`);
+  return Array.isArray(data) ? data.flatMap(x => x?.results || []) : (data?.results || []);
 }
 
 async function listarCampanhasGoogleAdsAdmin() {
@@ -10386,6 +10403,7 @@ registrarRotasRecuperacaoMedico(app, {
 // Ganhos médicos: somente leitura, agregados da própria pessoa (ver medico-ganhos.js).
 registrarRotaGanhosMedico(app, { pool, checkMedico, adminEmail: ADMIN_MEDICO_EMAIL });
 registrarRotasRepasses(app, { pool, checkMedico, adminEmail: ADMIN_MEDICO_EMAIL });
+registrarRotasFinanceiro(app, { pool, checkAdmin, adminEmail: ADMIN_MEDICO_EMAIL, consultarGoogleAds: consultarGoogleAdsGaql });
 
 app.post("/api/medico/trocar-senha", checkMedico, async (req, res) => {
   try {
