@@ -2,6 +2,7 @@ import express from 'express';
 import cors from 'cors';
 import pg from 'pg';
 import jwt from 'jsonwebtoken';
+import { ehTokenPrescritor } from './auth-tokens.js';
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 import { randomUUID } from 'crypto';
 
@@ -39,7 +40,7 @@ function authMedico(req, res, next) {
     const token = raw.replace(/^Bearer\s+/i, '').trim();
     if (!token) return res.status(401).json({ ok: false, error: 'Token não fornecido' });
     const decoded = jwt.verify(token, process.env.JWT_SECRET || '');
-    if (!decoded?.id || decoded?.tipo === 'paciente') {
+    if (!ehTokenPrescritor(decoded)) {
       return res.status(401).json({ ok: false, error: 'Token inválido' });
     }
     req.medicoId = Number(decoded.id);
