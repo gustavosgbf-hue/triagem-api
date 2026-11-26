@@ -11275,7 +11275,7 @@ app.post("/api/stripe/checkout-session", rlGeral, async (req, res) => {
       ui_mode: "elements",
       mode: "payment",
       line_items: [{ price_data: { currency: "brl", product_data: { name: nomeCobranca }, unit_amount: valorCentavos }, quantity: 1 }],
-      ...(email && /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(email) ? { customer_email: email } : {}),
+      ...(email && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ? { customer_email: email } : {}),
       return_url: returnUrl,
       metadata: { atendimento_id: String(atendimentoId), origem: "consultaja24h_web" },
       payment_intent_data: { metadata: { atendimento_id: String(atendimentoId), origem: "consultaja24h_web" } },
