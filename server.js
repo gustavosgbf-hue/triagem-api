@@ -24,6 +24,7 @@ import {
   validarDadosPrescritor,
 } from "./memed-utils.js";
 import { registrarRotaGanhosMedico } from "./medico-ganhos.js";
+import { ehTokenMedico, ehTokenPrescritor, criarVerificadorMedicoAtivo } from "./auth-tokens.js";
 import {
   AGENDA_HORIZONTE_DIAS,
   AGENDA_TZ,
@@ -2787,20 +2788,38 @@ async function atualizarRevogacoesSessaoMedico() {
 }
 setInterval(atualizarRevogacoesSessaoMedico, 60_000).unref?.();
 
-function checkMedico(req, res, next) {
+const medicoAtivoNoBanco = criarVerificadorMedicoAtivo(pool);
+
+// Rotas do painel médico: aceita SOMENTE o token do login médico.
+// Tokens de paciente, psicólogo, especialista ou de links (mesmo segredo)
+// são recusados, e o médico precisa existir, estar ativo e ter o mesmo e-mail.
+async function checkMedico(req, res, next) {
   const auth = req.headers["authorization"] || "";
   const token = auth.replace(/^Bearer\s+/i, "").trim();
   if (!token) return res.status(401).json({ ok: false, error: "Token nao fornecido" });
+  let decoded;
   try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    if (medicoBloqueado(decoded)) return res.status(403).json({ ok: false, error: "Acesso desativado." });
-    if (decoded?.tipo !== "especialista" && revogacoesSessaoMedico.revogado(decoded?.id, decoded?.iat)) {
-      return res.status(401).json({ ok: false, error: "Sessão expirada. Entre novamente." });
-    }
-    req.medico = decoded; req.medicoId = decoded.id; next();
+    decoded = jwt.verify(token, JWT_SECRET);
   } catch(e) {
     return res.status(401).json({ ok: false, error: "Token invalido ou expirado" });
   }
+  if (!ehTokenMedico(decoded)) {
+    console.warn("[AUTH] Token não médico recusado em rota médica", { path: req.path, tipo: String(decoded?.tipo || "sem_tipo").slice(0, 30) });
+    return res.status(401).json({ ok: false, error: "Token invalido ou expirado" });
+  }
+  if (medicoBloqueado(decoded)) return res.status(403).json({ ok: false, error: "Acesso desativado." });
+  if (revogacoesSessaoMedico.revogado(decoded?.id, decoded?.iat)) {
+    return res.status(401).json({ ok: false, error: "Sessão expirada. Entre novamente." });
+  }
+  try {
+    if (!(await medicoAtivoNoBanco(decoded))) {
+      return res.status(401).json({ ok: false, error: "Sessão expirada. Entre novamente." });
+    }
+  } catch (e) {
+    console.error("[AUTH] Falha ao verificar médico:", e.message);
+    return res.status(503).json({ ok: false, error: "Serviço indisponível. Tente novamente." });
+  }
+  req.medico = decoded; req.medicoId = decoded.id; next();
 }
 
 const autenticarMedico = checkMedico;
@@ -2811,8 +2830,9 @@ function decodificarMedicoRequest(req) {
   if (!token) return null;
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
+    if (!ehTokenMedico(decoded)) return null;
     if (medicoBloqueado(decoded)) return null;
-    if (decoded?.tipo !== "especialista" && revogacoesSessaoMedico.revogado(decoded?.id, decoded?.iat)) return null;
+    if (revogacoesSessaoMedico.revogado(decoded?.id, decoded?.iat)) return null;
     return decoded;
   } catch {
     return null;
@@ -9490,6 +9510,9 @@ function checkMedicoOuEspecialista(req, res, next) {
   if (!token) return res.status(401).json({ ok: false, error: 'Token não fornecido' });
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
+    if (!ehTokenPrescritor(decoded)) {
+      return res.status(401).json({ ok: false, error: 'Token inválido ou expirado' });
+    }
     if (decoded.tipo === 'especialista') {
       // Monta req.medico compatível com o handler existente usando dados do especialista
       req.medico = { id: decoded.id, tipo: 'especialista' };
@@ -10911,6 +10934,7 @@ app.post("/api/plantao/entrar", async (req, res) => {
   try {
     const auth = req.headers["authorization"]||"";
     const decoded = jwt.verify(auth.replace("Bearer ",""), JWT_SECRET);
+    if (!ehTokenMedico(decoded)) return res.status(401).json({ ok: false, error: "Token invalido" });
     await pool.query("UPDATE medicos SET status_online=true WHERE id=$1",[decoded.id]);
     return res.json({ ok: true });
   } catch (e) { return res.json({ ok: true }); }
@@ -10920,6 +10944,7 @@ app.post("/api/plantao/sair", async (req, res) => {
   try {
     const auth = req.headers["authorization"]||"";
     const decoded = jwt.verify(auth.replace("Bearer ",""), JWT_SECRET);
+    if (!ehTokenMedico(decoded)) return res.status(401).json({ ok: false, error: "Token invalido" });
     await pool.query("UPDATE medicos SET status_online=false WHERE id=$1",[decoded.id]);
     return res.json({ ok: true });
   } catch (e) { return res.json({ ok: true }); }
@@ -11093,7 +11118,7 @@ app.post("/api/agendamento/:id/iniciar", async (req, res) => {
   try {
     const auth=req.headers["authorization"]||"";
     let medicoId, medicoNome;
-    try { const d=jwt.verify(auth.replace("Bearer ",""),JWT_SECRET); medicoId=d.id; medicoNome=d.nome; }
+    try { const d=jwt.verify(auth.replace("Bearer ",""),JWT_SECRET); if(!ehTokenMedico(d)) throw new Error("tipo"); medicoId=d.id; medicoNome=d.nome; }
     catch(e) { return res.status(401).json({ok:false,error:"Token invalido"}); }
     // Lock: tenta marcar como 'iniciado' atomicamente — só funciona se ainda estiver 'confirmado'
     const lock = await pool.query(
