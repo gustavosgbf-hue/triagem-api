@@ -23,7 +23,7 @@ var CAMPANHAS_PERMITIDAS = ['23588664889']; // únicas campanhas que o Autopilot
 // Travas TÉCNICAS de segurança. Não são autorização de investimento: o teto que vale é o
 // configurado no painel (Autopilot > Limites), sempre menor ou igual a estes.
 var ORCAMENTO_MIN = 100;                    // R$/dia
-var ORCAMENTO_MAX = 1500;                   // R$/dia
+var ORCAMENTO_MAX = 500;                    // R$/dia: acima disso não há autorização
 var MAX_PASSO_ORCAMENTO = 0.15;             // variação máxima por ação (15%)
 var TCPA_MIN = 25, TCPA_MAX = 90;           // R$
 var MAX_PASSO_TCPA = 0.15;                  // 15%
@@ -49,6 +49,13 @@ function main() {
     gasto: coletarGasto(dia(DIAS_GASTO - 1), dia(0), cid),
     campanhas: coletarCampanhas(dia(13), dia(0)),
     mudancas: coletarMudancas(dia(29), dia(-1)),
+    leilao_diario: coletar('SELECT segments.date, campaign.id, metrics.impressions, metrics.clicks, metrics.cost_micros, metrics.conversions, ' +
+      'metrics.search_impression_share, metrics.search_rank_lost_impression_share, metrics.search_budget_lost_impression_share FROM campaign ' +
+      "WHERE segments.date BETWEEN '" + dia(34) + "' AND '" + dia(0) + "' AND campaign.status != 'REMOVED'", function (r) {
+        return { dia: r.segments.date, campanha_id: String(r.campaign.id), impressoes: num(r.metrics.impressions), cliques: num(r.metrics.clicks),
+          custo: micros(r.metrics.costMicros), conversoes: num(r.metrics.conversions), parcela: num(r.metrics.searchImpressionShare),
+          perdida_classificacao: num(r.metrics.searchRankLostImpressionShare), perdida_orcamento: num(r.metrics.searchBudgetLostImpressionShare) };
+      }),
     conversoes: coletar('SELECT conversion_action.id, conversion_action.name, conversion_action.status, conversion_action.primary_for_goal, ' +
       "conversion_action.category, conversion_action.click_through_lookback_window_days FROM conversion_action WHERE conversion_action.status = 'ENABLED'", function (r) {
         return { id: String(r.conversionAction.id), nome: r.conversionAction.name, principal: !!r.conversionAction.primaryForGoal,
@@ -163,7 +170,7 @@ function coletarPalavras(de, ate) {
 function coletarMudancas(desde, ate) {
   return coletar('SELECT change_event.change_date_time, change_event.change_resource_type, change_event.changed_fields, ' +
     "change_event.client_type, campaign.id FROM change_event WHERE change_event.change_date_time >= '" + desde + "' AND change_event.change_date_time <= '" + ate + "' " +
-    "AND change_event.change_resource_type IN ('CAMPAIGN', 'CAMPAIGN_BUDGET', 'AD_GROUP_CRITERION') " +
+    "AND change_event.change_resource_type IN ('CAMPAIGN', 'CAMPAIGN_BUDGET', 'CAMPAIGN_CRITERION', 'AD_GROUP_CRITERION') " +
     'ORDER BY change_event.change_date_time DESC LIMIT 500', function (r) {
       return { quando: r.changeEvent.changeDateTime, recurso: r.changeEvent.changeResourceType,
         campos: String(r.changeEvent.changedFields || ''), origem: r.changeEvent.clientType, campanha_id: r.campaign ? String(r.campaign.id) : null };

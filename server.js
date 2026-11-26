@@ -56,6 +56,7 @@ import { registrarRotasRepasses } from "./medico-repasses-admin.js";
 import { registrarRotasFinanceiro } from "./financeiro-marketing.js";
 import { criarTokensIntegracao } from "./integracoes-tokens.js";
 import { registrarRotasAutopilot } from "./autopilot.js";
+import { criarModoProprietario } from "./modo-proprietario.js";
 import { criarConferenciaRecebimentos } from "./recebimentos.js";
 import {
   registrarRotasRecuperacaoEspecialista,
@@ -295,6 +296,9 @@ app.get("/api/build-info", (_req, res) => {
 const RESEND_DEFAULT_FROM = process.env.RESEND_DEFAULT_FROM || "ConsultaJá24h <contato@consultaja24h.com.br>";
 const RESEND_FILA_FROM = process.env.RESEND_FILA_FROM || "ConsultaJá24h Fila <fila@consultaja24h.com.br>";
 const ADMIN_MEDICO_EMAIL = "gustavosgbf@gmail.com";
+// Reserva temporária das imediatas para o admin (modo proprietário), com liberação automática.
+const modoProprietario = criarModoProprietario({ pool, adminEmail: ADMIN_MEDICO_EMAIL });
+setInterval(() => modoProprietario.vigiar().catch(e => console.warn("[PROPRIETARIO] vigia:", e.message)), 30_000).unref?.();
 const MARIANA_PRIORIDADE_EMAIL = "marianamartinsc1@gmail.com";
 const PRIORIDADE_FILA_MINUTOS = 5;
 const PRIORIDADE_ADMIN_HORA_INICIO = 15;
@@ -2105,6 +2109,7 @@ async function initDB() {
       ['reembolso_erro','TEXT'],
       ['prioridade_medico_id','INTEGER'],
       ['prioridade_ate','TIMESTAMPTZ'],
+      ['prioridade_origem','TEXT'],
       ['prioridade_geral_notificada_em','TIMESTAMPTZ'],
       ['mostrar_avaliacao_google','BOOLEAN NOT NULL DEFAULT false'],
     ];
@@ -4534,6 +4539,21 @@ async function aplicarPrioridadeAdminSeElegivel(atendimentoId) {
 // Notificacao centralizada: unica fonte de verdade para envio de email aos medicos
 async function notificarMedicos(at) {
   at = await garantirNomePacienteParaFila(at);
+  // Modo proprietário: reserva curta para o admin; a equipe é avisada automaticamente se ele não assumir.
+  try {
+    if (await modoProprietario.tentarReservar(at)) {
+      await enviarEmailMedicos({
+        nome: normalizarNomePaciente(at.nome) || "Nome não informado", tel: at.tel, tipo: at.tipo, triagem: at.triagem,
+        linkRetorno: (process.env.SITE_URL || "https://consultaja24h.com.br") + "/triagem.html?consulta=" + at.id,
+        atendimentoId: at.id, subject: "RESERVADO PARA VOCÊ - " + (normalizarNomePaciente(at.nome) || "Paciente"),
+        especialidadeSolicitada: at.especialidade_solicitada, fallbackClinico: at.fallback_decisao === "clinico",
+        destinatariosPermitidos: [ADMIN_MEDICO_EMAIL]
+      }).catch(e => console.warn("[PROPRIETARIO] aviso ao admin:", e.message));
+      return;
+    }
+  } catch (e) {
+    console.warn("[PROPRIETARIO] reserva ignorada:", e.message); // em qualquer falha, segue o fluxo normal da equipe
+  }
   const nomeFila = normalizarNomePaciente(at.nome) || "Nome não informado";
   const SITE_URL = process.env.SITE_URL || "https://consultaja24h.com.br";
   const linkRetorno = SITE_URL + "/triagem.html?consulta=" + at.id;
@@ -10462,6 +10482,24 @@ registrarRotasRecuperacaoMedico(app, {
 registrarRotaGanhosMedico(app, { pool, checkMedico, adminEmail: ADMIN_MEDICO_EMAIL });
 registrarRotasRepasses(app, { pool, checkMedico, adminEmail: ADMIN_MEDICO_EMAIL });
 const tokensIntegracao = criarTokensIntegracao({ pool });
+app.get("/api/admin/modo-proprietario", checkAdmin, async (req, res) => {
+  res.set("Cache-Control", "no-store");
+  try { return res.json({ ok: true, modo: await modoProprietario.lerModo(true), participacao_7d: await modoProprietario.participacao(7) }); }
+  catch (e) { return res.status(500).json({ ok: false, error: e.message }); }
+});
+app.post("/api/admin/modo-proprietario", checkAdmin, async (req, res) => {
+  try {
+    const ativo = req.body?.ativo === true;
+    const horas = Math.min(8, Math.max(0.5, Number(req.body?.horas) || 2));
+    const minutos = Math.min(5, Math.max(1, Number(req.body?.minutos_reserva) || 3));
+    const modo = await modoProprietario.gravarModo(ativo
+      ? { ativo: true, ativado_em: new Date().toISOString(), ate: new Date(Date.now() + horas * 3600000).toISOString(), minutos_reserva: minutos, desligado_motivo: null }
+      : { ativo: false, desligado_em: new Date().toISOString(), desligado_motivo: "manual" });
+    if (!ativo) await modoProprietario.vigiar();
+    console.log("MODO_PROPRIETARIO", { ativo, horas, minutos });
+    return res.json({ ok: true, modo });
+  } catch (e) { return res.status(500).json({ ok: false, error: e.message }); }
+});
 const financeiroMarketing = registrarRotasFinanceiro(app, { pool, checkAdmin, adminEmail: ADMIN_MEDICO_EMAIL, consultarGoogleAds: consultarGoogleAdsGaql, tokens: tokensIntegracao });
 registrarRotasAutopilot(app, { pool, checkAdmin, tokens: tokensIntegracao, adminEmail: ADMIN_MEDICO_EMAIL, financeiro: financeiroMarketing });
 

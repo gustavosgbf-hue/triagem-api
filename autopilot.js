@@ -3,6 +3,8 @@
 // somente ações APROVADAS. Execução exige três travas: script em 'execucao', painel em 'execucao', aprovação.
 // Ações permitidas: orçamento diário, CPA desejado, status de palavra-chave existente. Nada mais.
 import { apurarPeriodo } from "./financeiro-marketing.js";
+import { calcularMargemConsulta } from "./margem-consulta.js";
+import { calcularCoortes, valorFuturoPorNovo } from "./coortes.js";
 
 export const TIPOS_PERMITIDOS = Object.freeze(["orcamento", "tcpa", "palavra_status"]);
 const FUSO = "America/Fortaleza";
@@ -15,8 +17,18 @@ export const CONFIG_PADRAO = Object.freeze({
   janela_dias: 14,
   min_pagamentos_janela: 20,
   passo_orcamento: 0.10,          // configurável no painel (1% a 15%)
-  orcamento_teto: 400,            // R$/dia: autorização de investimento (o R$ 1.500 do script é só trava técnica)
+  orcamento_habitual: 350,        // R$/dia
+  orcamento_teto: 450,            // faixa que pode ser proposta mediante evidência
+  orcamento_excepcional: 500,     // só como proposta "excepcional"; acima disso nunca
   orcamento_piso: 100,
+  congelar_orcamento: true,       // manter R$ 350 enquanto avalia melhorias recentes
+  congelar_tcpa: true,            // manter CPA R$ 46
+  congelamento_motivo: "Avaliando efeito das mudanças de 18/11 (orçamento), 20/11 (CPA), 25/11 (horários) e da landing.",
+  testes_planejados: [{ id: "tcpa_42", tipo: "tcpa", para: 42, nota: "Retorno isolado ao CPA de R$ 42" }],
+  intervalo_isolamento_dias: 7,   // entre mudanças de orçamento e de CPA (nunca juntas)
+  limiar_reducao: 0.5,            // só propõe reduzir se o valor do pagamento adicional < 50% do custo dele
+  min_novos_aumento: 0.35,        // aumento exige que >= 35% dos pagamentos do Google sejam pacientes novos
+  participacao_prevista: null,    // fração das imediatas atendidas por você; null = usa a realizada
   tcpa_min: 25,
   tcpa_max: 90,
   intervalo_orcamento_dias: 3,
@@ -54,7 +66,8 @@ export function planejar({ snapshot, economia, capacidade, historico = [], confi
   const tv = snapshot?.travas || {};
   // Vale o mais restritivo entre o painel (autorização) e o script (trava técnica).
   const lim = {
-    orcMax: Math.min(Number(cfg.orcamento_teto) || 0, Number(tv.orcamento_max) || Infinity),
+    orcMax: Math.min(Number(cfg.orcamento_excepcional) || 500, 500, Number(tv.orcamento_max) || Infinity),
+    orcMax_tecnico: Math.min(500, Number(tv.orcamento_max) || Infinity),
     orcMin: Math.max(Number(cfg.orcamento_piso) || 0, Number(tv.orcamento_min) || 0),
     passoOrc: Math.min(Number(cfg.passo_orcamento) || 0.1, Number(tv.passo_orcamento) || 0.15),
     tcpaMin: Math.max(Number(cfg.tcpa_min) || 0, Number(tv.tcpa_min) || 0),
@@ -97,51 +110,96 @@ export function planejar({ snapshot, economia, capacidade, historico = [], confi
     return { propostas, insights, alertas };
   }
 
-  // Valor econômico de um pagamento vindo do Google = margem imediata + retorno esperado dos novos.
-  const valorPagamento = g.margem_media + (g.novos / g.pagamentos) * (economia.ltv_margem_novo || 0);
+  // Valor de um pagamento do Google = margem imediata (pela participação prevista de quem atende) + valor futuro do novo.
+  const mix = economia.mix || null;
+  const margemPrevista = (share) => {
+    if (!mix) return g.margem_media;
+    const imediata = share * mix.margem_gustavo + (1 - share) * mix.margem_equipe;
+    return mix.share_renovacao * mix.margem_renovacao + (1 - mix.share_renovacao) * imediata;
+  };
+  const shareReal = mix ? mix.share_gustavo : null;
+  const shareUsado = cfg.participacao_prevista ?? shareReal;
+  const margemPag = mix ? margemPrevista(shareUsado) : g.margem_media;
+  const valorPagamento = margemPag + (g.novos / g.pagamentos) * (economia.ltv_margem_novo || 0);
   const cpaMedio = g.gasto / g.pagamentos;
   const elast = economia.elasticidade;
   const cpaMarginal = elast ? cpaMedio / elast.b : null;
+  const cenarios = mix ? [shareReal, 0.5, 0.8].filter((v, i, a) => v !== null && a.indexOf(v) === i).map(sh => ({
+    participacao: r2(sh), valor_por_pagamento: r2((margemPrevista(sh) + (g.novos / g.pagamentos) * (economia.ltv_margem_novo || 0)) / 100) })) : [];
   insights.push({ codigo: "economia_google", mensagem: "Base da decisão",
     dados: { janela_dias: cfg.janela_dias, pagamentos: g.pagamentos, novos: g.novos, margem_media: r2(g.margem_media / 100),
-      ltv_margem_novo: r2((economia.ltv_margem_novo || 0) / 100), valor_por_pagamento: r2(valorPagamento / 100),
-      cpa_medio: r2(cpaMedio / 100), cpa_marginal: cpaMarginal && r2(cpaMarginal / 100), elasticidade: elast } });
+      participacao_realizada: shareReal !== null ? r2(shareReal) : null, participacao_usada: shareUsado !== null ? r2(shareUsado) : null,
+      ltv_margem_novo: r2((economia.ltv_margem_novo || 0) / 100), ltv_fonte: economia.ltv_fonte || null,
+      valor_por_pagamento: r2(valorPagamento / 100), cpa_medio: r2(cpaMedio / 100), cpa_marginal: cpaMarginal && r2(cpaMarginal / 100),
+      elasticidade: elast, cenarios } });
 
-  // Relação entre o CPA real (pagamentos com clique novo) e o CPA que a plataforma reporta.
   const fator = economia.cpa_plataforma > 0 ? cpaMedio / (economia.cpa_plataforma * 100) : 1;
   const capacidadeOk = !(capacidade?.espera_p75_min > cfg.espera_max_min);
   if (!capacidadeOk) insights.push({ codigo: "capacidade", mensagem: `Espera p75 de ${Math.round(capacidade.espera_p75_min)} min: aumento de verba bloqueado até a fila normalizar.` });
 
+  // Isolamento: nunca orçamento e CPA juntos; uma mudança por vez, com intervalo entre elas.
+  const abertas = economia.abertas || [];
+  const algumaAberta = tipo => abertas.some(a => a.tipo === tipo);
+  const ultimaQualquer = (alvo) => [ultima("orcamento", alvo), ultima("tcpa", alvo)].filter(Boolean).sort((a, b) => b - a)[0];
+  let mudouNesteCiclo = false;
+
   // 2) Orçamento.
   for (const c of campanhas) {
     if (c.orcamento_compartilhado || !cpaMarginal) continue;
+    if (cfg.congelar_orcamento) { insights.push({ codigo: "congelado", mensagem: `Orçamento mantido em R$ ${c.orcamento} por decisão sua. ${cfg.congelamento_motivo || ""}`.trim() }); continue; }
+    if (algumaAberta("tcpa") || diasDesde(ultimaQualquer(c.id)) < cfg.intervalo_isolamento_dias) {
+      insights.push({ codigo: "isolamento", mensagem: `Houve mudança de orçamento ou CPA há menos de ${cfg.intervalo_isolamento_dias} dias (ou há proposta de CPA aberta); orçamento aguarda para não misturar efeitos.` }); continue;
+    }
     const perdaOrc = c.leilao_14d?.perdida_orcamento || 0;
-    const recente = diasDesde(ultima("orcamento", c.id)) < cfg.intervalo_orcamento_dias;
-    if (recente) { insights.push({ codigo: "orcamento_aguardando", mensagem: `Orçamento alterado há menos de ${cfg.intervalo_orcamento_dias} dias; aguardando efeito.` }); continue; }
-    if (valorPagamento > cpaMarginal * (1 + cfg.folga_retorno) && perdaOrc > 0.10 && capacidadeOk) {
-      const para = Math.min(lim.orcMax, r2(c.orcamento * (1 + lim.passoOrc)));
-      if (para <= c.orcamento) insights.push({ codigo: "teto_orcamento", mensagem: `Haveria espaço para aumentar, mas o orçamento já está no teto autorizado (R$ ${lim.orcMax}). Ajuste em Limites se quiser.` });
-      if (para > c.orcamento) propostas.push(decisao("orcamento", { alvo: c.id, campanha_id: c.id, recurso: c.orcamento_recurso, de: c.orcamento, para,
-        justificativa: `Cada pagamento adicional custa cerca de R$ ${r2(cpaMarginal / 100)} e vale R$ ${r2(valorPagamento / 100)} de margem (incluindo retorno esperado). A campanha perde ${Math.round(perdaOrc * 100)}% das impressões por orçamento.`,
-        dados: { cpa_marginal: cpaMarginal, valor_pagamento: valorPagamento, perdida_orcamento: perdaOrc } }));
-    } else if (valorPagamento < cpaMarginal * (1 - cfg.folga_retorno)) {
-      const para = Math.max(lim.orcMin, r2(c.orcamento * (1 - lim.passoOrc)));
-      if (para < c.orcamento) propostas.push(decisao("orcamento", { alvo: c.id, campanha_id: c.id, recurso: c.orcamento_recurso, de: c.orcamento, para,
-        justificativa: `O último real investido traz menos margem do que custa: pagamento adicional custa cerca de R$ ${r2(cpaMarginal / 100)} e vale R$ ${r2(valorPagamento / 100)}.`,
+    const fracNovos = g.novos / g.pagamentos;
+    const evidencia = valorPagamento >= cpaMarginal * (1 + cfg.folga_retorno) && perdaOrc > 0.10 && fracNovos >= cfg.min_novos_aumento && capacidadeOk;
+    if (evidencia) {
+      const forte = valorPagamento >= cpaMarginal * 1.25 && perdaOrc > 0.20;
+      const teto = forte ? Math.min(cfg.orcamento_excepcional, 500) : cfg.orcamento_teto;
+      const para = Math.min(teto, lim.orcMax_tecnico, r2(c.orcamento * (1 + lim.passoOrc)));
+      if (para > c.orcamento) {
+        propostas.push(decisao("orcamento", { alvo: c.id, campanha_id: c.id, recurso: c.orcamento_recurso, de: c.orcamento, para,
+          prioridade: para > cfg.orcamento_teto ? "excepcional" : null,
+          justificativa: `Cada pagamento adicional custa cerca de R$ ${r2(cpaMarginal / 100)} e vale R$ ${r2(valorPagamento / 100)}; ${Math.round(fracNovos * 100)}% dos pagamentos são de pacientes novos e a campanha perde ${Math.round(perdaOrc * 100)}% das impressões por orçamento.${para > cfg.orcamento_teto ? " Acima de R$ " + cfg.orcamento_teto + ": faixa excepcional." : ""}`,
+          dados: { cpa_marginal: cpaMarginal, valor_pagamento: valorPagamento, perdida_orcamento: perdaOrc, novos: fracNovos } }));
+        mudouNesteCiclo = true;
+      } else insights.push({ codigo: "teto_orcamento", mensagem: `Há evidência para aumentar, mas o orçamento já está no teto da faixa (R$ ${teto}).` });
+    } else if (cpaMarginal && valorPagamento < cpaMarginal * cfg.limiar_reducao && c.orcamento > cfg.orcamento_habitual) {
+      // Redução só volta ao habitual; abaixo do habitual só por decisão sua.
+      const para = Math.max(cfg.orcamento_habitual, r2(c.orcamento * (1 - lim.passoOrc)));
+      propostas.push(decisao("orcamento", { alvo: c.id, campanha_id: c.id, recurso: c.orcamento_recurso, de: c.orcamento, para,
+        justificativa: `Acima do habitual o pagamento adicional custa R$ ${r2(cpaMarginal / 100)} e vale R$ ${r2(valorPagamento / 100)}: volta em direção a R$ ${cfg.orcamento_habitual}.`,
         dados: { cpa_marginal: cpaMarginal, valor_pagamento: valorPagamento } }));
+      mudouNesteCiclo = true;
+    } else {
+      insights.push({ codigo: "orcamento_sem_evidencia", mensagem: perdaOrc <= 0.10
+        ? `Só ${Math.round(perdaOrc * 100)}% das impressões são perdidas por orçamento: mais verba não compraria mais leilões, só lances mais caros.`
+        : `Sem evidência suficiente para aumentar (valor por pagamento R$ ${r2(valorPagamento / 100)} x custo do pagamento adicional R$ ${r2(cpaMarginal / 100)}).` });
     }
   }
 
-  // 3) CPA desejado: respeita ciclo de aprendizado (intervalo e volume mínimo de conversões).
+  // 3) CPA desejado: um passo por vez, isolado, respeitando o ciclo de aprendizado. Inclui testes planejados por você.
   for (const c of campanhas) {
+    if (mudouNesteCiclo) break;
     if (!c.tcpa || !["MAXIMIZE_CONVERSIONS", "TARGET_CPA"].includes(c.estrategia)) continue;
-    const dias = diasDesde(ultima("tcpa", c.id));
-    const convs = c.leilao_14d?.conversoes ?? 0; // conversões da plataforma nos últimos 14 dias
-    if (dias < cfg.intervalo_tcpa_dias || convs < cfg.min_conversoes_tcpa) {
-      insights.push({ codigo: "tcpa_aguardando", mensagem: `CPA desejado: aguardando ${cfg.intervalo_tcpa_dias} dias e ${cfg.min_conversoes_tcpa} conversões desde a última mudança.` });
+    if (cfg.congelar_tcpa) {
+      const t = (cfg.testes_planejados || []).find(x => x.tipo === "tcpa");
+      insights.push({ codigo: "congelado", mensagem: `CPA desejado mantido em R$ ${c.tcpa}.${t ? " Próximo teste planejado: " + t.nota + " (R$ " + t.para + "), quando você descongelar." : ""}` });
       continue;
     }
-    // CPA que a plataforma "enxerga" é sobre as conversões dela; mantém a relação CPA real / CPA plataforma.
+    const dias = diasDesde(ultima("tcpa", c.id));
+    const convs = c.leilao_14d?.conversoes ?? 0;
+    if (algumaAberta("orcamento") || diasDesde(ultimaQualquer(c.id)) < cfg.intervalo_isolamento_dias || dias < cfg.intervalo_tcpa_dias || convs < cfg.min_conversoes_tcpa) {
+      insights.push({ codigo: "tcpa_aguardando", mensagem: `CPA desejado: aguardando ${cfg.intervalo_tcpa_dias} dias e ${cfg.min_conversoes_tcpa} conversões desde a última mudança, sem outra mudança em curso.` });
+      continue;
+    }
+    const teste = (cfg.testes_planejados || []).find(x => x.tipo === "tcpa" && Math.abs(x.para - c.tcpa) >= 0.5);
+    if (teste) {
+      const para = Math.min(lim.tcpaMax, Math.max(lim.tcpaMin, Number(teste.para)));
+      propostas.push(decisao("tcpa", { alvo: c.id, campanha_id: c.id, estrategia: c.estrategia, de: c.tcpa, para, prioridade: "teste",
+        justificativa: `Teste planejado por você: ${teste.nota}. Mudança isolada, avaliada após ${cfg.intervalo_tcpa_dias} dias.`, dados: { teste: teste.id } }));
+      continue;
+    }
     const alvoReal = valorPagamento / (1 + cfg.folga_retorno);
     const alvoPlataforma = alvoReal / 100 / (fator || 1);
     let para = c.tcpa;
@@ -149,7 +207,7 @@ export function planejar({ snapshot, economia, capacidade, historico = [], confi
     else if (alvoPlataforma < c.tcpa * 0.95) para = r2(Math.max(c.tcpa * (1 - lim.passoTcpa), alvoPlataforma));
     para = Math.min(lim.tcpaMax, Math.max(lim.tcpaMin, para));
     if (Math.abs(para - c.tcpa) >= 0.5) propostas.push(decisao("tcpa", { alvo: c.id, campanha_id: c.id, estrategia: c.estrategia, de: c.tcpa, para,
-      justificativa: `Valor por pagamento de R$ ${r2(valorPagamento / 100)} comporta CPA real de até R$ ${r2(alvoReal / 100)}; no critério da plataforma isso equivale a ~R$ ${r2(alvoPlataforma)}. Passo limitado a ${Math.round(lim.passoTcpa * 100)}%.`,
+      justificativa: `Valor por pagamento de R$ ${r2(valorPagamento / 100)} comporta CPA real de até R$ ${r2(alvoReal / 100)}; no critério da plataforma ~R$ ${r2(alvoPlataforma)}. Passo limitado a ${Math.round(lim.passoTcpa * 100)}%.`,
       dados: { fator_plataforma: fator, alvo_real: alvoReal } }));
   }
 
@@ -199,6 +257,7 @@ const SQL = [
      status TEXT NOT NULL DEFAULT 'proposta', aprovada_em TIMESTAMPTZ, aprovada_por TEXT,
      enviada_em TIMESTAMPTZ, aplicada_em TIMESTAMPTZ, resultado JSONB, avaliacao JSONB)`,
   `CREATE INDEX IF NOT EXISTS autopilot_decisoes_status ON autopilot_decisoes (status, plataforma)`,
+  `CREATE TABLE IF NOT EXISTS autopilot_marcos (id BIGSERIAL PRIMARY KEY, dia DATE NOT NULL, descricao TEXT NOT NULL, criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW())`,
   `CREATE TABLE IF NOT EXISTS autopilot_eventos (id BIGSERIAL PRIMARY KEY, criado_em TIMESTAMPTZ NOT NULL DEFAULT NOW(), tipo TEXT NOT NULL, dados JSONB)`
 ];
 
@@ -217,10 +276,29 @@ export function registrarRotasAutopilot(app, { pool, checkAdmin, tokens, adminEm
     const fin = await apurarPeriodo(pool, de, ate, adminEmail, { incluirLinhas: true });
     const g = fin.canais.find(c => c.canal === "google_ads");
     // Retorno dos novos (margem futura): coorte de 60 a 30 dias atrás, receita posterior x margem média.
-    const coorte = await apurarPeriodo(pool, menosDias(hoje, 60), menosDias(hoje, 30), adminEmail);
-    const cg = coorte.canais.find(c => c.canal === "google_ads");
-    const margemSobreReceita = fin.total.bruto > 0 ? fin.total.margem / Math.max(1, fin.total.bruto - fin.total.estornos) : 0.5;
-    const ltv = cg && cg.novos > 0 ? (cg.receita_retorno / cg.novos) * margemSobreReceita : 0;
+    // Valor futuro do paciente novo: coortes maduras do Google (margem de retornos SEM novo clique pago, sem dupla contagem).
+    let ltv = 0, ltvFonte = null;
+    try {
+      const vf = valorFuturoPorNovo(await calcularCoortes(pool, adminEmail));
+      if (vf) { ltv = vf.centavos; ltvFonte = `coortes ${vf.meses.join(", ")} em ${vf.janela} dias (${vf.pacientes} pacientes)`; }
+    } catch (e) { log.warn?.("[AUTOPILOT] coortes", e.message); }
+    // Mix de quem atende os pagamentos do Google (clique novo): renovação (sempre você), imediatas suas ou da equipe.
+    const mix = { n_renov: 0, m_renov: 0, n_g: 0, m_g: 0, n_eq: 0, m_eq: 0 };
+    for (const l of fin.linhas) {
+      if (!(l.ads_gclid || l.ads_gbraid || l.ads_wbraid) || l.clique_reutilizado) continue;
+      const medico = l.medico_email ? { email: l.medico_email, nome: l.medico_nome_cad, nome_exibicao: l.medico_nome_exibicao } : null;
+      const m = calcularMargemConsulta({ at: l, medico, adminEmail, estimarAntesDaRegra: true });
+      const v = m.margemCentavos ?? m.contribuicaoCentavos; if (v === null || v === undefined) continue;
+      if (String(l.tipo || "").startsWith("renovacao")) { mix.n_renov++; mix.m_renov += v; }
+      else if (String(l.medico_email || "").toLowerCase() === String(adminEmail).toLowerCase()) { mix.n_g++; mix.m_g += v; }
+      else if (medico) { mix.n_eq++; mix.m_eq += v; }
+    }
+    const nImed = mix.n_g + mix.n_eq, nTot = nImed + mix.n_renov;
+    const mixFinal = nTot >= 10 && mix.n_g > 0 && mix.n_eq > 0 ? {
+      share_renovacao: mix.n_renov / nTot, margem_renovacao: mix.n_renov ? mix.m_renov / mix.n_renov : 0,
+      share_gustavo: mix.n_g / nImed, margem_gustavo: mix.m_g / mix.n_g, margem_equipe: mix.m_eq / mix.n_eq
+    } : null;
+    const abertas = (await pool.query(`SELECT tipo FROM autopilot_decisoes WHERE status IN ('proposta','aprovada') AND plataforma='google_ads'`)).rows;
     // Elasticidade com 60 dias de gasto x pagamentos com clique novo.
     const hist = await apurarPeriodo(pool, menosDias(hoje, 60), ate, adminEmail, { incluirLinhas: true });
     const porDia = {};
@@ -256,7 +334,7 @@ export function registrarRotasAutopilot(app, { pool, checkAdmin, tokens, adminEm
     const camp = (snapshot.campanhas || []).find(c => (snapshot.travas?.campanhas || []).includes(c.id));
     return {
       google: g ? { pagamentos: g.pagamentos, novos: g.novos, gasto: g.gasto, margem: g.margem, margem_media: g.margem_media || 0 } : null,
-      ltv_margem_novo: Math.round(ltv), elasticidade, palavras, horas: listaHoras,
+      ltv_margem_novo: Math.round(ltv), ltv_fonte: ltvFonte, mix: mixFinal, abertas, elasticidade, palavras, horas: listaHoras,
       pagamentos_2h: p2?.pagos || 0, pendentes_2h: p2?.pendentes || 0, cliques_2h: cliques2h,
       cpa_plataforma: camp?.leilao_14d?.conversoes ? camp.leilao_14d.custo / camp.leilao_14d.conversoes : 0,
       janela: { de, ate }
@@ -392,6 +470,72 @@ export function registrarRotasAutopilot(app, { pool, checkAdmin, tokens, adminEm
     } catch (e) { return res.status(500).json({ ok: false, error: e.message }); }
   });
 
+  // Indicadores diários: leilão (Google, via script) x pagamentos reais, com marcos de alterações.
+  app.get("/api/admin/autopilot/indicadores", checkAdmin, async (req, res) => {
+    res.set("Cache-Control", "no-store");
+    try {
+      await garantir();
+      const dias = Math.min(60, Math.max(7, parseInt(req.query.dias || "30", 10) || 30));
+      const { rows: [snap] } = await pool.query(`SELECT recebido_em, dados FROM autopilot_snapshots WHERE plataforma='google_ads' ORDER BY id DESC LIMIT 1`);
+      const d = snap?.dados || {};
+      const campanhas = new Set((d.travas?.campanhas || []).map(String));
+      const porDia = {};
+      const garantirDia = k => (porDia[k] ||= { dia: k, impressoes: 0, cliques: 0, custo: 0, conversoes_plataforma: 0, parcela: null, perdida_classificacao: null, perdida_orcamento: null, pagamentos: 0, pagamentos_google: 0, novos: 0, recorrentes: 0 });
+      for (const l of d.leilao_diario || []) {
+        if (campanhas.size && !campanhas.has(String(l.campanha_id))) continue;
+        const x = garantirDia(l.dia);
+        x.impressoes += l.impressoes; x.cliques += l.cliques; x.custo += l.custo; x.conversoes_plataforma += l.conversoes;
+        x.parcela = l.parcela; x.perdida_classificacao = l.perdida_classificacao; x.perdida_orcamento = l.perdida_orcamento;
+      }
+      const { rows: pags } = await pool.query(
+        `SELECT to_char((pagamento_confirmado_em::timestamptz AT TIME ZONE '${FUSO}'),'YYYY-MM-DD') dia,
+                COUNT(*)::int pagamentos,
+                COUNT(*) FILTER (WHERE COALESCE(NULLIF(ads_gclid,''),NULLIF(ads_gbraid,''),NULLIF(ads_wbraid,'')) IS NOT NULL)::int google,
+                COUNT(*) FILTER (WHERE customer_type='new' OR cliente_novo IS TRUE)::int novos
+           FROM fila_atendimentos WHERE pagamento_status='confirmado'
+            AND pagamento_confirmado_em > NOW() - ($1::int * INTERVAL '1 day') GROUP BY 1`, [dias]);
+      for (const p of pags) { const x = garantirDia(p.dia); x.pagamentos = p.pagamentos; x.pagamentos_google = p.google; x.novos = p.novos; x.recorrentes = p.pagamentos - p.novos; }
+      const hoje = diaIso();
+      const lista = Object.values(porDia).filter(x => x.dia >= menosDias(hoje, dias - 1)).sort((a, b) => a.dia.localeCompare(b.dia))
+        .map(x => ({ ...x, cpc: x.cliques ? r2(x.custo / x.cliques) : null, cpa_real: x.pagamentos_google ? r2(x.custo / x.pagamentos_google) : null,
+          // Conversões e parcela de impressões do Google consolidam com atraso: últimos 3 dias são parciais.
+          parcial: x.dia > menosDias(hoje, 3) }));
+      const tipoMudanca = m => {
+        const c = String(m.campos || "").toLowerCase();
+        if (m.recurso === "CAMPAIGN_BUDGET") return "Orçamento";
+        if (m.recurso === "CAMPAIGN" && c.includes("target_cpa")) return "CPA desejado";
+        if (m.recurso === "CAMPAIGN_CRITERION" || c.includes("ad_schedule")) return "Programação/segmentação";
+        if (m.recurso === "AD_GROUP_CRITERION") return "Palavras-chave";
+        return "Campanha";
+      };
+      const marcosGoogle = (d.mudancas || []).filter(m => !m.campanha_id || !campanhas.size || campanhas.has(String(m.campanha_id)))
+        .map(m => ({ dia: String(m.quando).slice(0, 10), quando: m.quando, tipo: tipoMudanca(m), origem: m.origem, fonte: "google_ads" }));
+      const { rows: manuais } = await pool.query(`SELECT to_char(dia,'YYYY-MM-DD') dia, descricao FROM autopilot_marcos ORDER BY dia`);
+      return res.json({ ok: true, atualizado_em: snap?.recebido_em || null, dias: lista,
+        marcos: [...marcosGoogle, ...manuais.map(m => ({ dia: m.dia, tipo: m.descricao, fonte: "manual" }))].sort((a, b) => String(a.dia).localeCompare(String(b.dia))),
+        observacao: "Parcela de impressões e conversões do Google consolidam com até 3 dias de atraso. Pagamentos reais são do nosso banco, sem atraso." });
+    } catch (e) { return res.status(500).json({ ok: false, error: e.message }); }
+  });
+
+  app.post("/api/admin/autopilot/marcos", checkAdmin, async (req, res) => {
+    try {
+      await garantir();
+      const dia = String(req.body?.dia || ""), descricao = String(req.body?.descricao || "").trim().slice(0, 160);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(dia) || !descricao) return res.status(400).json({ ok: false, error: "parametros" });
+      await pool.query(`INSERT INTO autopilot_marcos (dia, descricao) VALUES ($1,$2)`, [dia, descricao]);
+      return res.json({ ok: true });
+    } catch (e) { return res.status(500).json({ ok: false, error: e.message }); }
+  });
+
+  app.get("/api/admin/financeiro/coortes", checkAdmin, async (req, res) => {
+    res.set("Cache-Control", "no-store");
+    try {
+      const coortes = await calcularCoortes(pool, adminEmail, { meses: Math.min(12, Math.max(3, parseInt(req.query.meses || "9", 10) || 9)) });
+      return res.json({ ok: true, coortes, valor_futuro_google: valorFuturoPorNovo(coortes),
+        nota: "Margem de retornos posteriores à primeira compra. Pagamentos que chegaram por novo clique pago ficam em 'readquiridos' e não entram no valor da coorte." });
+    } catch (e) { return res.status(500).json({ ok: false, error: e.message }); }
+  });
+
   app.post("/api/admin/autopilot/decisao/:id", checkAdmin, async (req, res) => {
     try {
       await garantir();
@@ -409,15 +553,25 @@ export function registrarRotasAutopilot(app, { pool, checkAdmin, tokens, adminEm
     try {
       await garantir();
       const b = req.body || {};
-      const num = (v, min, max) => { const n = Number(v); return Number.isFinite(n) && n >= min && n <= max ? n : null; };
+      const atual = await lerConfig();
+      const num = (v, min, max, padrao) => { if (v === undefined || v === null || v === "") return padrao; const n = Number(v); return Number.isFinite(n) && n >= min && n <= max ? n : NaN; };
       const novo = {
-        passo_orcamento: num(b.passo_orcamento, 0.01, 0.15), passo_tcpa: num(b.passo_tcpa, 0.01, 0.15),
-        orcamento_teto: num(b.orcamento_teto, 100, 1500), orcamento_piso: num(b.orcamento_piso, 50, 1500),
-        tcpa_min: num(b.tcpa_min, 10, 200), tcpa_max: num(b.tcpa_max, 10, 200)
+        passo_orcamento: num(b.passo_orcamento, 0.01, 0.15, atual.passo_orcamento),
+        passo_tcpa: num(b.passo_tcpa, 0.01, 0.15, atual.passo_tcpa),
+        orcamento_habitual: num(b.orcamento_habitual, 100, 500, atual.orcamento_habitual),
+        orcamento_teto: num(b.orcamento_teto, 100, 500, atual.orcamento_teto),
+        orcamento_excepcional: num(b.orcamento_excepcional, 100, 500, atual.orcamento_excepcional),
+        orcamento_piso: num(b.orcamento_piso, 50, 500, atual.orcamento_piso),
+        tcpa_min: num(b.tcpa_min, 10, 200, atual.tcpa_min),
+        tcpa_max: num(b.tcpa_max, 10, 200, atual.tcpa_max),
+        participacao_prevista: b.participacao_prevista === null || b.participacao_prevista === "" ? null : num(b.participacao_prevista, 0, 1, atual.participacao_prevista)
       };
-      if (Object.values(novo).some(v => v === null)) return res.status(400).json({ ok: false, error: "valores_fora_da_faixa" });
-      if (novo.orcamento_piso > novo.orcamento_teto || novo.tcpa_min > novo.tcpa_max) return res.status(400).json({ ok: false, error: "minimo_maior_que_maximo" });
-      const cfg = { ...(await lerConfig()), ...novo };
+      if (Object.values(novo).some(v => Number.isNaN(v))) return res.status(400).json({ ok: false, error: "valores_fora_da_faixa" });
+      if (novo.orcamento_piso > novo.orcamento_habitual || novo.orcamento_habitual > novo.orcamento_teto || novo.orcamento_teto > novo.orcamento_excepcional || novo.tcpa_min > novo.tcpa_max)
+        return res.status(400).json({ ok: false, error: "ordem_invalida" });
+      if (typeof b.congelar_orcamento === "boolean") novo.congelar_orcamento = b.congelar_orcamento;
+      if (typeof b.congelar_tcpa === "boolean") novo.congelar_tcpa = b.congelar_tcpa;
+      const cfg = { ...atual, ...novo };
       await pool.query(`INSERT INTO autopilot_config (id, config) VALUES (1,$1) ON CONFLICT (id) DO UPDATE SET config=$1, atualizado_em=NOW()`, [JSON.stringify(cfg)]);
       await evento("limites", { ...novo, por: req.adminMedico?.email || "admin" });
       return res.json({ ok: true, config: cfg });
