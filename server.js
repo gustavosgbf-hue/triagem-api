@@ -4753,12 +4753,10 @@ app.get("/api/paciente/buscar", rlGeral, async (req, res) => {
     const p = result.rows[0];
     return res.json({
       ok: true,
+      // Só o nome, para pular a etapa de nome no checkout. CPF, e-mail e
+      // nascimento não saem mais por esta rota pública.
       paciente: {
-        nome: p.nome || "",
-        tel: p.tel || "",
-        data_nascimento: p.data_nascimento || "",
-        cpf: p.cpf || "",
-        email: p.email || ""
+        nome: p.nome || ""
       }
     });
   } catch (e) {
@@ -5147,6 +5145,18 @@ app.get("/api/chat/:atendimentoId", async (req, res) => {
   } catch (e) { console.error("Erro em /api/chat/:id:", e); return res.status(500).json({ ok: false, error: "Erro ao buscar mensagens" }); }
 });
 
+const CAMPOS_STATUS_PUBLICO = [
+  "id", "status", "tipo", "medico_nome", "meet_link", "criado_em", "assumido_em", "encerrado_em",
+  "pagamento_status", "pagamento_confirmado_em", "pagbank_order_id", "categoria_atendimento",
+  "especialidade_solicitada", "fallback_disponivel_em", "fallback_decisao", "fallback_decidido_em",
+  "reembolso_status", "mostrar_avaliacao_google", "fallback_disponivel", "cliente_novo", "customer_type",
+];
+function resumoPublicoAtendimento(at) {
+  const out = {};
+  for (const k of CAMPOS_STATUS_PUBLICO) if (at && Object.prototype.hasOwnProperty.call(at, k)) out[k] = at[k];
+  return out;
+}
+
 app.get("/api/atendimento/status/:id", async (req, res) => {
   try {
     const result = await pool.query(
@@ -5208,7 +5218,24 @@ app.get("/api/atendimento/status/:id", async (req, res) => {
       }
     }
 
-    return res.json({ ok: true, atendimento: at, fila: await _filaPos(at) });
+    // Resposta completa só para o médico vinculado (ou admin, ou caso ainda na fila).
+    // Sem credencial médica: apenas o necessário para as telas do paciente,
+    // sem identificação nem dados clínicos.
+    let respostaCompleta = false;
+    const medStatus = decodificarMedicoRequest(req);
+    if (medStatus) {
+      try {
+        if (await medicoAtivoNoBanco(medStatus)) {
+          const souAdminStatus = String(medStatus.email || "").trim().toLowerCase() === ADMIN_MEDICO_EMAIL;
+          const vinc = souAdminStatus || at.status === "aguardando"
+            ? null
+            : await pool.query(`SELECT medico_id FROM fila_atendimentos WHERE id=$1`, [at.id]);
+          respostaCompleta = souAdminStatus || at.status === "aguardando" || medicoPodeEscreverNoAtendimento(medStatus, vinc?.rows?.[0] || {});
+        }
+      } catch (e) { console.warn("[STATUS] Verificação médica falhou:", e.message); }
+    }
+    const atResposta = respostaCompleta ? at : resumoPublicoAtendimento(at);
+    return res.json({ ok: true, atendimento: atResposta, fila: await _filaPos(at) });
   } catch (e) { return res.status(500).json({ ok: false, error: "Erro ao buscar status" }); }
 });
 
