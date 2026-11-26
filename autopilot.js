@@ -14,7 +14,11 @@ export const CONFIG_PADRAO = Object.freeze({
   modo: "simulacao",              // simulacao | execucao (execução ainda exige aprovação por ação)
   janela_dias: 14,
   min_pagamentos_janela: 20,
-  passo_orcamento: 0.15,
+  passo_orcamento: 0.10,          // configurável no painel (1% a 15%)
+  orcamento_teto: 400,            // R$/dia: autorização de investimento (o R$ 1.500 do script é só trava técnica)
+  orcamento_piso: 100,
+  tcpa_min: 25,
+  tcpa_max: 90,
   intervalo_orcamento_dias: 3,
   intervalo_tcpa_dias: 14,
   min_conversoes_tcpa: 30,
@@ -47,6 +51,16 @@ export function planejar({ snapshot, economia, capacidade, historico = [], confi
   const cfg = { ...CONFIG_PADRAO, ...config };
   const propostas = [], insights = [], alertas = [];
   const permitidas = new Set((snapshot?.travas?.campanhas || []).map(String));
+  const tv = snapshot?.travas || {};
+  // Vale o mais restritivo entre o painel (autorização) e o script (trava técnica).
+  const lim = {
+    orcMax: Math.min(Number(cfg.orcamento_teto) || 0, Number(tv.orcamento_max) || Infinity),
+    orcMin: Math.max(Number(cfg.orcamento_piso) || 0, Number(tv.orcamento_min) || 0),
+    passoOrc: Math.min(Number(cfg.passo_orcamento) || 0.1, Number(tv.passo_orcamento) || 0.15),
+    tcpaMin: Math.max(Number(cfg.tcpa_min) || 0, Number(tv.tcpa_min) || 0),
+    tcpaMax: Math.min(Number(cfg.tcpa_max) || Infinity, Number(tv.tcpa_max) || Infinity),
+    passoTcpa: Math.min(Number(cfg.passo_tcpa) || 0.1, Number(tv.passo_tcpa) || 0.15)
+  };
   const campanhas = (snapshot?.campanhas || []).filter(c => permitidas.has(String(c.id)) && c.status === "ENABLED");
   // Última mudança: decisões aplicadas pelo Autopilot OU alterações registradas no Google Ads (inclusive manuais).
   const mudancas = snapshot?.mudancas || [];
@@ -67,7 +81,7 @@ export function planejar({ snapshot, economia, capacidade, historico = [], confi
     alertas.push({ codigo: "pagamentos_parados", mensagem: `${economia.cliques_2h} cliques e ${economia.pendentes_2h} cobranças pendentes nas últimas 2 h, nenhuma confirmada.` });
     for (const c of campanhas) {
       if (c.orcamento_compartilhado) continue;
-      const para = Math.max(snapshot.travas.orcamento_min, r2(c.orcamento * (1 - snapshot.travas.passo_orcamento)));
+      const para = Math.max(lim.orcMin, r2(c.orcamento * (1 - lim.passoOrc)));
       if (para < c.orcamento) propostas.push(decisao("orcamento", {
         alvo: c.id, campanha_id: c.id, recurso: c.orcamento_recurso, de: c.orcamento, para, prioridade: "protecao",
         justificativa: "Proteção: pagamentos não estão sendo confirmados enquanto o anúncio segue recebendo cliques. Reduz exposição até a causa ser verificada.",
@@ -105,12 +119,13 @@ export function planejar({ snapshot, economia, capacidade, historico = [], confi
     const recente = diasDesde(ultima("orcamento", c.id)) < cfg.intervalo_orcamento_dias;
     if (recente) { insights.push({ codigo: "orcamento_aguardando", mensagem: `Orçamento alterado há menos de ${cfg.intervalo_orcamento_dias} dias; aguardando efeito.` }); continue; }
     if (valorPagamento > cpaMarginal * (1 + cfg.folga_retorno) && perdaOrc > 0.10 && capacidadeOk) {
-      const para = Math.min(snapshot.travas.orcamento_max, r2(c.orcamento * (1 + cfg.passo_orcamento)));
+      const para = Math.min(lim.orcMax, r2(c.orcamento * (1 + lim.passoOrc)));
+      if (para <= c.orcamento) insights.push({ codigo: "teto_orcamento", mensagem: `Haveria espaço para aumentar, mas o orçamento já está no teto autorizado (R$ ${lim.orcMax}). Ajuste em Limites se quiser.` });
       if (para > c.orcamento) propostas.push(decisao("orcamento", { alvo: c.id, campanha_id: c.id, recurso: c.orcamento_recurso, de: c.orcamento, para,
         justificativa: `Cada pagamento adicional custa cerca de R$ ${r2(cpaMarginal / 100)} e vale R$ ${r2(valorPagamento / 100)} de margem (incluindo retorno esperado). A campanha perde ${Math.round(perdaOrc * 100)}% das impressões por orçamento.`,
         dados: { cpa_marginal: cpaMarginal, valor_pagamento: valorPagamento, perdida_orcamento: perdaOrc } }));
     } else if (valorPagamento < cpaMarginal * (1 - cfg.folga_retorno)) {
-      const para = Math.max(snapshot.travas.orcamento_min, r2(c.orcamento * (1 - cfg.passo_orcamento)));
+      const para = Math.max(lim.orcMin, r2(c.orcamento * (1 - lim.passoOrc)));
       if (para < c.orcamento) propostas.push(decisao("orcamento", { alvo: c.id, campanha_id: c.id, recurso: c.orcamento_recurso, de: c.orcamento, para,
         justificativa: `O último real investido traz menos margem do que custa: pagamento adicional custa cerca de R$ ${r2(cpaMarginal / 100)} e vale R$ ${r2(valorPagamento / 100)}.`,
         dados: { cpa_marginal: cpaMarginal, valor_pagamento: valorPagamento } }));
@@ -130,11 +145,11 @@ export function planejar({ snapshot, economia, capacidade, historico = [], confi
     const alvoReal = valorPagamento / (1 + cfg.folga_retorno);
     const alvoPlataforma = alvoReal / 100 / (fator || 1);
     let para = c.tcpa;
-    if (alvoPlataforma > c.tcpa * 1.05) para = r2(Math.min(c.tcpa * (1 + cfg.passo_tcpa), alvoPlataforma));
-    else if (alvoPlataforma < c.tcpa * 0.95) para = r2(Math.max(c.tcpa * (1 - cfg.passo_tcpa), alvoPlataforma));
-    para = Math.min(snapshot.travas.tcpa_max, Math.max(snapshot.travas.tcpa_min, para));
+    if (alvoPlataforma > c.tcpa * 1.05) para = r2(Math.min(c.tcpa * (1 + lim.passoTcpa), alvoPlataforma));
+    else if (alvoPlataforma < c.tcpa * 0.95) para = r2(Math.max(c.tcpa * (1 - lim.passoTcpa), alvoPlataforma));
+    para = Math.min(lim.tcpaMax, Math.max(lim.tcpaMin, para));
     if (Math.abs(para - c.tcpa) >= 0.5) propostas.push(decisao("tcpa", { alvo: c.id, campanha_id: c.id, estrategia: c.estrategia, de: c.tcpa, para,
-      justificativa: `Valor por pagamento de R$ ${r2(valorPagamento / 100)} comporta CPA real de até R$ ${r2(alvoReal / 100)}; no critério da plataforma isso equivale a ~R$ ${r2(alvoPlataforma)}. Passo limitado a ${Math.round(cfg.passo_tcpa * 100)}%.`,
+      justificativa: `Valor por pagamento de R$ ${r2(valorPagamento / 100)} comporta CPA real de até R$ ${r2(alvoReal / 100)}; no critério da plataforma isso equivale a ~R$ ${r2(alvoPlataforma)}. Passo limitado a ${Math.round(lim.passoTcpa * 100)}%.`,
       dados: { fator_plataforma: fator, alvo_real: alvoReal } }));
   }
 
@@ -303,20 +318,35 @@ export function registrarRotasAutopilot(app, { pool, checkAdmin, tokens, adminEm
       await pool.query(`INSERT INTO autopilot_snapshots (plataforma, dados) VALUES ('google_ads',$1)`, [JSON.stringify(resumo)]);
       await pool.query(`DELETE FROM autopilot_snapshots WHERE recebido_em < NOW() - INTERVAL '30 days'`);
 
-      const cfg = await lerConfig();
+      let cfg = await lerConfig();
+      // Janela de conversão por clique da ação de compra principal (usada na validade do gclid).
+      const compra = (s.conversoes || []).filter(c => c.principal && c.categoria === "PURCHASE" && c.janela_clique_dias > 0);
+      const janela = compra.length ? Math.max(...compra.map(c => c.janela_clique_dias)) : null;
+      if (janela && janela !== cfg.janela_clique_dias && !s.preview) {
+        cfg = { ...cfg, janela_clique_dias: janela };
+        await pool.query(`INSERT INTO autopilot_config (id, config) VALUES (1,$1) ON CONFLICT (id) DO UPDATE SET config=autopilot_config.config || $1, atualizado_em=NOW()`,
+          [JSON.stringify({ janela_clique_dias: janela })]);
+      }
       const [economia, cap, hist] = await Promise.all([
         apurarEconomia(s, cfg), capacidade(),
         pool.query(`SELECT tipo, alvo, status, criado_em, aplicada_em FROM autopilot_decisoes WHERE status='aplicada' AND aplicada_em > NOW() - INTERVAL '60 days'`)
       ]);
       const plano = planejar({ snapshot: s, economia, capacidade: cap, historico: hist.rows, config: cfg });
+      // Visualização do Google Ads: só leitura. Não registra, não expira e não envia nada.
+      if (s.preview) {
+        await evento("sync_preview", { propostas: plano.propostas.length, alertas: plano.alertas });
+        return res.json({ ok: true, modo: "simulacao", preview: true, acoes: [], plano: { propostas: plano.propostas.map(p => ({ tipo: p.tipo, alvo: p.alvo, de: p.de, para: p.para })) } });
+      }
       await registrarPropostas(plano.propostas);
       await evento("sync", { modo_local: s.modo_local, preview: !!s.preview, propostas: plano.propostas.length, alertas: plano.alertas, insights: plano.insights, economia: { ...economia, palavras: undefined } });
 
-      // Só ações aprovadas saem para o script, e só se o painel estiver em execução.
-      const { rows: aprovadas } = await pool.query(`SELECT id, acao FROM autopilot_decisoes WHERE status='aprovada' AND plataforma='google_ads' ORDER BY aprovada_em LIMIT 10`);
-      const acoes = cfg.modo === "execucao" ? aprovadas.map(a => ({ id: String(a.id), ...a.acao, aprovada: true })) : [];
-      if (acoes.length) await pool.query(`UPDATE autopilot_decisoes SET enviada_em=NOW() WHERE id = ANY($1::bigint[])`, [acoes.map(a => a.id)]);
-      return res.json({ ok: true, modo: cfg.modo, acoes });
+      // Só ações aprovadas saem, e só com as três travas abertas. Nada é marcado aqui: o estado
+      // muda apenas quando o script reporta que aplicou de fato.
+      const execucao = cfg.modo === "execucao" && s.modo_local === "execucao" && !s.preview;
+      const aprovadas = execucao
+        ? (await pool.query(`SELECT id, acao FROM autopilot_decisoes WHERE status='aprovada' AND plataforma='google_ads' ORDER BY aprovada_em LIMIT 10`)).rows
+        : [];
+      return res.json({ ok: true, modo: cfg.modo, acoes: aprovadas.map(a => ({ id: String(a.id), ...a.acao, aprovada: true })) });
     } catch (e) {
       log.error?.("[AUTOPILOT SYNC]", e.message);
       return res.status(500).json({ ok: false, error: "falha_sync" });
@@ -327,9 +357,15 @@ export function registrarRotasAutopilot(app, { pool, checkAdmin, tokens, adminEm
     try {
       if (!(await tokens.validar(req.get("x-ingest-token"), "google_ads_script"))) return res.status(403).json({ ok: false, error: "nao_autorizado" });
       await garantir();
+      const cfgAtual = await lerConfig();
+      if (req.body?.preview || cfgAtual.modo !== "execucao") {
+        await evento("resultado_ignorado", { motivo: req.body?.preview ? "preview" : "modo_simulacao" });
+        return res.json({ ok: true, ignorado: true });
+      }
       for (const r of (req.body?.resultados || []).slice(0, 20)) {
         const id = parseInt(r.id, 10); if (!id) continue;
-        const status = ["aplicada", "falhou", "recusada_local", "simulada", "adiada"].includes(r.status) ? r.status : "falhou";
+        if (!["aplicada", "falhou", "recusada_local"].includes(r.status)) continue;
+        const status = r.status;
         await pool.query(`UPDATE autopilot_decisoes SET resultado=$2, atualizado_em=NOW(),
                             status=CASE WHEN $3 IN ('aplicada','falhou','recusada_local') THEN $3 ELSE status END,
                             aplicada_em=CASE WHEN $3='aplicada' THEN NOW() ELSE aplicada_em END
@@ -366,6 +402,25 @@ export function registrarRotasAutopilot(app, { pool, checkAdmin, tokens, adminEm
           WHERE id=$1 AND status IN ('proposta','aprovada')`, [id, acao === "aprovar" ? "aprovada" : "rejeitada", req.adminMedico?.email || "admin"]);
       await evento("decisao_" + acao, { id });
       return res.json({ ok: rowCount > 0 });
+    } catch (e) { return res.status(500).json({ ok: false, error: e.message }); }
+  });
+
+  app.post("/api/admin/autopilot/limites", checkAdmin, async (req, res) => {
+    try {
+      await garantir();
+      const b = req.body || {};
+      const num = (v, min, max) => { const n = Number(v); return Number.isFinite(n) && n >= min && n <= max ? n : null; };
+      const novo = {
+        passo_orcamento: num(b.passo_orcamento, 0.01, 0.15), passo_tcpa: num(b.passo_tcpa, 0.01, 0.15),
+        orcamento_teto: num(b.orcamento_teto, 100, 1500), orcamento_piso: num(b.orcamento_piso, 50, 1500),
+        tcpa_min: num(b.tcpa_min, 10, 200), tcpa_max: num(b.tcpa_max, 10, 200)
+      };
+      if (Object.values(novo).some(v => v === null)) return res.status(400).json({ ok: false, error: "valores_fora_da_faixa" });
+      if (novo.orcamento_piso > novo.orcamento_teto || novo.tcpa_min > novo.tcpa_max) return res.status(400).json({ ok: false, error: "minimo_maior_que_maximo" });
+      const cfg = { ...(await lerConfig()), ...novo };
+      await pool.query(`INSERT INTO autopilot_config (id, config) VALUES (1,$1) ON CONFLICT (id) DO UPDATE SET config=$1, atualizado_em=NOW()`, [JSON.stringify(cfg)]);
+      await evento("limites", { ...novo, por: req.adminMedico?.email || "admin" });
+      return res.json({ ok: true, config: cfg });
     } catch (e) { return res.status(500).json({ ok: false, error: e.message }); }
   });
 

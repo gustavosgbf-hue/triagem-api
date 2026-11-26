@@ -20,11 +20,13 @@ var TOKEN = '__TOKEN__';
 // ── Travas locais (só você altera, dentro do Google Ads) ─────────────────────
 var MODO_LOCAL = 'simulacao';               // 'simulacao' | 'execucao'
 var CAMPANHAS_PERMITIDAS = ['23588664889']; // únicas campanhas que o Autopilot pode tocar
+// Travas TÉCNICAS de segurança. Não são autorização de investimento: o teto que vale é o
+// configurado no painel (Autopilot > Limites), sempre menor ou igual a estes.
 var ORCAMENTO_MIN = 100;                    // R$/dia
-var ORCAMENTO_MAX = 1500;                   // R$/dia: teto absoluto, independente do backend
-var MAX_PASSO_ORCAMENTO = 0.25;             // variação máxima por ação (25%)
+var ORCAMENTO_MAX = 1500;                   // R$/dia
+var MAX_PASSO_ORCAMENTO = 0.15;             // variação máxima por ação (15%)
 var TCPA_MIN = 25, TCPA_MAX = 90;           // R$
-var MAX_PASSO_TCPA = 0.20;                  // 20%
+var MAX_PASSO_TCPA = 0.15;                  // 15%
 var MAX_ACOES_POR_EXECUCAO = 4;
 var MAX_PALAVRAS_POR_EXECUCAO = 3;
 var DIAS_GASTO = 7, DIAS_HORAS = 28, DIAS_CLIQUES = 3;
@@ -47,6 +49,11 @@ function main() {
     gasto: coletarGasto(dia(DIAS_GASTO - 1), dia(0), cid),
     campanhas: coletarCampanhas(dia(13), dia(0)),
     mudancas: coletarMudancas(dia(29)),
+    conversoes: coletar('SELECT conversion_action.id, conversion_action.name, conversion_action.status, conversion_action.primary_for_goal, ' +
+      "conversion_action.category, conversion_action.click_through_lookback_window_days FROM conversion_action WHERE conversion_action.status = 'ENABLED'", function (r) {
+        return { id: String(r.conversionAction.id), nome: r.conversionAction.name, principal: !!r.conversionAction.primaryForGoal,
+          categoria: r.conversionAction.category, janela_clique_dias: num(r.conversionAction.clickThroughLookbackWindowDays) };
+      }),
     horas: coletar('SELECT segments.date, segments.hour, campaign.id, metrics.cost_micros, metrics.clicks, metrics.impressions, metrics.conversions FROM campaign ' +
       "WHERE segments.date BETWEEN '" + dia(DIAS_HORAS) + "' AND '" + dia(0) + "' AND metrics.impressions > 0", function (r) {
         return { dia: r.segments.date, hora: r.segments.hour, campanha_id: String(r.campaign.id), custo: micros(r.metrics.costMicros),
@@ -80,7 +87,8 @@ function main() {
     } catch (e) { r.status = 'falhou'; r.motivo = String(e && e.message || e).slice(0, 300); }
     resultados.push(r);
   }
-  if (resultados.length) enviar('/resultado', { resultados: resultados, preview: preview });
+  // Em visualização ou simulação nada é reportado como resultado: nenhuma decisão muda de estado no backend.
+  if (resultados.length && !preview && MODO_LOCAL === 'execucao') enviar('/resultado', { resultados: resultados, preview: false });
   Logger.log('Snapshot enviado. Ações recebidas: ' + acoes.length + '. Resultados: ' + JSON.stringify(resultados));
 }
 

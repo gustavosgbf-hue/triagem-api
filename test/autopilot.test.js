@@ -23,14 +23,14 @@ test("reduz orçamento quando custo marginal supera o valor do pagamento", () =>
   // cpa médio 3500, b=0.5 -> marginal 7000 > valor ~2700+1500*0.44
   const r = planejar({ snapshot: snap(), economia: econ(), capacidade: { espera_p75_min: 5 }, agora });
   const o = r.propostas.find(p => p.tipo === "orcamento");
-  assert.equal(o.para, 297.5);
+  assert.equal(o.para, 315);
   assert.equal(o.requer_aprovacao, true);
 });
 
 test("aumenta quando há retorno, perda por orçamento e capacidade", () => {
   const r = planejar({ snapshot: snap(), economia: econ({ elasticidade: { b: 0.9 }, google: { pagamentos: 90, novos: 40, gasto: 180000, margem_media: 2700 } }), capacidade: { espera_p75_min: 5 }, agora });
   const o = r.propostas.find(p => p.tipo === "orcamento");
-  assert.equal(o.para, 402.5);
+  assert.equal(o.para, 385);
   const bloq = planejar({ snapshot: snap(), economia: econ({ elasticidade: { b: 0.9 }, google: { pagamentos: 90, novos: 40, gasto: 180000, margem_media: 2700 } }), capacidade: { espera_p75_min: 45 }, agora });
   assert.equal(bloq.propostas.filter(p => p.tipo === "orcamento").length, 0);
 });
@@ -72,4 +72,13 @@ test("tokens", () => {
   assert.ok(t.startsWith("cj24_") && t.length > 40);
   assert.equal(iguaisSeguro(t, t), true);
   assert.equal(iguaisSeguro(t, gerarToken()), false);
+});
+
+test("teto do painel limita mesmo com trava técnica maior", () => {
+  const e = econ({ elasticidade: { b: 0.9 }, google: { pagamentos: 90, novos: 40, gasto: 180000, margem_media: 2700 } });
+  const r = planejar({ snapshot: snap({ campanhas: [campanha({ orcamento: 400 })] }), economia: e, capacidade: {}, config: { orcamento_teto: 400 }, agora });
+  assert.equal(r.propostas.filter(p => p.tipo === "orcamento").length, 0);
+  assert.ok(r.insights.some(i => i.codigo === "teto_orcamento"));
+  const r2 = planejar({ snapshot: snap(), economia: e, capacidade: {}, config: { passo_orcamento: 0.15, orcamento_teto: 2000 }, agora });
+  assert.equal(r2.propostas.find(p => p.tipo === "orcamento").para, 402.5);
 });

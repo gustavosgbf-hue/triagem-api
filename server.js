@@ -109,6 +109,7 @@ const adsAttributionSchemaReady = pool.query(`
     ADD COLUMN IF NOT EXISTS ads_first_touch JSONB,
     ADD COLUMN IF NOT EXISTS ads_last_touch JSONB,
     ADD COLUMN IF NOT EXISTS ads_conversion_touch JSONB,
+    ADD COLUMN IF NOT EXISTS ads_clique_historico JSONB,
     ADD COLUMN IF NOT EXISTS app_install_id TEXT,
     ADD COLUMN IF NOT EXISTS app_attribution_id TEXT;
 
@@ -702,12 +703,60 @@ function normalizarAdsAttribution(input = {}, req) {
   };
 }
 
+// Janela de conversão por clique configurada no Google Ads (enviada pelo script; padrão 30 dias).
+let janelaCliqueCache = { dias: 30, ate: 0 };
+async function janelaCliqueDias() {
+  if (janelaCliqueCache.ate > Date.now()) return janelaCliqueCache.dias;
+  let dias = 30;
+  try {
+    const { rows } = await pool.query(`SELECT (config->>'janela_clique_dias')::int d FROM autopilot_config WHERE id=1`);
+    if (rows[0]?.d >= 1 && rows[0].d <= 90) dias = rows[0].d;
+  } catch (_) {}
+  janelaCliqueCache = { dias, ate: Date.now() + 10 * 60_000 };
+  return dias;
+}
+
+// Um identificador de clique só atribui um NOVO pagamento dentro da janela de conversão,
+// contada da primeira vez que o vimos (ou da data real do clique, quando o script a informou).
+// Fora da janela ele vira histórico do paciente (ads_clique_historico) e não vai para ads_gclid.
+async function avaliarValidadeClique(ads) {
+  const clique = ads.gclid || ads.gbraid || ads.wbraid;
+  if (!clique) return { valido: true };
+  const janela = await janelaCliqueDias();
+  let primeiro = null;
+  try {
+    const { rows } = await pool.query(
+      `SELECT MIN(ads_capturado_em) t FROM fila_atendimentos
+        WHERE ads_capturado_em IS NOT NULL AND (ads_gclid=$1 OR ads_gbraid=$1 OR ads_wbraid=$1)`, [clique]);
+    primeiro = rows[0]?.t ? new Date(rows[0].t) : null;
+  } catch (_) {}
+  try {
+    const { rows } = await pool.query(`SELECT MIN(dia)::timestamptz t FROM autopilot_cliques WHERE gclid=$1`, [clique]);
+    const t = rows[0]?.t ? new Date(rows[0].t) : null;
+    if (t && (!primeiro || t < primeiro)) primeiro = t;
+  } catch (_) {}
+  const valido = !primeiro || (Date.now() - primeiro.getTime()) <= janela * 86400000;
+  return { valido, clique, primeiro, janela };
+}
+
 async function salvarAdsAttribution(atendimentoId, attribution, req) {
   const id = parseInt(atendimentoId, 10);
   if (!id) return;
-  const ads = attribution?.hasAny ? attribution : normalizarAdsAttribution(attribution || {}, req);
+  let ads = attribution?.hasAny ? attribution : normalizarAdsAttribution(attribution || {}, req);
   if (!ads.hasAny) return;
   await adsAttributionSchemaReady;
+
+  const validade = await avaliarValidadeClique(ads);
+  if (!validade.valido) {
+    // Preserva a origem histórica sem atribuir este pagamento ao clique antigo.
+    await pool.query(
+      `UPDATE fila_atendimentos SET ads_clique_historico = COALESCE(ads_clique_historico, $2::jsonb) WHERE id=$1`,
+      [id, JSON.stringify({ gclid: ads.gclid || null, gbraid: ads.gbraid || null, wbraid: ads.wbraid || null,
+        primeiro_visto: validade.primeiro?.toISOString() || null, janela_dias: validade.janela, motivo: "fora_da_janela" })]
+    ).catch(e => console.warn("[ADS] histórico de clique:", e.message));
+    const semClique = (t) => { const c = { ...(t || {}) }; delete c.gclid; delete c.gbraid; delete c.wbraid; return c; };
+    ads = { ...ads, gclid: "", gbraid: "", wbraid: "", lastTouch: semClique(ads.lastTouch) };
+  }
 
   const firstJson = JSON.stringify(ads.firstTouch || {});
   const lastJson = JSON.stringify(ads.lastTouch || {});
@@ -2020,6 +2069,7 @@ async function initDB() {
       ['ads_checkout_session_id','TEXT'],
       ['ads_user_agent','TEXT'],
       ['ads_capturado_em','TIMESTAMPTZ'],
+      ['ads_clique_historico','JSONB'],
       ['confirmado_pageview_em','TIMESTAMPTZ'],
       ['confirmado_has_ads_id','BOOLEAN'],
       ['confirmado_href','TEXT'],
