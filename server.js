@@ -23,7 +23,8 @@ import {
   normalizarDataIso,
   validarDadosPrescritor,
 } from "./memed-utils.js";
-import { registrarRotaGanhosMedico } from "./medico-ganhos.js";
+import { registrarRotaGanhosMedico, GANHOS_INICIO_ISO } from "./medico-ganhos.js";
+import { calcularMargemConsulta, validarAcaoMargem, transactionIdMargem } from "./margem-consulta.js";
 import { ehTokenMedico, ehTokenPrescritor, criarVerificadorMedicoAtivo } from "./auth-tokens.js";
 import { criarAcessoAtendimento, exporChave, registrarNegado, lerLinkAssinado } from "./acesso-atendimento.js";
 import {
@@ -837,22 +838,6 @@ function googleAdsOfflineConfig() {
   };
 }
 
-function googleAdsMarginConfig() {
-  const base = googleAdsOfflineConfig();
-  const conversionCustomerId = normalizarGoogleAdsCustomerId(
-    process.env.GOOGLE_ADS_CONVERSION_CUSTOMER_ID || base.customerId
-  );
-  const conversionActionResource = limitarTexto(process.env.GOOGLE_ADS_MARGIN_CONVERSION_ACTION_RESOURCE, 180);
-  const conversionActionId = limitarTexto(process.env.GOOGLE_ADS_MARGIN_CONVERSION_ACTION_ID, 80);
-  const actionResource = conversionActionResource ||
-    (conversionActionId && conversionCustomerId
-      ? `customers/${conversionCustomerId}/conversionActions/${conversionActionId}`
-      : "");
-  const missing = base.missing.filter(item => item !== "GOOGLE_ADS_CONVERSION_ACTION_ID");
-  if (!actionResource) missing.push("GOOGLE_ADS_MARGIN_CONVERSION_ACTION_ID");
-  return { ...base, configured: missing.length === 0, missing, actionResource };
-}
-
 let googleAdsTokenCache = { token: "", expiresAt: 0 };
 
 async function obterGoogleAdsAccessToken() {
@@ -1173,74 +1158,145 @@ async function marcarGoogleAdsMargem(atendimentoId, status, detalhes = {}) {
   ).catch(e => console.warn("[GOOGLE-ADS-MARGEM] Falha ao marcar status:", e.message));
 }
 
-function calcularMargemOperacionalCentavos(at, medicoEmail) {
-  const brutoInformado = Number(at?.valor_cobrado_centavos);
-  const reembolsoInformado = Number(at?.reembolso_valor_centavos);
-  const bruto = Math.max(0, Number.isFinite(brutoInformado) ? brutoInformado : 4990);
-  const reembolsado = Math.max(0, Number.isFinite(reembolsoInformado) ? reembolsoInformado : 0);
-  const liquidoAntesTaxas = Math.max(0, bruto - reembolsado);
-  const email = String(medicoEmail || "").trim().toLowerCase();
-  const atendimentoDoAdmin = email === ADMIN_MEDICO_EMAIL || String(at?.tipo || "").startsWith("renovacao_");
-  const percentualConfigurado = Number(process.env.MARGEM_PLATAFORMA_MEDICO_PERCENTUAL);
-  const percentualPlataforma = Math.min(1, Math.max(0,
-    Number.isFinite(percentualConfigurado) ? percentualConfigurado : 0.30
-  ));
-  return atendimentoDoAdmin
-    ? Math.round(liquidoAntesTaxas)
-    : Math.round(liquidoAntesTaxas * percentualPlataforma);
+// Margem por consulta: mensuração separada da compra. Regras em margem-consulta.js.
+// O valor fica no banco (consulta_margem). Envio ao Google Ads só com
+// GOOGLE_ADS_MARGEM_UPLOAD_ENABLED=true e numa ação própria, nunca a de compra.
+let consultaMargemTabelaPronta = false;
+async function garantirTabelaConsultaMargem() {
+  if (consultaMargemTabelaPronta) return;
+  await pool.query(`CREATE TABLE IF NOT EXISTS consulta_margem (
+    atendimento_id INTEGER PRIMARY KEY,
+    calculado_em TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    encerrado_em TIMESTAMPTZ,
+    pago_em TIMESTAMPTZ,
+    medico_id INTEGER,
+    customer_type TEXT,
+    origem TEXT,
+    tem_click_google BOOLEAN NOT NULL DEFAULT FALSE,
+    gateway TEXT,
+    metodo TEXT,
+    bruto_centavos INTEGER NOT NULL,
+    reembolso_centavos INTEGER NOT NULL,
+    repasse_centavos INTEGER,
+    taxa_gateway_centavos INTEGER,
+    imposto_centavos INTEGER,
+    contribuicao_centavos INTEGER,
+    margem_centavos INTEGER,
+    completo BOOLEAN NOT NULL,
+    pendencias TEXT,
+    versao_regra TEXT NOT NULL
+  )`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS consulta_margem_pago_em_idx ON consulta_margem (pago_em)`);
+  consultaMargemTabelaPronta = true;
 }
 
-async function enviarConversaoMargemGoogleAds(at, medicoEmail, opts = {}) {
-  if (!at?.id) return { ok: false, skipped: "sem_atendimento" };
-  if (at.google_ads_margem_enviado_em && !opts.force) return { ok: true, skipped: "ja_enviado" };
+function googleAdsMargemUploadConfig() {
+  const enabled = envBool("GOOGLE_ADS_MARGEM_UPLOAD_ENABLED", false);
+  const acao = process.env.GOOGLE_ADS_MARGIN_CONVERSION_ACTION_ID || "";
+  const idsCompra = [
+    "7507030772",
+    process.env.GOOGLE_DATA_MANAGER_CONVERSION_ACTION_ID,
+    process.env.GOOGLE_ADS_CONVERSION_ACTION_ID
+  ];
+  const v = validarAcaoMargem(acao, idsCompra);
+  return { enabled, ok: v.ok, erro: v.erro || "", conversionActionId: v.id || "" };
+}
 
-  const valorCentavos = calcularMargemOperacionalCentavos(at, medicoEmail);
-  if (valorCentavos <= 0) return { ok: false, skipped: "sem_margem" };
-
-  const dmCfg = googleDataManagerConfig();
-  if (!dmCfg.enabled || !dmCfg.configured) {
-    const missing = dmCfg.enabled ? dmCfg.missing : ["GOOGLE_DATA_MANAGER_ENABLED"];
-    await marcarGoogleAdsMargem(at.id, "unconfigured", {
-      error: missing.join(","),
-      valorCentavos
-    });
-    return { ok: false, skipped: "unconfigured", missing };
+async function enviarMargemGoogleAds(at, margemCentavos) {
+  const cfg = googleAdsMargemUploadConfig();
+  if (!cfg.enabled) return { ok: false, skipped: "upload_desligado" };
+  if (!cfg.ok) {
+    await marcarGoogleAdsMargem(at.id, "blocked", { error: cfg.erro });
+    return { ok: false, skipped: cfg.erro };
   }
-
-  // Data Manager deduplica/ajusta pela mesma transactionId usada pela tag web: o atendimento_id puro.
-  // Enviar o valor final após o atendimento substitui o valor original sem criar nova conversão.
-  const r = await enviarConversaoDataManagerGoogleAds(
-    at,
-    valorCentavos / 100,
-    "BRL",
-    { validateOnly: opts.validateOnly ?? dmCfg.validateOnly }
-  );
-
+  // Valor negativo não é aceito como valor de conversão: envia 0 e mantém o real no banco.
+  const valor = Math.max(0, margemCentavos) / 100;
+  const txId = transactionIdMargem(at.id);
+  const r = await enviarConversaoDataManagerGoogleAds(at, valor, "BRL", {
+    conversionActionId: cfg.conversionActionId,
+    transactionId: txId,
+    permitirZero: true
+  });
   if (!r.ok) {
-    await marcarGoogleAdsMargem(at.id, "failed", {
-      error: String(r.error || r.skipped || "data_manager_failed"),
-      orderId: String(at.id),
-      jobId: r.requestId || "",
-      valorCentavos
+    await marcarGoogleAdsMargem(at.id, r.skipped === "no_match_data" ? "no_match_data" : "failed", {
+      error: String(r.error || r.skipped || "data_manager_failed"), orderId: txId, valorCentavos: margemCentavos
     });
-    return { ok: false, error: r.error || r.skipped || "data_manager_failed", valorCentavos };
+    return { ok: false, error: r.error || r.skipped };
   }
-
   const status = r.validated ? "validated" : "sent";
-  await marcarGoogleAdsMargem(at.id, status, {
-    jobId: r.requestId || "",
-    orderId: String(at.id),
-    error: "",
-    valorCentavos
-  });
-  console.log("GOOGLE_ADS_MARGIN_RESTATEMENT_OK", {
-    consultaId: String(at.id),
-    status,
-    valorCentavos,
-    transactionId: String(at.id)
-  });
-  return { ok: true, status, valorCentavos, provider: "data_manager" };
+  await marcarGoogleAdsMargem(at.id, status, { jobId: r.requestId || "", orderId: txId, error: "", valorCentavos: margemCentavos });
+  return { ok: true, status, valorCentavos: margemCentavos };
 }
+
+// Calcula, grava e (se habilitado) envia a margem. Reenvio com o mesmo
+// transactionId na mesma ação é tratado pelo Google como ajuste de valor.
+async function registrarMargemConsulta(atOuId, opts = {}) {
+  const id = parseInt(typeof atOuId === "object" ? atOuId?.id : atOuId, 10);
+  if (!id) return { ok: false, skipped: "sem_atendimento" };
+  await garantirTabelaConsultaMargem();
+  const { rows } = await pool.query(
+    `SELECT f.*, m.email AS medico_email, m.nome AS medico_nome_cad, m.nome_exibicao AS medico_nome_exibicao,
+            cm.margem_centavos AS margem_anterior
+       FROM fila_atendimentos f
+       LEFT JOIN medicos m ON m.id = f.medico_id
+       LEFT JOIN consulta_margem cm ON cm.atendimento_id = f.id
+      WHERE f.id = $1`, [id]);
+  const at = rows[0];
+  if (!at || at.status !== "encerrado" || at.pagamento_status !== "confirmado") return { ok: false, skipped: "nao_elegivel" };
+  const medico = at.medico_email ? { email: at.medico_email, nome: at.medico_nome_cad, nome_exibicao: at.medico_nome_exibicao } : null;
+  const r = calcularMargemConsulta({ at, medico, adminEmail: ADMIN_MEDICO_EMAIL });
+  const temClick = !!(at.ads_gclid || at.ads_gbraid || at.ads_wbraid);
+  await pool.query(
+    `INSERT INTO consulta_margem (atendimento_id, calculado_em, encerrado_em, pago_em, medico_id, customer_type, origem,
+        tem_click_google, gateway, metodo, bruto_centavos, reembolso_centavos, repasse_centavos, taxa_gateway_centavos,
+        imposto_centavos, contribuicao_centavos, margem_centavos, completo, pendencias, versao_regra)
+     VALUES ($1,NOW(),$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+     ON CONFLICT (atendimento_id) DO UPDATE SET calculado_em=NOW(), encerrado_em=EXCLUDED.encerrado_em,
+        pago_em=EXCLUDED.pago_em, medico_id=EXCLUDED.medico_id, customer_type=EXCLUDED.customer_type,
+        origem=EXCLUDED.origem, tem_click_google=EXCLUDED.tem_click_google, gateway=EXCLUDED.gateway,
+        metodo=EXCLUDED.metodo, bruto_centavos=EXCLUDED.bruto_centavos, reembolso_centavos=EXCLUDED.reembolso_centavos,
+        repasse_centavos=EXCLUDED.repasse_centavos, taxa_gateway_centavos=EXCLUDED.taxa_gateway_centavos,
+        imposto_centavos=EXCLUDED.imposto_centavos, contribuicao_centavos=EXCLUDED.contribuicao_centavos,
+        margem_centavos=EXCLUDED.margem_centavos, completo=EXCLUDED.completo, pendencias=EXCLUDED.pendencias,
+        versao_regra=EXCLUDED.versao_regra`,
+    [id, at.encerrado_em || null, at.pagamento_confirmado_em || null, at.medico_id || null,
+     at.customer_type || (at.cliente_novo === true ? "new" : at.cliente_novo === false ? "returning" : "unknown"),
+     at.origem_plataforma || null, temClick, r.gateway, r.metodo, r.brutoCentavos, r.reembolsoCentavos,
+     r.repasseCentavos, r.taxaGatewayCentavos, r.impostoCentavos, r.contribuicaoCentavos, r.margemCentavos,
+     r.completo, r.pendencias.join(",") || null, r.versaoRegra]
+  );
+  // Só envia margem calculada com regra real de repasse; sem clique Google não há o que atribuir.
+  const mudou = at.margem_anterior === null || Number(at.margem_anterior) !== r.margemCentavos;
+  if (temClick && r.margemCentavos !== null && (mudou || opts.force) && !r.pendencias.some(p => p.startsWith("repasse") || p === "medico_nao_identificado")) {
+    const envio = await enviarMargemGoogleAds(at, r.margemCentavos).catch(e => ({ ok: false, error: e.message }));
+    return { ok: true, margem: r, envio };
+  }
+  return { ok: true, margem: r };
+}
+
+// Recalcula consultas encerradas recentes (pega estornos posteriores ao encerramento).
+let recalculoMargemRodando = false;
+async function recalcularMargensRecentes(dias = 45) {
+  if (recalculoMargemRodando) return;
+  recalculoMargemRodando = true;
+  try {
+    const { rows } = await pool.query(
+      `SELECT id FROM fila_atendimentos
+        WHERE status='encerrado' AND pagamento_status='confirmado'
+          AND encerrado_em::timestamptz >= GREATEST($1::timestamptz, NOW() - ($2::int * INTERVAL '1 day'))
+        ORDER BY encerrado_em`, [GANHOS_INICIO_ISO, dias]);
+    let ok = 0;
+    for (const { id } of rows) {
+      const r = await registrarMargemConsulta(id).catch(e => ({ ok: false, error: e.message }));
+      if (r.ok) ok++;
+    }
+    console.log("MARGEM_RECALCULO", { total: rows.length, ok });
+  } finally {
+    recalculoMargemRodando = false;
+  }
+}
+setTimeout(() => recalcularMargensRecentes().catch(e => console.warn("[MARGEM]", e.message)), 150_000).unref?.();
+setInterval(() => recalcularMargensRecentes().catch(e => console.warn("[MARGEM]", e.message)), 6 * 60 * 60_000).unref?.();
 
 let googleDataManagerTokenCache = { token: "", expiresAt: 0 };
 
@@ -1311,10 +1367,10 @@ async function enviarConversaoDataManagerGoogleAds(at, valor, currency, opts = {
   const token = await obterGoogleDataManagerAccessToken(cfg);
   const classificacao = await classificarClienteGoogleAds(at);
   const event = {
-    conversionValue: Number(valor) || 49.90,
+    conversionValue: opts.permitirZero ? Math.max(0, Number(valor) || 0) : (Number(valor) || 49.90),
     currency: limitarTexto(currency || "BRL", 3).toUpperCase(),
     eventTimestamp: new Date(at.pagamento_confirmado_em || Date.now()).toISOString(),
-    transactionId: String(at.id),
+    transactionId: String(opts.transactionId || at.id),
     eventSource: origemEventoGoogleDataManager(at)
   };
   if (Object.keys(adIdentifiers).length) event.adIdentifiers = adIdentifiers;
@@ -1327,7 +1383,7 @@ async function enviarConversaoDataManagerGoogleAds(at, valor, currency, opts = {
   const body = {
     destinations: [{
       operatingAccount: { product: "GOOGLE_ADS", accountId: cfg.customerId },
-      productDestinationId: cfg.conversionActionId
+      productDestinationId: String(opts.conversionActionId || cfg.conversionActionId)
     }],
     events: [event],
     validateOnly: opts.validateOnly ?? cfg.validateOnly
@@ -2784,44 +2840,44 @@ app.post("/api/admin/google-ads/offline/retry", checkAdmin, async (req, res) => 
 });
 
 app.post("/api/admin/google-ads/margem/retry", checkAdmin, async (req, res) => {
-  const limit = Math.min(100, Math.max(1, parseInt(req.body?.limit || req.query.limit || "25", 10) || 25));
-  const force = /^(1|true|yes|sim)$/i.test(String(req.body?.force || req.query.force || ""));
-  const cfg = googleAdsMarginConfig();
-  if (!cfg.configured) {
-    return res.status(400).json({ ok: false, error: "google_ads_margem_nao_configurado", missing: cfg.missing });
-  }
+  const dias = Math.min(90, Math.max(1, parseInt(req.body?.dias || req.query.dias || "45", 10) || 45));
   try {
+    await recalcularMargensRecentes(dias);
+    return res.json({ ok: true, dias, upload: googleAdsMargemUploadConfig() });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
+// Resumo administrativo da margem real (sem percentuais de repasse).
+app.get("/api/admin/margem/resumo", checkAdmin, async (req, res) => {
+  res.set("Cache-Control", "no-store");
+  try {
+    await garantirTabelaConsultaMargem();
+    const dias = Math.min(180, Math.max(1, parseInt(req.query.dias || "30", 10) || 30));
     const { rows } = await pool.query(
-      `SELECT f.*, LOWER(TRIM(COALESCE(m.email,''))) AS medico_email
-         FROM fila_atendimentos f
-         LEFT JOIN medicos m ON m.id=f.medico_id
-        WHERE f.status='encerrado'
-          AND f.encerrado_em IS NOT NULL
-          AND ($1::boolean OR f.google_ads_margem_enviado_em IS NULL)
-          AND (
-            COALESCE(f.ads_gclid,'') <> ''
-            OR COALESCE(f.ads_gbraid,'') <> ''
-            OR COALESCE(f.ads_wbraid,'') <> ''
-            OR $2::boolean
-          )
-        ORDER BY f.encerrado_em DESC
-        LIMIT $3`,
-      [force, cfg.sendUserData, limit]
-    );
-    const resultados = [];
-    for (const at of rows) {
-      const r = await enviarConversaoMargemGoogleAds(at, at.medico_email, { force })
-        .catch(e => ({ ok: false, error: e.message }));
-      resultados.push({
-        id: at.id,
-        ok: !!r.ok,
-        status: r.status || "",
-        skipped: r.skipped || "",
-        valorCentavos: r.valorCentavos || calcularMargemOperacionalCentavos(at, at.medico_email),
-        error: r.error || ""
-      });
-    }
-    return res.json({ ok: true, total: resultados.length, resultados });
+      `SELECT COALESCE(customer_type,'unknown') AS cliente,
+              CASE WHEN tem_click_google THEN 'google' ELSE 'outros' END AS canal,
+              COUNT(*)::int AS consultas,
+              COUNT(*) FILTER (WHERE margem_centavos IS NOT NULL)::int AS com_margem,
+              COUNT(*) FILTER (WHERE completo)::int AS completas,
+              SUM(bruto_centavos)::bigint AS bruto,
+              SUM(reembolso_centavos)::bigint AS reembolso,
+              SUM(repasse_centavos)::bigint AS repasse,
+              SUM(taxa_gateway_centavos)::bigint AS taxas,
+              SUM(imposto_centavos)::bigint AS impostos,
+              SUM(contribuicao_centavos)::bigint AS contribuicao,
+              SUM(margem_centavos)::bigint AS margem,
+              ROUND(AVG(margem_centavos))::int AS margem_media
+         FROM consulta_margem
+        WHERE encerrado_em >= NOW() - ($1::int * INTERVAL '1 day')
+        GROUP BY 1,2 ORDER BY 2,1`, [dias]);
+    const pend = await pool.query(
+      `SELECT p AS pendencia, COUNT(*)::int AS n
+         FROM consulta_margem, LATERAL unnest(string_to_array(pendencias, ',')) p
+        WHERE encerrado_em >= NOW() - ($1::int * INTERVAL '1 day')
+        GROUP BY 1 ORDER BY 2 DESC`, [dias]);
+    return res.json({ ok: true, dias, grupos: rows, pendencias: pend.rows, upload: googleAdsMargemUploadConfig() });
   } catch (e) {
     return res.status(500).json({ ok: false, error: e.message });
   }
@@ -5737,9 +5793,6 @@ app.get("/api/atendimento/assumir-email", async (req, res) => {
       return res.send(`<html><body style="font-family:sans-serif;text-align:center;padding:60px;background:#060d0b;color:#fff"><h2 style="color:#ffbd2e">⚠️ Atendimento já assumido</h2><p>Este atendimento já foi assumido por outro médico.</p><a href="${PAINEL_URL}" style="color:#b4e05a">Ir para o painel</a></body></html>`);
     }
     const paciente = result.rows[0];
-    const medicoEmailMargem = medicoReserva?.email || (Number(medicoId) === 0 ? ADMIN_MEDICO_EMAIL : "");
-    enviarConversaoMargemGoogleAds(paciente, medicoEmailMargem, { force: true })
-      .catch(e => console.warn("[GOOGLE-ADS] Ajuste ao assumir por e-mail falhou:", e.message));
     console.log(`[ASSUMIR-EMAIL] ${medicoNome} assumiu atendimento #${atendimentoId} (${paciente.nome}) via e-mail`);
     // Redireciona para o painel com o atendimento já marcado
     return res.redirect(`${PAINEL_URL}?assumiu=${atendimentoId}`);
@@ -10239,8 +10292,9 @@ app.post("/api/admin/atendimentos/:id/transferir", checkAdmin, async (req, res) 
       return res.status(404).json({ ok: false, error: "Atendimento não encontrado." });
     }
     const atendimento = atualizado.rows[0];
-    enviarConversaoMargemGoogleAds(atendimento, medico.email, { force: true })
-      .catch(e => console.warn("[GOOGLE-ADS] Ajuste ao atribuir atendimento falhou:", e.message));
+    if (atendimento.status === "encerrado") {
+      registrarMargemConsulta(atendimento.id).catch(e => console.warn("[MARGEM] Recalculo na transferência falhou:", e.message));
+    }
     const agora = new Date().toLocaleString("pt-BR", { timeZone: "America/Fortaleza" });
     await appendToSheet("Atendimentos", [
       agora, atendimento.nome || "", atendimento.tel || "", atendimento.cpf || "",
@@ -10717,8 +10771,6 @@ app.post("/api/atendimento/assumir", checkMedico, async (req, res) => {
     );
     if (result.rowCount===0) return res.status(409).json({ ok: false, error: "Paciente ja foi assumido" });
     const at2 = result.rows[0];
-    enviarConversaoMargemGoogleAds(at2, medico.email, { force: true })
-      .catch(e => console.warn("[GOOGLE-ADS] Ajuste ao assumir falhou:", e.message));
 
     // Da baixa no agendamento para sair do badge de agendamentos
     if (at2.agendamento_id) {
@@ -10948,9 +11000,7 @@ app.post("/api/atendimento/encerrar", checkMedico, async (req, res) => {
     if (!at) return res.status(404).json({ ok: false, error: "Atendimento nao encontrado" });
     const agora = new Date().toLocaleString("pt-BR",{timeZone:"America/Fortaleza"});
     appendToSheet("Atendimentos",[agora,at.nome||"",at.tel||"",at.cpf||"","Encerrado",at.medico_nome||"",triagemParaPlanilha(at.triagem, at.queixa),at.tipo||"",at.documentos_emitidos||"",String(at.id)]).catch(e=>console.error("[Sheets]",e));
-    await enviarConversaoMargemGoogleAds(at, medicoEmail).catch(e => {
-      console.warn("[GOOGLE-ADS-MARGEM] Erro inesperado:", e.message);
-    });
+    registrarMargemConsulta(at.id).catch(e => console.warn("[MARGEM] Erro ao registrar:", e.message));
     return res.json({ ok: true, atendimento: at });
   } catch (err) { console.error("Erro em /api/atendimento/encerrar:", err); return res.status(500).json({ ok: false, error: "Erro ao encerrar atendimento" }); }
 });
