@@ -5,6 +5,7 @@
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import { timingSafeEqual } from "crypto";
 import { calcularMargemConsulta, lerTaxasMargem } from "./margem-consulta.js";
 
 export const CANAIS_PAGOS = ["google_ads", "microsoft_ads", "meta_ads"];
@@ -101,7 +102,7 @@ export function agregarFinanceiro({ pagamentos = [], gastos = [], retornos = new
   for (const p of pagamentos) {
     const canal = classificarCanal(p);
     const medico = p.medico_email ? { email: p.medico_email, nome: p.medico_nome_cad, nome_exibicao: p.medico_nome_exibicao } : null;
-    const m = calcularMargemConsulta({ at: p, medico, adminEmail, taxas });
+    const m = calcularMargemConsulta({ at: p, medico, adminEmail, taxas, estimarAntesDaRegra: true });
     const tipo = p.customer_type === "new" || p.cliente_novo === true ? "new" : "returning";
     const alvo = [garantir(canal), total];
     const d = dia(p.dia);
@@ -236,7 +237,12 @@ export function criarColetores({ consultarGoogleAds, env = process.env, fetchFn 
   };
 }
 
-export function normalizarLinhaImportada(l) {
+export function tokenIngestValido(recebido, esperado) {
+  const a = Buffer.from(String(recebido || "")), b = Buffer.from(String(esperado || ""));
+  return b.length >= 24 && a.length === b.length && timingSafeEqual(a, b);
+}
+
+export function normalizarLinhaImportada(l, fonte = "importacao_manual") {
   const canal = String(l?.canal || "");
   if (!CANAIS_PAGOS.includes(canal)) return null;
   if (!DIA_RE.test(String(l?.dia || ""))) return null;
@@ -246,7 +252,8 @@ export function normalizarLinhaImportada(l) {
     canal, conta_id: String(l.conta_id || "manual").slice(0, 40), campanha_id: String(l.campanha_id || "total").slice(0, 40),
     campanha_nome: l.campanha_nome ? String(l.campanha_nome).slice(0, 200) : null, dia: l.dia, custo_centavos: custo,
     impressoes: Math.max(0, Math.round(Number(l.impressoes) || 0)), cliques: Math.max(0, Math.round(Number(l.cliques) || 0)),
-    conversoes_plataforma: Number(l.conversoes_plataforma) || 0, valor_conversoes_centavos: 0, fonte: "importacao_manual"
+    conversoes_plataforma: Number(l.conversoes_plataforma ?? l.conversoes) || 0,
+    valor_conversoes_centavos: Math.max(0, Math.round(Number(l.valor_conversoes ?? 0) * 100) || 0), fonte
   };
 }
 
@@ -261,7 +268,7 @@ const SQL_TABELA = `CREATE TABLE IF NOT EXISTS marketing_gasto_diario (
 async function gravarGastos(pool, linhas, { sobrescreverApi = true } = {}) {
   let n = 0;
   for (const l of linhas) {
-    // Dado da API sempre prevalece; seed e importação não sobrescrevem dado da API.
+    // Dado de API/script da plataforma prevalece; seed e importação manual não o sobrescrevem.
     await pool.query(
       `INSERT INTO marketing_gasto_diario (canal,conta_id,campanha_id,dia,campanha_nome,custo_centavos,impressoes,cliques,conversoes_plataforma,valor_conversoes_centavos,fonte,atualizado_em)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,NOW())
@@ -269,7 +276,8 @@ async function gravarGastos(pool, linhas, { sobrescreverApi = true } = {}) {
          custo_centavos=EXCLUDED.custo_centavos, impressoes=EXCLUDED.impressoes, cliques=EXCLUDED.cliques,
          conversoes_plataforma=EXCLUDED.conversoes_plataforma, valor_conversoes_centavos=EXCLUDED.valor_conversoes_centavos,
          fonte=EXCLUDED.fonte, atualizado_em=NOW()
-       WHERE ($12::boolean AND EXCLUDED.fonte LIKE '%_api') OR marketing_gasto_diario.fonte NOT LIKE '%_api'`,
+       WHERE ($12::boolean AND (EXCLUDED.fonte LIKE '%\\_api' OR EXCLUDED.fonte LIKE '%\\_script'))
+          OR NOT (marketing_gasto_diario.fonte LIKE '%\\_api' OR marketing_gasto_diario.fonte LIKE '%\\_script')`,
       [l.canal, l.conta_id, l.campanha_id, l.dia, l.campanha_nome, l.custo_centavos, l.impressoes, l.cliques,
        l.conversoes_plataforma, l.valor_conversoes_centavos, l.fonte, sobrescreverApi]);
     n++;
@@ -302,7 +310,7 @@ const SQL_RETORNOS = `
         FROM fila_atendimentos f
        WHERE f.pagamento_status='confirmado'
     ) x JOIN ids USING (identidade)
-   WHERE x.pagamento_confirmado_em::timestamptz > ids.primeiro
+   WHERE x.pagamento_confirmado_em::timestamptz > ids.primeiro + INTERVAL '1 second'
    GROUP BY 1`;
 
 export function registrarRotasFinanceiro(app, { pool, checkAdmin, adminEmail, consultarGoogleAds, log = console }) {
@@ -401,6 +409,27 @@ export function registrarRotasFinanceiro(app, { pool, checkAdmin, adminEmail, co
       const gravadas = await gravarGastos(pool, validas, { sobrescreverApi: false });
       return res.json({ ok: true, recebidas: entrada.length, gravadas, rejeitadas: linhas.length - validas.length });
     } catch (e) { return res.status(500).json({ ok: false, error: e.message }); }
+  });
+
+  // Envio automático pelos scripts das plataformas (Google Ads Scripts / Microsoft Advertising Scripts).
+  // Autenticação por token próprio, sem sessão de usuário.
+  app.post("/api/financeiro/gasto/ingest", async (req, res) => {
+    try {
+      if (!tokenIngestValido(req.get("x-ingest-token"), process.env.FINANCEIRO_INGEST_TOKEN)) {
+        return res.status(403).json({ ok: false, error: "nao_autorizado" });
+      }
+      await garantir();
+      const canal = String(req.body?.canal || "");
+      if (!["google_ads", "microsoft_ads", "meta_ads"].includes(canal)) return res.status(400).json({ ok: false, error: "canal_invalido" });
+      const entrada = Array.isArray(req.body?.linhas) ? req.body.linhas.slice(0, 5000) : [];
+      const linhas = entrada.map(l => normalizarLinhaImportada({ ...l, canal }, `${canal}_script`)).filter(Boolean);
+      const gravadas = await gravarGastos(pool, linhas);
+      estado[canal] = { ok: true, configurado: true, via: "script", linhas: gravadas, em: new Date().toISOString() };
+      return res.json({ ok: true, recebidas: entrada.length, gravadas });
+    } catch (e) {
+      log.error?.("[FINANCEIRO INGEST]", e.message);
+      return res.status(500).json({ ok: false, error: "falha_ingestao" });
+    }
   });
 
   return { sincronizar };

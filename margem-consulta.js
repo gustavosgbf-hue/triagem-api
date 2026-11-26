@@ -64,7 +64,7 @@ function pontosBaseCentavos(base, pontosBase) {
  * Retorna valores em centavos e a lista de pendências; completo=false quando
  * algum componente não pôde ser determinado com regra real.
  */
-export function calcularMargemConsulta({ at, medico, adminEmail, taxas = lerTaxasMargem() }) {
+export function calcularMargemConsulta({ at, medico, adminEmail, taxas = lerTaxasMargem(), estimarAntesDaRegra = false }) {
   const pendencias = [];
   const bruto = Math.max(0, Number.isFinite(Number(at?.valor_cobrado_centavos)) && at?.valor_cobrado_centavos !== null
     ? Math.round(Number(at.valor_cobrado_centavos)) : 0);
@@ -85,9 +85,14 @@ export function calcularMargemConsulta({ at, medico, adminEmail, taxas = lerTaxa
       repasse = 0;
     } else {
       const encerrado = at?.encerrado_em ? new Date(at.encerrado_em) : null;
-      if (!encerrado || encerrado < new Date(GANHOS_INICIO_ISO)) {
+      const antesDaRegra = encerrado && encerrado < new Date(GANHOS_INICIO_ISO);
+      if (!encerrado) {
+        pendencias.push("consulta_nao_encerrada");
+      } else if (antesDaRegra && !estimarAntesDaRegra) {
         pendencias.push("repasse_antes_da_regra_vigente");
       } else {
+        // Antes de 16/11 só como estimativa (regra atual aplicada ao passado), nunca para envio ao Google.
+        if (antesDaRegra) pendencias.push("repasse_estimado_regra_atual");
         const { elegivel, motivo } = classificarAtendimentoGanhos(at);
         if (elegivel) repasse = valorPorAtendimentoCentavos(faixa);
         else if (MOTIVOS_SEM_REPASSE.has(motivo)) repasse = 0;

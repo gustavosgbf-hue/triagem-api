@@ -1284,7 +1284,7 @@ async function registrarMargemConsulta(atOuId, opts = {}) {
   );
   // Só envia margem calculada com regra real de repasse; sem clique Google não há o que atribuir.
   const mudou = at.margem_anterior === null || Number(at.margem_anterior) !== r.margemCentavos;
-  if (temClick && r.margemCentavos !== null && (mudou || opts.force) && !r.pendencias.some(p => p.startsWith("repasse") || p === "medico_nao_identificado")) {
+  if (temClick && r.margemCentavos !== null && (mudou || opts.force) && !r.pendencias.some(p => p.startsWith("repasse") || p === "medico_nao_identificado" || p === "consulta_nao_encerrada")) {
     const envio = await enviarMargemGoogleAds(at, r.margemCentavos).catch(e => ({ ok: false, error: e.message }));
     return { ok: true, margem: r, envio };
   }

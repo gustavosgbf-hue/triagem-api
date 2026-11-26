@@ -93,3 +93,16 @@ test("coletor Google converte micros e Meta pagina", async () => {
   assert.equal(m[0].custo_centavos, 1050);
   assert.equal(col.microsoft_ads.configurado(), false);
 });
+
+test("token de ingestão e fonte do script", async () => {
+  const { tokenIngestValido } = await import("../financeiro-marketing.js");
+  const tok = "a".repeat(32);
+  assert.equal(tokenIngestValido(tok, tok), true);
+  assert.equal(tokenIngestValido("b".repeat(32), tok), false);
+  assert.equal(tokenIngestValido("", ""), false);
+  assert.equal(tokenIngestValido("curto", "curto"), false);
+  const l = normalizarLinhaImportada({ canal: "google_ads", dia: "2026-11-25", custo: "415.81", conversoes: 7, valor_conversoes: 349.3 }, "google_ads_script");
+  assert.equal(l.fonte, "google_ads_script");
+  assert.equal(l.custo_centavos, 41581);
+  assert.equal(l.valor_conversoes_centavos, 34930);
+});

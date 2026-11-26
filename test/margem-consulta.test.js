@@ -72,3 +72,13 @@ test("ação de margem nunca pode ser a de compra", () => {
   assert.equal(validarAcaoMargem("999", ["7507030772"]).ok, true);
   assert.equal(transactionIdMargem(55), "m-55");
 });
+
+test("antes de 16/11: estimativa só quando pedida, sinalizada", () => {
+  const at = { ...base, encerrado_em: "2026-11-10T12:00:00Z" };
+  const r = calcularMargemConsulta({ at, medico: { email: "a@x.com", nome: "Fulano" }, adminEmail: ADMIN, taxas: comTaxas, estimarAntesDaRegra: true });
+  assert.equal(r.repasseCentavos, valorPorAtendimentoCentavos("padrao"));
+  assert.ok(r.pendencias.includes("repasse_estimado_regra_atual"));
+  const aberta = calcularMargemConsulta({ at: { ...base, encerrado_em: null }, medico: { email: "a@x.com", nome: "X" }, adminEmail: ADMIN, taxas: comTaxas, estimarAntesDaRegra: true });
+  assert.equal(aberta.margemCentavos, null);
+  assert.ok(aberta.pendencias.includes("consulta_nao_encerrada"));
+});
