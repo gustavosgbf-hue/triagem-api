@@ -81,8 +81,8 @@ export function planejar({ snapshot, economia, capacidade, historico = [], confi
     const datas = historico.filter(h => h.tipo === tipo && h.alvo === alvo && h.status === "aplicada").map(h => new Date(h.aplicada_em || h.criado_em));
     for (const m of mudancas) {
       if (String(m.campanha_id) !== String(alvo)) continue;
-      const campos = String(m.campos || "").toLowerCase();
-      if (tipo === "tcpa" && m.recurso === "CAMPAIGN" && campos.includes("target_cpa")) datas.push(new Date(String(m.quando).replace(" ", "T") + "-03:00"));
+      const campos = String(m.campos || "").toLowerCase().replace(/_/g, "");
+      if (tipo === "tcpa" && m.recurso === "CAMPAIGN" && campos.includes("targetcpa")) datas.push(new Date(String(m.quando).replace(" ", "T") + "-03:00"));
       if (tipo === "orcamento" && m.recurso === "CAMPAIGN_BUDGET" && campos.includes("amount")) datas.push(new Date(String(m.quando).replace(" ", "T") + "-03:00"));
     }
     return datas.filter(d => !isNaN(d)).sort((a, b) => b - a)[0];
@@ -501,10 +501,11 @@ export function registrarRotasAutopilot(app, { pool, checkAdmin, tokens, adminEm
           // Conversões e parcela de impressões do Google consolidam com atraso: últimos 3 dias são parciais.
           parcial: x.dia > menosDias(hoje, 3) }));
       const tipoMudanca = m => {
-        const c = String(m.campos || "").toLowerCase();
+        const c = String(m.campos || "").toLowerCase().replace(/_/g, "");
         if (m.recurso === "CAMPAIGN_BUDGET") return "Orçamento";
-        if (m.recurso === "CAMPAIGN" && c.includes("target_cpa")) return "CPA desejado";
-        if (m.recurso === "CAMPAIGN_CRITERION" || c.includes("ad_schedule")) return "Programação/segmentação";
+        if (m.recurso === "CAMPAIGN" && c.includes("targetcpa")) return "CPA desejado";
+        if (m.recurso === "CAMPAIGN_CRITERION" && c.includes("adschedule")) return "Programação de horários";
+        if (m.recurso === "CAMPAIGN_CRITERION") return "Segmentação";
         if (m.recurso === "AD_GROUP_CRITERION") return "Palavras-chave";
         return "Campanha";
       };

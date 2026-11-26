@@ -53,7 +53,7 @@ test("sem perda por orçamento não aumenta (não paga mais caro pelos mesmos)",
 
 test("respeita intervalo após mudança manual registrada no Google Ads", () => {
   const s = snap({ mudancas: [{ quando: "2026-11-25 10:00:00", recurso: "CAMPAIGN_BUDGET", campos: "amount_micros", campanha_id: "1" },
-    { quando: "2026-11-20 10:00:00", recurso: "CAMPAIGN", campos: "maximize_conversions.target_cpa_micros", campanha_id: "1" }] });
+    { quando: "2026-11-20 10:00:00", recurso: "CAMPAIGN", campos: "maximizeConversions.targetCpaMicros", campanha_id: "1" }] });
   const r = planejar({ snapshot: s, economia: econ(), capacidade: { espera_p75_min: 5 }, agora });
   assert.equal(r.propostas.filter(p => p.tipo === "orcamento" || p.tipo === "tcpa").length, 0);
 });
