@@ -11,7 +11,8 @@ import { calcularMargemConsulta, lerTaxasMargem } from "./margem-consulta.js";
 export const CANAIS_PAGOS = ["google_ads", "microsoft_ads", "meta_ads"];
 export const ROTULO_CANAL = {
   google_ads: "Google Ads", microsoft_ads: "Microsoft Ads", meta_ads: "Meta Ads",
-  app: "Aplicativo", referencia: "Indicação e IA", organico: "Orgânico e direto"
+  app: "Aplicativo", referencia: "Indicação e IA", organico: "Orgânico e direto",
+  google_clique_antigo: "Google (clique já usado)"
 };
 const FUSO = "America/Fortaleza";
 const DIA_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -25,7 +26,8 @@ function minusc(v) { return String(v || "").trim().toLowerCase(); }
 
 // Canal do pagamento pelo último toque registrado. Função pura.
 export function classificarCanal(at) {
-  if (at?.ads_gclid || at?.ads_gbraid || at?.ads_wbraid) return "google_ads";
+  // Mesmo identificador de clique já usado em pagamento anterior: recompra sem novo clique pago.
+  if (at?.ads_gclid || at?.ads_gbraid || at?.ads_wbraid) return at?.clique_reutilizado ? "google_clique_antigo" : "google_ads";
   const toque = { ...json(at?.ads_first_touch), ...json(at?.ads_utm), ...json(at?.ads_last_touch) };
   const landing = String(toque.landing_url || at?.ads_landing_url || "");
   const fonte = minusc(toque.utm_source);
@@ -289,6 +291,12 @@ const SQL_PAGAMENTOS = `
   SELECT f.id, f.pagamento_confirmado_em, to_char((f.pagamento_confirmado_em::timestamptz AT TIME ZONE '${FUSO}'),'YYYY-MM-DD') AS dia,
          f.tipo, f.status, f.pagamento_status, f.status_atendimento, f.categoria_atendimento, f.especialidade_solicitada,
          f.valor_cobrado_centavos, f.reembolso_valor_centavos, f.reembolso_status, f.encerrado_em, f.pagamento_metodo,
+         f.valor_recebido_centavos, f.taxa_gateway_real_centavos, f.frete_valor,
+         EXISTS (SELECT 1 FROM fila_atendimentos f2
+                  WHERE f2.pagamento_status='confirmado' AND f2.id <> f.id
+                    AND f2.pagamento_confirmado_em < f.pagamento_confirmado_em
+                    AND COALESCE(NULLIF(f2.ads_gclid,''),NULLIF(f2.ads_gbraid,''),NULLIF(f2.ads_wbraid,''))
+                      = COALESCE(NULLIF(f.ads_gclid,''),NULLIF(f.ads_gbraid,''),NULLIF(f.ads_wbraid,''))) AS clique_reutilizado,
          f.pagbank_order_id, f.stripe_payment_intent_id, f.stripe_checkout_session_id, f.efi_charge_id,
          f.customer_type, f.cliente_novo, f.origem_plataforma, f.ads_gclid, f.ads_gbraid, f.ads_wbraid,
          f.ads_utm, f.ads_first_touch, f.ads_last_touch, f.ads_landing_url,
@@ -313,7 +321,31 @@ const SQL_RETORNOS = `
    WHERE x.pagamento_confirmado_em::timestamptz > ids.primeiro + INTERVAL '1 second'
    GROUP BY 1`;
 
-export function registrarRotasFinanceiro(app, { pool, checkAdmin, adminEmail, consultarGoogleAds, log = console }) {
+// Apura o período: pagamentos (com margem real) cruzados com gasto diário por canal.
+export async function apurarPeriodo(pool, de, ate, adminEmail, { incluirLinhas = false } = {}) {
+  const [pag, gas] = await Promise.all([
+    pool.query(SQL_PAGAMENTOS, [de, ate]),
+    pool.query(`SELECT canal, to_char(dia,'YYYY-MM-DD') dia, SUM(custo_centavos)::bigint custo_centavos,
+                       SUM(impressoes)::bigint impressoes, SUM(cliques)::bigint cliques
+                  FROM marketing_gasto_diario WHERE dia BETWEEN $1::date AND $2::date GROUP BY 1,2`, [de, ate])
+  ]);
+  const primeiro = new Map();
+  for (const p of pag.rows) {
+    if (!(p.customer_type === "new" || p.cliente_novo === true) || !p.identidade) continue;
+    const t = new Date(p.pagamento_confirmado_em);
+    if (!primeiro.has(p.identidade) || t < primeiro.get(p.identidade)) primeiro.set(p.identidade, t);
+  }
+  const retornos = new Map();
+  if (primeiro.size) {
+    const ids = [...primeiro.keys()];
+    const r = await pool.query(SQL_RETORNOS, [ids, ids.map(i => primeiro.get(i).toISOString())]);
+    for (const x of r.rows) retornos.set(x.identidade, { pagamentos: x.pagamentos, bruto: Number(x.bruto) || 0 });
+  }
+  const agregado = agregarFinanceiro({ pagamentos: pag.rows, gastos: gas.rows, retornos, adminEmail });
+  return incluirLinhas ? { ...agregado, linhas: pag.rows, gastos_linhas: gas.rows } : agregado;
+}
+
+export function registrarRotasFinanceiro(app, { pool, checkAdmin, adminEmail, consultarGoogleAds, tokens, log = console }) {
   const coletores = criarColetores({ consultarGoogleAds });
   let pronto = false;
   async function garantir() {
@@ -344,27 +376,7 @@ export function registrarRotasFinanceiro(app, { pool, checkAdmin, adminEmail, co
   setTimeout(() => sincronizar(35).catch(() => {}), 180_000).unref?.();
   setInterval(() => sincronizar(7).catch(() => {}), 3 * 60 * 60_000).unref?.();
 
-  async function apurar(de, ate) {
-    const [pag, gas] = await Promise.all([
-      pool.query(SQL_PAGAMENTOS, [de, ate]),
-      pool.query(`SELECT canal, to_char(dia,'YYYY-MM-DD') dia, SUM(custo_centavos)::bigint custo_centavos,
-                         SUM(impressoes)::bigint impressoes, SUM(cliques)::bigint cliques
-                    FROM marketing_gasto_diario WHERE dia BETWEEN $1::date AND $2::date GROUP BY 1,2`, [de, ate])
-    ]);
-    const primeiro = new Map();
-    for (const p of pag.rows) {
-      if (!(p.customer_type === "new" || p.cliente_novo === true) || !p.identidade) continue;
-      const t = new Date(p.pagamento_confirmado_em);
-      if (!primeiro.has(p.identidade) || t < primeiro.get(p.identidade)) primeiro.set(p.identidade, t);
-    }
-    const retornos = new Map();
-    if (primeiro.size) {
-      const ids = [...primeiro.keys()];
-      const r = await pool.query(SQL_RETORNOS, [ids, ids.map(i => primeiro.get(i).toISOString())]);
-      for (const x of r.rows) retornos.set(x.identidade, { pagamentos: x.pagamentos, bruto: Number(x.bruto) || 0 });
-    }
-    return agregarFinanceiro({ pagamentos: pag.rows, gastos: gas.rows, retornos, adminEmail });
-  }
+  const apurar = (de, ate) => apurarPeriodo(pool, de, ate, adminEmail);
 
   app.get("/api/admin/financeiro", checkAdmin, async (req, res) => {
     res.set("Cache-Control", "no-store");
@@ -415,12 +427,12 @@ export function registrarRotasFinanceiro(app, { pool, checkAdmin, adminEmail, co
   // Autenticação por token próprio, sem sessão de usuário.
   app.post("/api/financeiro/gasto/ingest", async (req, res) => {
     try {
-      if (!tokenIngestValido(req.get("x-ingest-token"), process.env.FINANCEIRO_INGEST_TOKEN)) {
+      const canal = String(req.body?.canal || "");
+      if (!["google_ads", "microsoft_ads", "meta_ads"].includes(canal)) return res.status(400).json({ ok: false, error: "canal_invalido" });
+      if (!tokens || !(await tokens.validar(req.get("x-ingest-token"), `${canal}_script`))) {
         return res.status(403).json({ ok: false, error: "nao_autorizado" });
       }
       await garantir();
-      const canal = String(req.body?.canal || "");
-      if (!["google_ads", "microsoft_ads", "meta_ads"].includes(canal)) return res.status(400).json({ ok: false, error: "canal_invalido" });
       const entrada = Array.isArray(req.body?.linhas) ? req.body.linhas.slice(0, 5000) : [];
       const linhas = entrada.map(l => normalizarLinhaImportada({ ...l, canal }, `${canal}_script`)).filter(Boolean);
       const gravadas = await gravarGastos(pool, linhas);
@@ -432,5 +444,5 @@ export function registrarRotasFinanceiro(app, { pool, checkAdmin, adminEmail, co
     }
   });
 
-  return { sincronizar };
+  return { sincronizar, gravarGastos: (linhas) => gravarGastos(pool, linhas), garantir };
 }

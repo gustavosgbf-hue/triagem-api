@@ -54,6 +54,9 @@ import {
 } from "./agendamento-acesso.js";
 import { registrarRotasRepasses } from "./medico-repasses-admin.js";
 import { registrarRotasFinanceiro } from "./financeiro-marketing.js";
+import { criarTokensIntegracao } from "./integracoes-tokens.js";
+import { registrarRotasAutopilot } from "./autopilot.js";
+import { criarConferenciaRecebimentos } from "./recebimentos.js";
 import {
   registrarRotasRecuperacaoEspecialista,
   registrarRotasRecuperacaoMedico,
@@ -683,6 +686,7 @@ function normalizarAdsAttribution(input = {}, req) {
     gbraid,
     wbraid,
     fbclid,
+    msclkid: limitarTexto(src.msclkid, 220),
     ...utm
   };
   Object.keys(firstTouch).forEach(k => { if (!firstTouch[k]) delete firstTouch[k]; });
@@ -2038,6 +2042,10 @@ async function initDB() {
       ['categoria_atendimento','TEXT NOT NULL DEFAULT \'clinico\''],
       ['especialidade_solicitada','TEXT'],
       ['valor_cobrado_centavos','INTEGER NOT NULL DEFAULT 4990'],
+      ['valor_recebido_centavos','INTEGER'],
+      ['taxa_gateway_real_centavos','INTEGER'],
+      ['recebido_fonte','TEXT'],
+      ['recebido_conferido_em','TIMESTAMPTZ'],
       ['fallback_disponivel_em','TIMESTAMPTZ'],
       ['fallback_decisao','TEXT'],
       ['fallback_decidido_em','TIMESTAMPTZ'],
@@ -10403,7 +10411,59 @@ registrarRotasRecuperacaoMedico(app, {
 // Ganhos médicos: somente leitura, agregados da própria pessoa (ver medico-ganhos.js).
 registrarRotaGanhosMedico(app, { pool, checkMedico, adminEmail: ADMIN_MEDICO_EMAIL });
 registrarRotasRepasses(app, { pool, checkMedico, adminEmail: ADMIN_MEDICO_EMAIL });
-registrarRotasFinanceiro(app, { pool, checkAdmin, adminEmail: ADMIN_MEDICO_EMAIL, consultarGoogleAds: consultarGoogleAdsGaql });
+const tokensIntegracao = criarTokensIntegracao({ pool });
+const financeiroMarketing = registrarRotasFinanceiro(app, { pool, checkAdmin, adminEmail: ADMIN_MEDICO_EMAIL, consultarGoogleAds: consultarGoogleAdsGaql, tokens: tokensIntegracao });
+registrarRotasAutopilot(app, { pool, checkAdmin, tokens: tokensIntegracao, adminEmail: ADMIN_MEDICO_EMAIL, financeiro: financeiroMarketing });
+
+// Emite token novo (revoga o anterior do mesmo escopo) e devolve o script já preenchido. Só o admin vê.
+const SCRIPTS_INTEGRACAO = {
+  google_ads_script: { arquivo: "google-ads-cj24.js", nome: "cj24-google-ads.js" },
+  microsoft_ads_script: { arquivo: "microsoft-ads-gasto.js", nome: "cj24-microsoft-ads.js" }
+};
+app.post("/api/admin/integracoes/token", checkAdmin, async (req, res) => {
+  res.set("Cache-Control", "no-store");
+  try {
+    const escopo = String(req.body?.escopo || "");
+    const def = SCRIPTS_INTEGRACAO[escopo];
+    if (!def) return res.status(400).json({ ok: false, error: "escopo_invalido" });
+    const modelo = fs.readFileSync(path.join(path.dirname(new URL(import.meta.url).pathname), "scripts-ads", def.arquivo), "utf8");
+    const token = await tokensIntegracao.emitir(escopo);
+    console.log("INTEGRACAO_TOKEN_EMITIDO", { escopo });
+    return res.json({ ok: true, escopo, nome_arquivo: def.nome, script: modelo.replace("__TOKEN__", token) });
+  } catch (e) {
+    console.error("[INTEGRACAO TOKEN]", e.message);
+    return res.status(500).json({ ok: false, error: "falha_emissao" });
+  }
+});
+
+// Valor efetivamente recebido e tarifa real (Stripe) por pagamento, conferidos no gateway.
+const conferenciaRecebimentos = criarConferenciaRecebimentos({
+  pool,
+  buscarPedidoPagBank: async (orderId) => {
+    if (!PAGBANK_TOKEN || !orderIdPagBankValido(String(orderId))) return null;
+    const r = await fetch(`${PAGBANK_URL}/orders/${encodeURIComponent(String(orderId))}`,
+      { headers: { Authorization: `Bearer ${PAGBANK_TOKEN}`, accept: "application/json" } });
+    if (!r.ok) throw new Error("pagbank_http_" + r.status);
+    return r.json();
+  },
+  buscarPaymentIntentStripe: stripe
+    ? (id) => stripe.paymentIntents.retrieve(String(id), { expand: ["latest_charge.balance_transaction"] })
+    : null
+});
+// Renovações gravadas antes desta correção ficaram com o preço da consulta (4990).
+async function corrigirValorRenovacoesAntigas() {
+  const { rows } = await pool.query(
+    `SELECT id, tipo, frete_valor FROM fila_atendimentos
+      WHERE tipo LIKE 'renovacao_%' AND valor_cobrado_centavos = 4990`);
+  for (const r of rows) {
+    await pool.query(`UPDATE fila_atendimentos SET valor_cobrado_centavos=$2 WHERE id=$1 AND valor_cobrado_centavos=4990`,
+      [r.id, renovacaoValorCentavos(r)]);
+  }
+  if (rows.length) console.log("RENOVACAO_VALOR_CORRIGIDO", { total: rows.length });
+}
+setTimeout(() => corrigirValorRenovacoesAntigas().catch(e => console.warn("[RENOVACAO-VALOR]", e.message)), 60_000).unref?.();
+setTimeout(() => conferenciaRecebimentos.conferir({ limite: 200 }).then(r => console.log("RECEBIMENTO_CONFERENCIA", r)).catch(e => console.warn("[RECEBIMENTO]", e.message)), 240_000).unref?.();
+setInterval(() => conferenciaRecebimentos.conferir().catch(() => {}), 20 * 60_000).unref?.();
 
 app.post("/api/medico/trocar-senha", checkMedico, async (req, res) => {
   try {
@@ -13481,8 +13541,8 @@ app.post("/api/renovacao/criar-pre", rlGeral, async (req, res) => {
     const result = await pool.query(
       `INSERT INTO fila_atendimentos
        (nome,tel,tel_documentos,cpf,tipo,triagem,status,pagamento_status,queixa,medicacoes,data_nascimento,email,
-        endereco_envio,frete_valor,frete_modalidade,frete_servico_id,frete_prazo_dias,questionario)
-       VALUES ($1,$2,$3,$4,$5,$6,'pagamento_pendente','pendente',$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
+        endereco_envio,frete_valor,frete_modalidade,frete_servico_id,frete_prazo_dias,questionario,valor_cobrado_centavos)
+       VALUES ($1,$2,$3,$4,$5,$6,'pagamento_pendente','pendente',$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
        RETURNING id, tipo, frete_valor`,
       [
         nome.trim(), tel, tel, String(cpf).replace(/\D/g, ""), tipoFila, triagem,
@@ -13492,10 +13552,16 @@ app.post("/api/renovacao/criar-pre", rlGeral, async (req, res) => {
         freteConfirmado?.nome || null,
         freteConfirmado?.id || null,
         freteConfirmado?.prazo ?? null,
-        questionario ? JSON.stringify(questionario) : null
+        questionario ? JSON.stringify(questionario) : null,
+        renovacaoValorCentavos({ tipo: tipoFila, frete_valor: freteConfirmado?.valor ?? 0 })
       ]
     );
     const row = result.rows[0];
+    // Atribuição: antes a renovação não registrava o clique de anúncio vindo da landing.
+    if (req.body?.ads && typeof req.body.ads === "object") {
+      salvarAdsAttribution(row.id, normalizarAdsAttribution(req.body.ads, req), req)
+        .catch(e => console.warn("[RENOVACAO-ADS]", e.message));
+    }
     return res.json({ ok: true, atendimentoId: row.id, valorCentavos: renovacaoValorCentavos(row), valorTotal: renovacaoValorCentavos(row) / 100 });
   } catch (e) {
     console.error("[RENOVACAO-CRIAR]", e.message);

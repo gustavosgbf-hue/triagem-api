@@ -66,8 +66,11 @@ function pontosBaseCentavos(base, pontosBase) {
  */
 export function calcularMargemConsulta({ at, medico, adminEmail, taxas = lerTaxasMargem(), estimarAntesDaRegra = false }) {
   const pendencias = [];
-  const bruto = Math.max(0, Number.isFinite(Number(at?.valor_cobrado_centavos)) && at?.valor_cobrado_centavos !== null
-    ? Math.round(Number(at.valor_cobrado_centavos)) : 0);
+  // Valor conferido no gateway prevalece sobre o valor registrado no pedido.
+  const recebido = at?.valor_recebido_centavos;
+  const cobrado = at?.valor_cobrado_centavos;
+  const base = recebido !== null && recebido !== undefined && Number.isFinite(Number(recebido)) ? recebido : cobrado;
+  const bruto = Math.max(0, base !== null && base !== undefined && Number.isFinite(Number(base)) ? Math.round(Number(base)) : 0);
   if (!bruto) pendencias.push("valor_cobrado_ausente");
   const reembolso = Math.min(bruto, Math.max(0, Math.round(Number(at?.reembolso_valor_centavos) || 0)));
   const liquido = bruto - reembolso;
@@ -104,7 +107,10 @@ export function calcularMargemConsulta({ at, medico, adminEmail, taxas = lerTaxa
   // Taxa do meio de pagamento, sobre o valor cobrado (não é devolvida no estorno).
   const { gateway, metodo } = identificarGateway(at);
   let taxaGateway = null;
-  if (bruto) {
+  const taxaReal = at?.taxa_gateway_real_centavos;
+  if (taxaReal !== null && taxaReal !== undefined && Number.isFinite(Number(taxaReal))) {
+    taxaGateway = Math.round(Number(taxaReal));
+  } else if (bruto) {
     const t = taxas.taxa(gateway, metodo);
     if (t) taxaGateway = pontosBaseCentavos(bruto, t.pontosBase) + t.fixaCentavos;
     else pendencias.push(`taxa_nao_configurada:${gateway}_${metodo}`);
@@ -115,7 +121,9 @@ export function calcularMargemConsulta({ at, medico, adminEmail, taxas = lerTaxa
   if (taxas.impostoPontosBase !== null) imposto = pontosBaseCentavos(liquido, taxas.impostoPontosBase);
   else pendencias.push("imposto_nao_configurado");
 
-  const contribuicao = repasse === null ? null : liquido - repasse;
+  // Receita física: o frete cobrado do paciente é custo de envio pago pela empresa.
+  const custoEnvio = tipo === "renovacao_fisica" && Number(at?.frete_valor) > 0 ? Math.round(Number(at.frete_valor) * 100) : 0;
+  const contribuicao = repasse === null ? null : liquido - repasse - custoEnvio;
   const margem = contribuicao === null ? null : contribuicao - (taxaGateway ?? 0) - (imposto ?? 0);
 
   return {
@@ -123,6 +131,7 @@ export function calcularMargemConsulta({ at, medico, adminEmail, taxas = lerTaxa
     reembolsoCentavos: reembolso,
     liquidoCentavos: liquido,
     repasseCentavos: repasse,
+    custoEnvioCentavos: custoEnvio,
     taxaGatewayCentavos: taxaGateway,
     impostoCentavos: imposto,
     contribuicaoCentavos: contribuicao,

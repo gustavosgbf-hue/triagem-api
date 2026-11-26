@@ -82,3 +82,13 @@ test("antes de 16/11: estimativa só quando pedida, sinalizada", () => {
   assert.equal(aberta.margemCentavos, null);
   assert.ok(aberta.pendencias.includes("consulta_nao_encerrada"));
 });
+
+test("valor recebido e taxa real do gateway prevalecem; frete é custo", () => {
+  const at = { ...base, tipo: "renovacao_fisica", valor_cobrado_centavos: 4990, valor_recebido_centavos: 8590, taxa_gateway_real_centavos: 380, frete_valor: "16.70" };
+  const r = calcularMargemConsulta({ at, medico: { email: ADMIN }, adminEmail: ADMIN, taxas: comTaxas });
+  assert.equal(r.brutoCentavos, 8590);
+  assert.equal(r.taxaGatewayCentavos, 380);
+  assert.equal(r.custoEnvioCentavos, 1670);
+  assert.equal(r.repasseCentavos, 0);
+  assert.equal(r.margemCentavos, 8590 - 1670 - 380 - 515);
+});
