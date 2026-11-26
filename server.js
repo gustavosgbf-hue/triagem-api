@@ -2828,6 +2828,27 @@ async function checkMedico(req, res, next) {
 
 const autenticarMedico = checkMedico;
 
+// Link de continuidade emitido exclusivamente por médico ativo responsável.
+app.post("/api/medico/atendimento/:id/link-paciente", checkMedico, async (req,res) => {
+  res.set("Cache-Control","no-store");
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isSafeInteger(id) || id <= 0) return res.status(400).json({ok:false,error:"Atendimento inválido"});
+    const {rows} = await pool.query("SELECT id, medico_id, status, pagamento_status FROM fila_atendimentos WHERE id=$1", [id]);
+    const at = rows[0];
+    if (!at || !medicoPodeEscreverNoAtendimento(req.medico,at)) return res.status(404).json({ok:false,error:"Atendimento não encontrado"});
+    if (at.status !== "assumido" || !["confirmado","isento_admin"].includes(at.pagamento_status)) return res.status(409).json({ok:false,error:"Atendimento não está ativo e liberado"});
+    const chave = await acessoAtendimento.emitirChave(id);
+    if (!chave) return res.status(503).json({ok:false,error:"Não foi possível gerar o acesso"});
+    console.info("[LINK-PACIENTE] emitido", {atendimento:id,medico:req.medicoId});
+    return res.json({ok:true,link:"https://consultaja24h.com.br/triagem.html?consulta="+id+"#k="+encodeURIComponent(chave)});
+  } catch(e) {
+    console.error("[LINK-PACIENTE] falha",e.message);
+    return res.status(500).json({ok:false,error:"Não foi possível gerar o acesso"});
+  }
+});
+
+
 function decodificarMedicoRequest(req) {
   const auth = req.headers["authorization"] || "";
   const token = auth.replace(/^Bearer\s+/i, "").trim();
