@@ -25,6 +25,7 @@ import {
 } from "./memed-utils.js";
 import { registrarRotaGanhosMedico } from "./medico-ganhos.js";
 import { ehTokenMedico, ehTokenPrescritor, criarVerificadorMedicoAtivo } from "./auth-tokens.js";
+import { criarAcessoAtendimento, exporChave, registrarNegado, lerLinkAssinado } from "./acesso-atendimento.js";
 import {
   AGENDA_HORIZONTE_DIAS,
   AGENDA_TZ,
@@ -1648,7 +1649,11 @@ setInterval(async () => {
       // Lembrete para o paciente também
       if (ag.email && !ag.lembrete_paciente_enviado) {
         const SITE_URL = process.env.SITE_URL || "https://consultaja24h.com.br";
-        const linkConsulta = ag.fila_id ? `${SITE_URL}/triagem.html?consulta=${ag.fila_id}` : `${SITE_URL}/triagem.html`;
+        let linkConsulta = ag.fila_id ? `${SITE_URL}/triagem.html?consulta=${ag.fila_id}` : `${SITE_URL}/triagem.html`;
+        if (ag.fila_id) {
+          const chaveLembrete = await acessoAtendimento.emitirChave(ag.fila_id).catch(() => null);
+          if (chaveLembrete) linkConsulta += `#k=${chaveLembrete}`;
+        }
         await enviarEmailLembretePaciente({ nome: ag.nome, email: ag.email, horarioFormatado, modalidade: ag.modalidade, linkConsulta }).catch(()=>{});
         await pool.query(`UPDATE agendamentos SET lembrete_paciente_enviado=true WHERE id=$1`,[ag.id]);
       }
@@ -2789,6 +2794,7 @@ async function atualizarRevogacoesSessaoMedico() {
 setInterval(atualizarRevogacoesSessaoMedico, 60_000).unref?.();
 
 const medicoAtivoNoBanco = criarVerificadorMedicoAtivo(pool);
+const acessoAtendimento = criarAcessoAtendimento({ pool });
 
 // Rotas do painel médico: token do login médico, de médico ativo.
 async function checkMedico(req, res, next) {
@@ -5061,8 +5067,13 @@ app.post("/api/chat/upload", rlUpload, upload.single("arquivo"), async (req, res
       return res.status(403).json({ ok: false, error: "Renovação de receita não possui chat. Sua receita anterior e as informações do formulário serão avaliadas pelo médico." });
     } else if (atendimento.rows[0].status !== "assumido") {
       return res.status(403).json({ ok: false, error: "Chat indisponivel para envio neste atendimento" });
-    } else if (!origemPacientePermitida(req)) {
-      return res.status(403).json({ ok: false, error: "Origem nao autorizada" });
+    } else {
+      const acessoEnvio = await acessoAtendimento.avaliar(req, atendimentoId);
+      if (!acessoEnvio.ok || acessoEnvio.papel === "medico") {
+        registrarNegado(req, req.path, atendimentoId, acessoEnvio.ok ? "medico_como_paciente" : acessoEnvio.motivo);
+        return res.status(401).json({ ok: false, code: "ACESSO_NECESSARIO", error: "Confirme seu acesso para enviar mensagens." });
+      }
+      if (acessoEnvio.chaveNova) exporChave(res, atendimentoId, acessoEnvio.chaveNova);
     }
     const ext = req.file.originalname.split(".").pop().toLowerCase();
     const tipo = req.file.mimetype.startsWith("image/") ? "imagem" : "pdf";
@@ -5101,13 +5112,28 @@ app.post("/api/chat/enviar", rlMensagem, async (req, res) => {
       return res.status(403).json({ ok: false, error: "Renovação de receita não possui chat. Sua receita anterior e as informações do formulário serão avaliadas pelo médico." });
     } else if (atendimento.rows[0].status !== "assumido") {
       return res.status(403).json({ ok: false, error: "Chat indisponivel para envio neste atendimento" });
-    } else if (!origemPacientePermitida(req)) {
-      return res.status(403).json({ ok: false, error: "Origem nao autorizada" });
+    } else {
+      const acessoEnvio = await acessoAtendimento.avaliar(req, atendimentoId);
+      if (!acessoEnvio.ok || acessoEnvio.papel === "medico") {
+        registrarNegado(req, req.path, atendimentoId, acessoEnvio.ok ? "medico_como_paciente" : acessoEnvio.motivo);
+        return res.status(401).json({ ok: false, code: "ACESSO_NECESSARIO", error: "Confirme seu acesso para enviar mensagens." });
+      }
+      if (acessoEnvio.chaveNova) exporChave(res, atendimentoId, acessoEnvio.chaveNova);
     }
     const textoSeguro = String(texto || "").trim().slice(0, 3000);
+    let arquivoUrlSeguro = arquivo_url ? String(arquivo_url) : null;
+    if (arquivoUrlSeguro) {
+      const basePublica = String(process.env.R2_PUBLIC_URL || "").replace(/\/$/, "");
+      const assinado = arquivoUrlSeguro.match(/\/api\/arquivo\?t=([^&#]+)/);
+      const chaveObj = assinado ? lerLinkAssinado(decodeURIComponent(assinado[1])) : null;
+      if (chaveObj && basePublica) arquivoUrlSeguro = `${basePublica}/${chaveObj}`;
+      else if (!basePublica || !arquivoUrlSeguro.startsWith(basePublica + "/")) {
+        return res.status(400).json({ ok: false, error: "Arquivo inválido" });
+      }
+    }
     const result = await pool.query(
       `INSERT INTO mensagens (atendimento_id,autor,autor_id,texto,arquivo_url,arquivo_tipo) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id,atendimento_id,autor,texto,arquivo_url,arquivo_tipo,arquivo_nome,criado_em`,
-      [atendimentoId,autor,autorIdSeguro,textoSeguro,arquivo_url||null,arquivo_tipo||null]
+      [atendimentoId,autor,autorIdSeguro,textoSeguro,arquivoUrlSeguro,arquivo_tipo||null]
     );
     return res.json({ ok: true, mensagem: result.rows[0] });
   } catch (e) { console.error("Erro em /api/chat/enviar:", e); return res.status(500).json({ ok: false, error: "Erro ao enviar mensagem" }); }
@@ -5136,10 +5162,13 @@ app.get("/api/chat/:atendimentoId", async (req, res) => {
     const { atendimentoId } = req.params;
     const auth = req.headers["authorization"] || "";
     const token = auth.replace("Bearer ","").trim();
-    let autorizado = false;
-    if (token) { try { jwt.verify(token, JWT_SECRET); autorizado=true; } catch(e){} }
-    if (!autorizado) { const check = await pool.query(`SELECT id FROM fila_atendimentos WHERE id=$1`,[atendimentoId]); autorizado=check.rowCount>0; }
-    if (!autorizado) return res.status(403).json({ ok: false, error: "Acesso negado" });
+    void token;
+    const acessoChat = await acessoAtendimento.avaliar(req, atendimentoId);
+    if (!acessoChat.ok) {
+      registrarNegado(req, "GET /api/chat/:id", atendimentoId, acessoChat.motivo);
+      return res.status(401).json({ ok: false, code: "ACESSO_NECESSARIO", error: "Confirme seu acesso para ver esta conversa." });
+    }
+    if (acessoChat.chaveNova) exporChave(res, atendimentoId, acessoChat.chaveNova);
     const result = await pool.query(`SELECT id,atendimento_id,autor,texto,arquivo_url,arquivo_tipo,arquivo_nome,criado_em FROM mensagens WHERE atendimento_id=$1 ORDER BY criado_em ASC`,[atendimentoId]);
     return res.json({ ok: true, mensagens: result.rows });
   } catch (e) { console.error("Erro em /api/chat/:id:", e); return res.status(500).json({ ok: false, error: "Erro ao buscar mensagens" }); }
@@ -5221,20 +5250,14 @@ app.get("/api/atendimento/status/:id", async (req, res) => {
     // Resposta completa só para o médico vinculado (ou admin, ou caso ainda na fila).
     // Sem credencial médica: apenas o necessário para as telas do paciente,
     // sem identificação nem dados clínicos.
-    let respostaCompleta = false;
-    const medStatus = decodificarMedicoRequest(req);
-    if (medStatus) {
-      try {
-        if (await medicoAtivoNoBanco(medStatus)) {
-          const souAdminStatus = String(medStatus.email || "").trim().toLowerCase() === ADMIN_MEDICO_EMAIL;
-          const vinc = souAdminStatus || at.status === "aguardando"
-            ? null
-            : await pool.query(`SELECT medico_id FROM fila_atendimentos WHERE id=$1`, [at.id]);
-          respostaCompleta = souAdminStatus || at.status === "aguardando" || medicoPodeEscreverNoAtendimento(medStatus, vinc?.rows?.[0] || {});
-        }
-      } catch (e) { console.warn("[STATUS] Verificação médica falhou:", e.message); }
-    }
-    const atResposta = respostaCompleta ? at : resumoPublicoAtendimento(at);
+    let acessoStatus = { ok: false };
+    try { acessoStatus = await acessoAtendimento.avaliar(req, at.id); }
+    catch (e) { console.warn("[STATUS] Verificação de acesso falhou:", e.message); }
+    if (acessoStatus.chaveNova) exporChave(res, at.id, acessoStatus.chaveNova);
+    let atResposta;
+    if (acessoStatus.ok && acessoStatus.papel === "medico") atResposta = at;
+    else if (acessoStatus.ok) atResposta = { ...resumoPublicoAtendimento(at), nome: at.nome, tel: at.tel, cpf: at.cpf, email: at.email, data_nascimento: at.data_nascimento };
+    else { atResposta = resumoPublicoAtendimento(at); delete atResposta.meet_link; }
     return res.json({ ok: true, atendimento: atResposta, fila: await _filaPos(at) });
   } catch (e) { return res.status(500).json({ ok: false, error: "Erro ao buscar status" }); }
 });

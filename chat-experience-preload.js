@@ -2,6 +2,7 @@ import express from 'express';
 import pg from 'pg';
 import jwt from 'jsonwebtoken';
 import { ehTokenMedico } from './auth-tokens.js';
+import { criarAcessoAtendimento, exporChave, registrarNegado } from './acesso-atendimento.js';
 
 const { Pool } = pg;
 const pool = new Pool({
@@ -91,6 +92,8 @@ async function atendimentoDoPaciente(pacienteId, atendimentoId) {
   return rows[0] || null;
 }
 
+const acessoAtendimento = criarAcessoAtendimento({ pool });
+
 function installChatExperience(app) {
   if (app.locals.__chatExperienceInstalled) return;
   app.locals.__chatExperienceInstalled = true;
@@ -135,12 +138,12 @@ function installChatExperience(app) {
         try { decoded = jwt.verify(raw, process.env.JWT_SECRET || ''); } catch {}
       }
 
-      let autorizado = !!decoded;
-      if (!autorizado) {
-        const check = await pool.query('SELECT id FROM fila_atendimentos WHERE id=$1', [atendimentoId]);
-        autorizado = check.rowCount > 0;
+      const acessoChat = await acessoAtendimento.avaliar(req, atendimentoId);
+      if (!acessoChat.ok) {
+        registrarNegado(req, 'GET /api/chat/:id', atendimentoId, acessoChat.motivo);
+        return res.status(401).json({ ok: false, code: 'ACESSO_NECESSARIO', error: 'Confirme seu acesso para ver esta conversa.' });
       }
-      if (!autorizado) return res.status(403).json({ ok: false, error: 'Acesso negado' });
+      if (acessoChat.chaveNova) exporChave(res, atendimentoId, acessoChat.chaveNova);
 
       if (ehTokenMedico(decoded)) {
         await pool.query(

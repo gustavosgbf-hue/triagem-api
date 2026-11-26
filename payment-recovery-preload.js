@@ -9,6 +9,7 @@ const pool = new Pool({
 });
 
 const EXPO_PUSH_URL = 'https://exp.host/--/api/v2/push/send';
+import { criarAcessoAtendimento, exporChave } from './acesso-atendimento.js';
 const SITE_URL = String(process.env.PUBLIC_SITE_URL || 'https://consultaja24h.com.br').replace(/\/$/, '');
 const API_URL = String(process.env.API_URL || 'https://triagem-api.onrender.com').replace(/\/$/, '');
 const RESEND_FROM = process.env.RESEND_DEFAULT_FROM || 'ConsultaJá24h <contato@consultaja24h.com.br>';
@@ -254,6 +255,11 @@ express.application.init = function (...args) {
       if (at.pagamento_status!=='pendente' || ['cancelado','expirado','arquivado'].includes(at.status)) {
         return res.json({ok:true,estado:'indisponivel'});
       }
+      // O e-mail é a prova de posse: o navegador que abriu o link recebe uma chave do atendimento.
+      try {
+        const chave = await criarAcessoAtendimento({ pool }).emitirChave(at.id);
+        if (chave) exporChave(res, at.id, chave);
+      } catch (e) { console.warn('[PAYMENT-RECOVERY] chave:', e.message); }
       return res.json({ok:true,estado:'pendente',atendimento:{
         id:at.id,tipo:at.tipo,nome:at.nome||'',tel:at.tel||'',
         cpf:at.cpf||'',email:at.email||'',pagador_nome:at.pagador_nome||'',
