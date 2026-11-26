@@ -509,7 +509,8 @@ export function registrarRotasAutopilot(app, { pool, checkAdmin, tokens, adminEm
         return "Campanha";
       };
       const marcosGoogle = (d.mudancas || []).filter(m => !m.campanha_id || !campanhas.size || campanhas.has(String(m.campanha_id)))
-        .map(m => ({ dia: String(m.quando).slice(0, 10), quando: m.quando, tipo: tipoMudanca(m), origem: m.origem, fonte: "google_ads" }));
+        .map(m => ({ dia: String(m.quando).slice(0, 10), quando: m.quando, tipo: tipoMudanca(m), origem: m.origem, fonte: "google_ads" }))
+        .filter((m, i, arr) => arr.findIndex(o => o.dia === m.dia && o.tipo === m.tipo) === i);
       const { rows: manuais } = await pool.query(`SELECT to_char(dia,'YYYY-MM-DD') dia, descricao FROM autopilot_marcos ORDER BY dia`);
       return res.json({ ok: true, atualizado_em: snap?.recebido_em || null, dias: lista,
         marcos: [...marcosGoogle, ...manuais.map(m => ({ dia: m.dia, tipo: m.descricao, fonte: "manual" }))].sort((a, b) => String(a.dia).localeCompare(String(b.dia))),
